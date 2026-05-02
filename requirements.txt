@@ -1,0 +1,6 @@
+# Dependencias del loader BYMA + tests offline
+# Versiones mínimas testeadas — pip resuelve la última compatible
+
+pandas>=2.0
+numpy>=1.24
+requests>=2.31
