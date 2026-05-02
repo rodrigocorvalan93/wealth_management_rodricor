@@ -1,0 +1,24 @@
+# Lista de FCIs a trackear vía API CAFCI.
+# Formato por línea: TICKER_INTERNO|NOMBRE_EXACTO_EN_CAFCI
+#
+# - El TICKER_INTERNO es lo que vas a usar en la planilla v3.1 (hoja Especies
+#   y Blotter). Tiene que ser único, sin espacios.
+# - El NOMBRE_EXACTO_EN_CAFCI debe coincidir LITERALMENTE con el campo
+#   "nombreDeLaClaseDeFondo" del reporte CAFCI (incluso espacios y guiones).
+# - Líneas vacías y comentarios (#) se ignoran.
+#
+# Si un FCI no aparece en el report, el loader lo lista en "no encontrados"
+# (probablemente cambió el nombre o la clase — verificá en el report crudo).
+
+# === Fima (Galicia) ===
+FIMA_RFD_C|Fima Renta Fija Dólares - Clase C
+FIMA_PREM_A|Fima Premium Dólares - Clase A
+
+# === Delta ===
+DELTA_AHORRO_A|Delta Ahorro Plus - Clase A
+DELTA_ACC_A|Delta Acciones - Clase A
+DELTA_GVI_A|Delta Gestion VI - Clase A
+DELTA_RR_A|Delta Retorno Real - Clase A
+DELTA_LATAM_A|Delta Latinoamerica - Clase A
+DELTA_RENTA_A|Delta Renta - Clase A
+DELTA_RD_D|Delta Renta Dolares - Clase D
