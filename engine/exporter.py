@@ -36,6 +36,7 @@ from openpyxl.utils import get_column_letter
 from .holdings import (
     calculate_holdings, total_pn,
     by_asset_class, by_account, by_currency,
+    filter_investible, filter_non_investible, by_cash_purpose,
 )
 from .pnl import (
     calculate_realized_pnl, aggregate_pnl_by_asset,
@@ -44,6 +45,14 @@ from .pnl import (
     calculate_unrealized_pnl_summary,
 )
 from .liabilities import all_card_snapshots
+from .trade_stats import (
+    calculate_trade_stats, trade_stats_by_asset, trade_stats_by_account,
+)
+from .snapshots import (
+    record_snapshots, get_equity_curve, get_equity_curves_by_account,
+    calculate_returns, TOTAL_KEY, TOTAL_INV_KEY,
+)
+from .buying_power import buying_power_summary
 
 
 # =============================================================================
@@ -416,6 +425,318 @@ def _sheet_pnl_realizado(wb, fills, anchor_ccy):
     ws.freeze_panes = "A2"
 
 
+def _sheet_trade_stats(wb, fills, anchor_ccy):
+    """Sprint A: métricas de trading (winners/losers, winrate, expectancy)."""
+    ws = wb.create_sheet("Trade Stats")
+
+    if not fills:
+        ws.cell(row=1, column=1,
+                value="Aún no hay trades cerrados para calcular métricas.").font = FONT_SUBTITLE
+        return
+
+    stats_by_ccy = calculate_trade_stats(fills)
+
+    ws.cell(row=1, column=1, value="MÉTRICAS DE TRADING POR MONEDA").font = FONT_BOLD
+    ws.cell(row=2, column=1,
+            value="Performance histórica de los trades cerrados (FIFO).").font = FONT_SUBTITLE
+
+    headers = [
+        "Moneda", "# Trades", "# Ganadores", "# Perdedores", "# Scratch",
+        "Winrate", "Gross Profit", "Gross Loss", "Net PnL",
+        "Avg Winner", "Avg Loser", "Profit Factor", "Expectancy",
+        "Best Trade", "Worst Trade", "Avg Holding (días)",
+        "Racha Win Max", "Racha Loss Max",
+    ]
+    widths = [8, 10, 12, 12, 10, 10, 14, 14, 14, 12, 12, 12, 12, 14, 14, 14, 12, 12]
+    _write_headers(ws, 4, headers, widths)
+
+    row = 5
+    for ccy, s in sorted(stats_by_ccy.items()):
+        pf = s.profit_factor
+        pf_display = "" if pf == float("inf") else pf
+        _write_row(ws, row, [
+            s.currency, s.n_trades, s.n_winners, s.n_losers, s.n_scratch,
+            s.winrate, s.gross_profit, s.gross_loss, s.net_pnl,
+            s.avg_winner, s.avg_loser, pf_display, s.expectancy,
+            s.best_trade, s.worst_trade, s.avg_holding_days,
+            s.largest_streak_wins, s.largest_streak_losses,
+        ], formats=[
+            None, FMT_INT, FMT_INT, FMT_INT, FMT_INT,
+            FMT_PCT, FMT_NUMBER, FMT_NUMBER, FMT_NUMBER,
+            FMT_NUMBER, FMT_NUMBER, FMT_NUMBER, FMT_NUMBER,
+            FMT_NUMBER, FMT_NUMBER, FMT_NUMBER,
+            FMT_INT, FMT_INT,
+        ])
+        row += 1
+
+    # Subseción: por activo
+    row += 2
+    ws.cell(row=row, column=1, value="POR ACTIVO").font = FONT_BOLD
+    row += 1
+    h2 = ["Activo", "Moneda", "# Trades", "# Win", "# Loss", "Winrate",
+          "Net PnL", "Avg PnL"]
+    _write_headers(ws, row, h2, [22, 8, 10, 8, 8, 10, 14, 14])
+    by_asset = trade_stats_by_asset(fills)
+    for item in by_asset:
+        row += 1
+        _write_row(ws, row, [
+            item["asset"], item["currency"], item["n_trades"],
+            item["n_winners"], item["n_losers"], item["winrate"],
+            item["net_pnl"], item["avg_pnl"],
+        ], formats=[
+            None, None, FMT_INT, FMT_INT, FMT_INT, FMT_PCT,
+            FMT_NUMBER, FMT_NUMBER,
+        ])
+
+    # Subseción: por cuenta
+    row += 3
+    ws.cell(row=row, column=1, value="POR CUENTA").font = FONT_BOLD
+    row += 1
+    h3 = ["Cuenta", "Moneda", "# Trades", "# Win", "# Loss", "Winrate", "Net PnL"]
+    _write_headers(ws, row, h3, [22, 8, 10, 8, 8, 10, 14])
+    by_acc = trade_stats_by_account(fills)
+    for item in by_acc:
+        row += 1
+        _write_row(ws, row, [
+            item["account"], item["currency"], item["n_trades"],
+            item["n_winners"], item["n_losers"], item["winrate"],
+            item["net_pnl"],
+        ], formats=[
+            None, None, FMT_INT, FMT_INT, FMT_INT, FMT_PCT, FMT_NUMBER,
+        ])
+
+
+def _sheet_invertible(wb, holdings, anchor_ccy):
+    """Sprint B: vista de PN invertible vs no-invertible."""
+    ws = wb.create_sheet("PN Invertible")
+
+    tp = total_pn(holdings, anchor_ccy)
+
+    ws.cell(row=1, column=1, value="PN INVERTIBLE vs NO-INVERTIBLE").font = FONT_BOLD
+    ws.cell(row=2, column=1,
+            value="Excluye cuentas marcadas como Investible=NO en la hoja 'cuentas'.").font = FONT_SUBTITLE
+
+    ws.cell(row=4, column=1, value="PN Total").font = FONT_NORMAL
+    cell = ws.cell(row=4, column=2, value=tp["total_anchor"])
+    cell.number_format = FMT_NUMBER
+    ws.cell(row=4, column=3, value=anchor_ccy).font = FONT_SUBTITLE
+
+    ws.cell(row=5, column=1, value="PN Invertible").font = FONT_BOLD
+    cell = ws.cell(row=5, column=2, value=tp["total_investible"])
+    cell.font = FONT_BOLD
+    cell.number_format = FMT_NUMBER
+
+    ws.cell(row=6, column=1, value="PN No-Invertible").font = FONT_NORMAL
+    cell = ws.cell(row=6, column=2, value=tp["total_non_investible"])
+    cell.number_format = FMT_NUMBER
+
+    # Cash por purpose
+    ws.cell(row=8, column=1, value="CASH POR PROPÓSITO").font = FONT_BOLD
+    _write_headers(ws, 9, ["Cash Purpose", f"MV ({anchor_ccy})"], [28, 16])
+    purposes = by_cash_purpose(holdings)
+    row = 10
+    for p, val in purposes.items():
+        _write_row(ws, row, [p, val], formats=[None, FMT_NUMBER])
+        row += 1
+
+    # Detalle no-invertibles
+    row += 2
+    ws.cell(row=row, column=1, value="HOLDINGS NO-INVERTIBLES").font = FONT_BOLD
+    row += 1
+    _write_headers(ws, row, [
+        "Cuenta", "Activo", "Asset Class", "Qty", f"MV ({anchor_ccy})", "Cash Purpose",
+    ], [22, 22, 14, 14, 16, 24])
+    non_inv = filter_non_investible(holdings)
+    non_inv = [h for h in non_inv if h["mv_anchor"] is not None and abs(h["mv_anchor"]) > 1e-6]
+    for h in non_inv:
+        row += 1
+        _write_row(ws, row, [
+            h["account"], h["asset"], h["asset_class"] or "",
+            h["qty"], h["mv_anchor"], h.get("cash_purpose") or "",
+        ], formats=[None, None, None, FMT_NUMBER4, FMT_NUMBER, None])
+
+
+def _sheet_buying_power(wb, conn, holdings, anchor_ccy):
+    """Sprint D: poder de compra por cuenta (BYMA aforos + IBKR margin)."""
+    ws = wb.create_sheet("Buying Power")
+
+    ws.cell(row=1, column=1, value="PODER DE COMPRA POR CUENTA").font = FONT_BOLD
+    ws.cell(row=2, column=1,
+            value=("Cocos/Eco: aforos BYMA. IBKR: RegT margin (verificá parámetros). "
+                   "Valores en moneda ancla.")).font = FONT_SUBTITLE
+
+    summary = buying_power_summary(conn, holdings, anchor_ccy)
+
+    if not summary:
+        ws.cell(row=4, column=1,
+                value="No hay cuentas broker con holdings/cash para calcular BP.").font = FONT_SUBTITLE
+        return
+
+    # Sección 1: resumen
+    headers = [
+        "Cuenta", "Tipo", f"Equity ({anchor_ccy})",
+        f"Cash ({anchor_ccy})", f"Holdings MV ({anchor_ccy})",
+        f"Garantía ({anchor_ccy})", f"Poder Compra ({anchor_ccy})",
+        "Leverage Ratio", "Notas",
+    ]
+    widths = [22, 10, 16, 16, 18, 16, 18, 12, 35]
+    _write_headers(ws, 4, headers, widths)
+    row = 5
+
+    for item in summary:
+        if item["type"] == "BYMA":
+            bp = item["result"]
+            equity = bp.cash_total + bp.holdings_mv
+            _write_row(ws, row, [
+                bp.account, "BYMA", equity,
+                bp.cash_total, bp.holdings_mv,
+                bp.garantia_total, bp.poder_de_compra,
+                bp.leverage_ratio, "Aforos BYMA aplicados",
+            ], formats=[
+                None, None, FMT_NUMBER,
+                FMT_NUMBER, FMT_NUMBER,
+                FMT_NUMBER, FMT_NUMBER,
+                FMT_NUMBER, None,
+            ])
+            row += 1
+        elif item["type"] == "MARGIN":
+            bp_o = item["overnight"]
+            bp_i = item["intraday"]
+            _write_row(ws, row, [
+                bp_o.account, "MARGIN (overnight)", bp_o.equity,
+                "", "",
+                bp_o.margin_disponible, bp_o.poder_de_compra,
+                bp_o.multiplier,
+                f"Mult x{bp_o.multiplier:.1f} | Funding {bp_o.funding_rate_annual*100:.2f}%/año",
+            ], formats=[
+                None, None, FMT_NUMBER,
+                None, None,
+                FMT_NUMBER, FMT_NUMBER,
+                FMT_NUMBER, None,
+            ])
+            row += 1
+            _write_row(ws, row, [
+                bp_i.account, "MARGIN (intraday)", bp_i.equity,
+                "", "",
+                bp_i.margin_disponible, bp_i.poder_de_compra,
+                bp_i.multiplier,
+                f"Mult x{bp_i.multiplier:.1f} | Day-trading BP",
+            ], formats=[
+                None, None, FMT_NUMBER,
+                None, None,
+                FMT_NUMBER, FMT_NUMBER,
+                FMT_NUMBER, None,
+            ])
+            row += 1
+
+    # Sección 2: detalle de aforos para cuentas BYMA
+    row += 2
+    ws.cell(row=row, column=1,
+            value="DETALLE GARANTÍAS POR HOLDING (BYMA)").font = FONT_BOLD
+    row += 1
+    _write_headers(ws, row, [
+        "Cuenta", "Activo", "Asset Class",
+        f"MV ({anchor_ccy})", "Aforo %", f"Garantía ({anchor_ccy})",
+    ], [22, 18, 12, 16, 10, 16])
+    for item in summary:
+        if item["type"] != "BYMA":
+            continue
+        bp = item["result"]
+        for d in bp.detalle_por_holding:
+            row += 1
+            _write_row(ws, row, [
+                bp.account, d["asset"], d["asset_class"],
+                d["mv_anchor"], d["aforo_pct"], d["garantia"],
+            ], formats=[
+                None, None, None,
+                FMT_NUMBER, FMT_PCT, FMT_NUMBER,
+            ])
+
+
+def _sheet_equity_curve(wb, conn, anchor_ccy):
+    """Sprint C: equity curve desde snapshots históricos."""
+    ws = wb.create_sheet("Equity Curve")
+
+    total_curve = get_equity_curve(conn, anchor_currency=anchor_ccy)
+    inv_curve = get_equity_curve(conn, anchor_currency=anchor_ccy,
+                                  investible_only=True)
+
+    ws.cell(row=1, column=1, value="EQUITY CURVE").font = FONT_BOLD
+    ws.cell(row=2, column=1,
+            value="Snapshots históricos del PN. Se appendea uno por cada corrida del reporte.").font = FONT_SUBTITLE
+
+    if not total_curve:
+        ws.cell(row=4, column=1,
+                value="Sin snapshots aún. Corré el reporte algunos días para ver evolución.").font = FONT_SUBTITLE
+        return
+
+    # Métricas
+    rets = calculate_returns(total_curve)
+    inv_rets = calculate_returns(inv_curve)
+
+    ws.cell(row=4, column=1, value="MÉTRICAS PORTFOLIO").font = FONT_BOLD
+    metrics = [
+        ("PN Inicial", rets["first_value"], FMT_NUMBER),
+        ("PN Actual", rets["last_value"], FMT_NUMBER),
+        ("Retorno Absoluto", rets["total_return_abs"], FMT_NUMBER),
+        ("Retorno %", rets["total_return_pct"], FMT_PCT),
+        ("Max Drawdown %", rets["max_drawdown_pct"], FMT_PCT),
+        ("# Snapshots", rets["n_periods"], FMT_INT),
+    ]
+    for i, (label, val, fmt) in enumerate(metrics, start=5):
+        ws.cell(row=i, column=1, value=label).font = FONT_NORMAL
+        c = ws.cell(row=i, column=2, value=val)
+        c.number_format = fmt
+        c.alignment = ALIGN_RIGHT
+    set_col = 4
+    ws.cell(row=4, column=set_col, value="MÉTRICAS PN INVERTIBLE").font = FONT_BOLD
+    inv_metrics = [
+        ("PN Inicial", inv_rets["first_value"], FMT_NUMBER),
+        ("PN Actual", inv_rets["last_value"], FMT_NUMBER),
+        ("Retorno Absoluto", inv_rets["total_return_abs"], FMT_NUMBER),
+        ("Retorno %", inv_rets["total_return_pct"], FMT_PCT),
+        ("Max Drawdown %", inv_rets["max_drawdown_pct"], FMT_PCT),
+    ]
+    for i, (label, val, fmt) in enumerate(inv_metrics, start=5):
+        ws.cell(row=i, column=set_col, value=label).font = FONT_NORMAL
+        c = ws.cell(row=i, column=set_col + 1, value=val)
+        c.number_format = fmt
+        c.alignment = ALIGN_RIGHT
+
+    # Tabla de la curva total
+    row = 13
+    ws.cell(row=row, column=1, value="EQUITY CURVE (TOTAL)").font = FONT_BOLD
+    row += 1
+    _write_headers(ws, row, ["Fecha", f"PN Total ({anchor_ccy})", f"PN Invertible ({anchor_ccy})"],
+                   [12, 18, 18])
+    inv_by_date = {p["fecha"]: p["mv_anchor"] for p in inv_curve}
+    for p in total_curve:
+        row += 1
+        _write_row(ws, row, [
+            p["fecha"], p["mv_anchor"], inv_by_date.get(p["fecha"]),
+        ], formats=[None, FMT_NUMBER, FMT_NUMBER])
+
+    # Por cuenta
+    by_acc = get_equity_curves_by_account(conn, anchor_currency=anchor_ccy)
+    if by_acc:
+        row += 3
+        ws.cell(row=row, column=1, value="EQUITY CURVE POR CUENTA").font = FONT_BOLD
+        row += 1
+        accounts = sorted(by_acc.keys())
+        _write_headers(ws, row, ["Fecha"] + accounts,
+                       [12] + [16] * len(accounts))
+        # Pivot por fecha
+        all_dates = sorted({p["fecha"] for curve in by_acc.values() for p in curve})
+        # Pre-calcular dict (account, fecha) -> mv
+        lookup = {(acc, p["fecha"]): p["mv_anchor"]
+                  for acc, curve in by_acc.items() for p in curve}
+        for d in all_dates:
+            row += 1
+            vals = [d] + [lookup.get((acc, d)) for acc in accounts]
+            fmts = [None] + [FMT_NUMBER] * len(accounts)
+            _write_row(ws, row, vals, formats=fmts)
+
+
 def _sheet_pnl_no_realizado(wb, holdings, anchor_ccy):
     ws = wb.create_sheet("PnL No-Realizado")
 
@@ -460,8 +781,13 @@ def _sheet_pnl_no_realizado(wb, holdings, anchor_ccy):
 # Excel export
 # =============================================================================
 
-def export_excel(conn, output_path, fecha=None, anchor_currency="USD"):
-    """Genera Excel multi-sheet del portfolio. Devuelve Path del archivo."""
+def export_excel(conn, output_path, fecha=None, anchor_currency="USD",
+                 record_snapshot=True):
+    """Genera Excel multi-sheet del portfolio. Devuelve Path del archivo.
+
+    Si record_snapshot=True, appendea un snapshot del PN a `pn_snapshots`
+    (necesario para construir la equity curve histórica).
+    """
     if fecha is None:
         fecha = date.today()
     output_path = Path(output_path)
@@ -470,8 +796,13 @@ def export_excel(conn, output_path, fecha=None, anchor_currency="USD"):
     holdings = calculate_holdings(conn, fecha=fecha, anchor_currency=anchor_currency)
     fills = calculate_realized_pnl(conn, fecha_hasta=fecha)
 
+    if record_snapshot:
+        try:
+            record_snapshots(conn, holdings, fecha, anchor_currency)
+        except Exception as e:
+            print(f"[exporter] WARN no se pudo guardar snapshot: {e}")
+
     wb = Workbook()
-    # Eliminar la hoja default que crea Workbook()
     if "Sheet" in wb.sheetnames:
         del wb["Sheet"]
 
@@ -479,10 +810,14 @@ def export_excel(conn, output_path, fecha=None, anchor_currency="USD"):
     _sheet_holdings(wb, holdings, anchor_currency)
     _sheet_pn_by_account(wb, holdings, anchor_currency)
     _sheet_pn_by_class(wb, holdings, anchor_currency)
+    _sheet_invertible(wb, holdings, anchor_currency)            # Sprint B
     _sheet_cash_position(wb, holdings, anchor_currency)
+    _sheet_buying_power(wb, conn, holdings, anchor_currency)    # Sprint D
+    _sheet_equity_curve(wb, conn, anchor_currency)              # Sprint C
     _sheet_tarjetas(wb, conn, fecha)
     _sheet_pnl_realizado(wb, fills, anchor_currency)
     _sheet_pnl_no_realizado(wb, holdings, anchor_currency)
+    _sheet_trade_stats(wb, fills, anchor_currency)              # Sprint A
 
     wb.save(str(output_path))
     return output_path
@@ -506,22 +841,29 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     margin: 0;
     padding: 20px;
   }}
-  .container {{ max-width: 1200px; margin: 0 auto; }}
+  .container {{ max-width: 1280px; margin: 0 auto; }}
   h1 {{ color: #1F3864; font-size: 28px; margin: 0 0 8px 0; }}
   .subtitle {{ color: #595959; font-size: 14px; margin-bottom: 24px; }}
-  .kpi {{
-    background: white; border-radius: 12px; padding: 24px;
-    margin-bottom: 24px; box-shadow: 0 2px 4px rgba(0,0,0,0.05);
+  .kpi-grid {{
+    display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px;
+    margin-bottom: 24px;
   }}
-  .kpi-label {{ color: #595959; font-size: 12px; text-transform: uppercase; }}
-  .kpi-value {{ font-size: 36px; font-weight: bold; color: #1F3864; }}
-  .kpi-currency {{ font-size: 16px; color: #595959; }}
+  .kpi {{
+    background: white; border-radius: 12px; padding: 20px;
+    box-shadow: 0 2px 4px rgba(0,0,0,0.05);
+  }}
+  .kpi-label {{ color: #595959; font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; }}
+  .kpi-value {{ font-size: 28px; font-weight: bold; color: #1F3864; margin-top: 4px; }}
+  .kpi-currency {{ font-size: 13px; color: #595959; }}
+  .kpi.muted .kpi-value {{ color: #595959; font-size: 22px; }}
   .grid {{ display: grid; grid-template-columns: 1fr 1fr; gap: 24px; }}
+  .grid-3 {{ display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; }}
   .card {{
     background: white; border-radius: 12px; padding: 20px;
     box-shadow: 0 2px 4px rgba(0,0,0,0.05);
   }}
   h2 {{ color: #1F3864; font-size: 18px; margin: 0 0 16px 0; }}
+  h3 {{ color: #1F3864; font-size: 14px; margin: 16px 0 8px 0; }}
   table {{ width: 100%; border-collapse: collapse; font-size: 13px; }}
   th {{
     background: #1F3864; color: white; padding: 10px;
@@ -533,10 +875,21 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   .positive {{ color: #00B050; }}
   .negative {{ color: #C00000; }}
   .chart-container {{ position: relative; height: 300px; }}
+  .chart-container.tall {{ height: 380px; }}
   .warn {{
     background: #FFF3CD; border-left: 4px solid #FFC107;
     padding: 12px; border-radius: 4px; margin-bottom: 16px; font-size: 13px;
   }}
+  .info {{
+    background: #E8F4F8; border-left: 4px solid #4F81BD;
+    padding: 10px 12px; border-radius: 4px; margin: 12px 0; font-size: 12px;
+    color: #595959;
+  }}
+  .stat-mini {{ display: flex; justify-content: space-between; padding: 4px 0;
+                border-bottom: 1px dashed #e0e0e0; font-size: 13px; }}
+  .stat-mini-label {{ color: #595959; }}
+  .stat-mini-value {{ font-weight: 600; font-variant-numeric: tabular-nums; }}
+  details summary {{ cursor: pointer; font-weight: 600; color: #1F3864; }}
 </style>
 </head>
 <body>
@@ -544,10 +897,22 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   <h1>📊 Portfolio</h1>
   <div class="subtitle">Fecha: {fecha}  ·  Moneda ancla: {anchor_ccy}</div>
 
-  <div class="kpi">
-    <div class="kpi-label">Patrimonio Neto Total</div>
-    <div class="kpi-value">{pn_formatted}</div>
-    <div class="kpi-currency">{anchor_ccy}</div>
+  <div class="kpi-grid">
+    <div class="kpi">
+      <div class="kpi-label">Patrimonio Neto Total</div>
+      <div class="kpi-value">{pn_formatted}</div>
+      <div class="kpi-currency">{anchor_ccy}</div>
+    </div>
+    <div class="kpi">
+      <div class="kpi-label">PN Invertible</div>
+      <div class="kpi-value">{pn_invertible_formatted}</div>
+      <div class="kpi-currency">{anchor_ccy} (excluye reserva)</div>
+    </div>
+    <div class="kpi muted">
+      <div class="kpi-label">PN No-Invertible</div>
+      <div class="kpi-value">{pn_non_invertible_formatted}</div>
+      <div class="kpi-currency">{anchor_ccy}</div>
+    </div>
   </div>
 
   {warn_html}
@@ -561,6 +926,25 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       <h2>Por Moneda Nativa</h2>
       <div class="chart-container"><canvas id="chartCcy"></canvas></div>
     </div>
+  </div>
+
+  <div class="card" style="margin-top: 24px;">
+    <h2>📈 Equity Curve</h2>
+    {equity_curve_block}
+  </div>
+
+  <div class="card" style="margin-top: 24px;">
+    <h2>🎯 Métricas de Trading (PnL Realizado FIFO)</h2>
+    {trade_stats_block}
+  </div>
+
+  <div class="card" style="margin-top: 24px;">
+    <h2>💪 Poder de Compra por Cuenta</h2>
+    <div class="info">
+      Cocos/Eco: aforos BYMA (caución). IBKR: RegT margin (verificá tus parámetros reales).
+      Valores en {anchor_ccy}.
+    </div>
+    {buying_power_block}
   </div>
 
   <div class="card" style="margin-top: 24px;">
@@ -600,6 +984,14 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     </div>
   </div>
 
+  <details class="card" style="margin-top: 24px;">
+    <summary>💵 Cash por Propósito (filtros)</summary>
+    <table style="margin-top: 12px;">
+      <thead><tr><th>Propósito</th><th class="num">MV ({anchor_ccy})</th></tr></thead>
+      <tbody>{cash_purpose_rows}</tbody>
+    </table>
+  </details>
+
   <div class="subtitle" style="margin-top: 24px; text-align: center;">
     Generado por wm_engine
   </div>
@@ -608,6 +1000,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 <script>
 const dataClass = {data_class_json};
 const dataCcy = {data_ccy_json};
+const equityData = {equity_curve_json};
 
 new Chart(document.getElementById('chartClass'), {{
   type: 'doughnut',
@@ -632,6 +1025,37 @@ new Chart(document.getElementById('chartCcy'), {{
   }},
   options: {{ responsive: true, maintainAspectRatio: false }}
 }});
+
+if (equityData && equityData.labels && equityData.labels.length > 0) {{
+  const palette = ['#1F3864','#00B050','#C00000','#FFC107','#9C27B0','#FF5722',
+                   '#4F81BD','#8DB4E2','#2E5B9C','#595959'];
+  const datasets = equityData.series.map((s, idx) => ({{
+    label: s.label,
+    data: s.values,
+    borderColor: palette[idx % palette.length],
+    backgroundColor: palette[idx % palette.length] + '20',
+    borderWidth: s.bold ? 3 : 1.5,
+    tension: 0.2,
+    fill: false,
+    spanGaps: true,
+  }}));
+  new Chart(document.getElementById('chartEquity'), {{
+    type: 'line',
+    data: {{ labels: equityData.labels, datasets: datasets }},
+    options: {{
+      responsive: true, maintainAspectRatio: false,
+      interaction: {{ mode: 'index', intersect: false }},
+      plugins: {{ legend: {{ position: 'bottom' }} }},
+      scales: {{
+        y: {{
+          ticks: {{
+            callback: v => v.toLocaleString('es-AR', {{ maximumFractionDigits: 0 }})
+          }}
+        }}
+      }}
+    }}
+  }});
+}}
 </script>
 </body>
 </html>
@@ -651,7 +1075,201 @@ def _fmt_pct(v):
     return f'<span class="{cls}">{v*100:+.2f}%</span>'
 
 
-def export_html(conn, output_path, fecha=None, anchor_currency="USD"):
+def _html_trade_stats_block(fills, anchor_ccy):
+    """Construye bloque HTML con métricas de trading."""
+    if not fills:
+        return '<div class="info">Sin trades cerrados aún. Vendé al menos una posición para ver métricas.</div>'
+
+    stats = calculate_trade_stats(fills)
+    if not stats:
+        return '<div class="info">Sin métricas calculables.</div>'
+
+    blocks = []
+    for ccy in sorted(stats.keys()):
+        s = stats[ccy]
+        pf_str = "∞" if s.profit_factor == float("inf") else f"{s.profit_factor:.2f}"
+        block = f"""
+<div style="margin-bottom: 18px;">
+  <h3>Moneda: {ccy} — {s.n_trades} trades cerrados</h3>
+  <div class="grid-3">
+    <div>
+      <div class="stat-mini"><span class="stat-mini-label">✅ Ganadores</span><span class="stat-mini-value positive">{s.n_winners}</span></div>
+      <div class="stat-mini"><span class="stat-mini-label">❌ Perdedores</span><span class="stat-mini-value negative">{s.n_losers}</span></div>
+      <div class="stat-mini"><span class="stat-mini-label">⚪ Scratch</span><span class="stat-mini-value">{s.n_scratch}</span></div>
+      <div class="stat-mini"><span class="stat-mini-label">Winrate</span><span class="stat-mini-value">{s.winrate*100:.1f}%</span></div>
+    </div>
+    <div>
+      <div class="stat-mini"><span class="stat-mini-label">Gross Profit</span><span class="stat-mini-value positive">{_fmt_number(s.gross_profit)}</span></div>
+      <div class="stat-mini"><span class="stat-mini-label">Gross Loss</span><span class="stat-mini-value negative">{_fmt_number(s.gross_loss)}</span></div>
+      <div class="stat-mini"><span class="stat-mini-label">Net PnL</span><span class="stat-mini-value {'positive' if s.net_pnl > 0 else 'negative' if s.net_pnl < 0 else ''}">{_fmt_number(s.net_pnl)}</span></div>
+      <div class="stat-mini"><span class="stat-mini-label">Profit Factor</span><span class="stat-mini-value">{pf_str}</span></div>
+    </div>
+    <div>
+      <div class="stat-mini"><span class="stat-mini-label">Avg Winner</span><span class="stat-mini-value positive">{_fmt_number(s.avg_winner)}</span></div>
+      <div class="stat-mini"><span class="stat-mini-label">Avg Loser</span><span class="stat-mini-value negative">{_fmt_number(s.avg_loser)}</span></div>
+      <div class="stat-mini"><span class="stat-mini-label">Expectancy</span><span class="stat-mini-value">{_fmt_number(s.expectancy)}</span></div>
+      <div class="stat-mini"><span class="stat-mini-label">Avg Holding (días)</span><span class="stat-mini-value">{s.avg_holding_days:.1f}</span></div>
+    </div>
+  </div>
+  <div class="stat-mini" style="margin-top: 8px;">
+    <span class="stat-mini-label">Best / Worst trade</span>
+    <span class="stat-mini-value"><span class="positive">{_fmt_number(s.best_trade)}</span> / <span class="negative">{_fmt_number(s.worst_trade)}</span></span>
+  </div>
+  <div class="stat-mini">
+    <span class="stat-mini-label">Racha máx wins / losses</span>
+    <span class="stat-mini-value">{s.largest_streak_wins} / {s.largest_streak_losses}</span>
+  </div>
+</div>
+"""
+        blocks.append(block)
+    return "".join(blocks)
+
+
+def _html_buying_power_block(conn, holdings, anchor_ccy):
+    """Construye bloque HTML del poder de compra."""
+    summary = buying_power_summary(conn, holdings, anchor_ccy)
+    if not summary:
+        return '<div class="info">No hay cuentas broker con holdings/cash.</div>'
+
+    rows = []
+    for item in summary:
+        if item["type"] == "BYMA":
+            bp = item["result"]
+            equity = bp.cash_total + bp.holdings_mv
+            lev = f"{bp.leverage_ratio:.2f}x"
+            rows.append(
+                f'<tr>'
+                f'<td><b>{bp.account}</b></td>'
+                f'<td>BYMA (caución)</td>'
+                f'<td class="num">{_fmt_number(equity)}</td>'
+                f'<td class="num">{_fmt_number(bp.cash_total)}</td>'
+                f'<td class="num">{_fmt_number(bp.garantia_holdings)}</td>'
+                f'<td class="num"><b>{_fmt_number(bp.poder_de_compra)}</b></td>'
+                f'<td class="num">{lev}</td>'
+                f'</tr>'
+            )
+        else:
+            bp_o = item["overnight"]
+            bp_i = item["intraday"]
+            funding_pct = bp_o.funding_rate_annual * 100
+            rows.append(
+                f'<tr>'
+                f'<td><b>{bp_o.account}</b></td>'
+                f'<td>MARGIN overnight</td>'
+                f'<td class="num">{_fmt_number(bp_o.equity)}</td>'
+                f'<td class="num">—</td>'
+                f'<td class="num">{_fmt_number(bp_o.margin_disponible)}</td>'
+                f'<td class="num"><b>{_fmt_number(bp_o.poder_de_compra)}</b></td>'
+                f'<td class="num">x{bp_o.multiplier:.1f}</td>'
+                f'</tr>'
+            )
+            rows.append(
+                f'<tr>'
+                f'<td></td>'
+                f'<td>MARGIN intraday</td>'
+                f'<td class="num">{_fmt_number(bp_i.equity)}</td>'
+                f'<td class="num">—</td>'
+                f'<td class="num">{_fmt_number(bp_i.margin_disponible)}</td>'
+                f'<td class="num"><b>{_fmt_number(bp_i.poder_de_compra)}</b></td>'
+                f'<td class="num">x{bp_i.multiplier:.1f}</td>'
+                f'</tr>'
+            )
+            rows.append(
+                f'<tr><td colspan="7" style="font-size: 11px; color: #595959; padding-left: 16px;">'
+                f'Funding rate: {funding_pct:.2f}%/año ({bp_o.funding_currency or "?"}) · '
+                f'Costo si usás todo el margen 1 día: {_fmt_number(bp_o.funding_cost_per_day)} {bp_o.funding_currency or anchor_ccy}</td></tr>'
+            )
+
+    return f"""
+<table>
+  <thead>
+    <tr>
+      <th>Cuenta</th><th>Tipo</th>
+      <th class="num">Equity</th>
+      <th class="num">Cash</th>
+      <th class="num">Garantía / Margin Disp.</th>
+      <th class="num">Poder de Compra</th>
+      <th class="num">Lev</th>
+    </tr>
+  </thead>
+  <tbody>{''.join(rows)}</tbody>
+</table>
+"""
+
+
+def _html_equity_curve_block(conn, anchor_ccy):
+    """Construye bloque HTML con gráfico equity curve."""
+    total_curve = get_equity_curve(conn, anchor_currency=anchor_ccy)
+    inv_curve = get_equity_curve(conn, anchor_currency=anchor_ccy,
+                                  investible_only=True)
+    if not total_curve:
+        return ('<div class="info">Sin snapshots aún. Cada vez que generás el reporte se '
+                'guarda un snapshot — corré el reporte algunos días para ver la evolución.</div>')
+
+    rets = calculate_returns(total_curve)
+    inv_rets = calculate_returns(inv_curve)
+
+    metrics_html = f"""
+<div class="grid-3" style="margin-bottom: 16px;">
+  <div>
+    <div class="stat-mini"><span class="stat-mini-label">PN inicial</span><span class="stat-mini-value">{_fmt_number(rets['first_value'])}</span></div>
+    <div class="stat-mini"><span class="stat-mini-label">PN actual</span><span class="stat-mini-value">{_fmt_number(rets['last_value'])}</span></div>
+  </div>
+  <div>
+    <div class="stat-mini"><span class="stat-mini-label">Retorno absoluto</span><span class="stat-mini-value {'positive' if rets['total_return_abs']>0 else 'negative' if rets['total_return_abs']<0 else ''}">{_fmt_number(rets['total_return_abs'])}</span></div>
+    <div class="stat-mini"><span class="stat-mini-label">Retorno %</span><span class="stat-mini-value {'positive' if rets['total_return_pct']>0 else 'negative' if rets['total_return_pct']<0 else ''}">{rets['total_return_pct']*100:+.2f}%</span></div>
+  </div>
+  <div>
+    <div class="stat-mini"><span class="stat-mini-label">Max Drawdown</span><span class="stat-mini-value negative">{rets['max_drawdown_pct']*100:.2f}%</span></div>
+    <div class="stat-mini"><span class="stat-mini-label">Snapshots</span><span class="stat-mini-value">{rets['n_periods']}</span></div>
+  </div>
+</div>
+<div class="chart-container tall"><canvas id="chartEquity"></canvas></div>
+"""
+    return metrics_html
+
+
+def _equity_curve_chart_data(conn, anchor_ccy):
+    """Prepara JSON para el chart Chart.js de equity curve."""
+    total_curve = get_equity_curve(conn, anchor_currency=anchor_ccy)
+    inv_curve = get_equity_curve(conn, anchor_currency=anchor_ccy,
+                                  investible_only=True)
+    by_acc = get_equity_curves_by_account(conn, anchor_currency=anchor_ccy)
+
+    if not total_curve:
+        return {"labels": [], "series": []}
+
+    # Unir todas las fechas únicas
+    all_dates = sorted({p["fecha"] for p in total_curve}
+                       | {p["fecha"] for p in inv_curve}
+                       | {p["fecha"] for c in by_acc.values() for p in c})
+
+    def values_for(curve):
+        m = {p["fecha"]: p["mv_anchor"] for p in curve}
+        return [m.get(d) for d in all_dates]
+
+    series = [
+        {"label": "Total", "values": values_for(total_curve), "bold": True},
+    ]
+    if inv_curve:
+        series.append({
+            "label": "Invertible", "values": values_for(inv_curve), "bold": True,
+        })
+    # Por cuenta — solo top-N por último valor para no llenar el chart
+    by_acc_sorted = sorted(
+        by_acc.items(),
+        key=lambda kv: -(kv[1][-1]["mv_anchor"] if kv[1] else 0),
+    )[:8]
+    for acc, curve in by_acc_sorted:
+        series.append({
+            "label": acc, "values": values_for(curve), "bold": False,
+        })
+
+    return {"labels": all_dates, "series": series}
+
+
+def export_html(conn, output_path, fecha=None, anchor_currency="USD",
+                record_snapshot=True):
     """Genera HTML autocontenido del portfolio. Devuelve Path."""
     if fecha is None:
         fecha = date.today()
@@ -660,6 +1278,12 @@ def export_html(conn, output_path, fecha=None, anchor_currency="USD"):
 
     holdings = calculate_holdings(conn, fecha=fecha, anchor_currency=anchor_currency)
     fills = calculate_realized_pnl(conn, fecha_hasta=fecha)
+
+    if record_snapshot:
+        try:
+            record_snapshots(conn, holdings, fecha, anchor_currency)
+        except Exception as e:
+            print(f"[exporter] WARN no se pudo guardar snapshot: {e}")
 
     tp = total_pn(holdings, anchor_currency)
     cls_data = by_asset_class(holdings)
@@ -712,14 +1336,30 @@ def export_html(conn, output_path, fecha=None, anchor_currency="USD"):
     if tp["total_unconverted_count"] > 0:
         warn = f'<div class="warn">⚠ {tp["total_unconverted_count"]} posiciones sin FX hacia {anchor_currency}, no incluidas en el total</div>'
 
+    # Cash purpose rows (Sprint B)
+    purposes = by_cash_purpose(holdings)
+    cash_purpose_rows = []
+    for p, val in purposes.items():
+        cash_purpose_rows.append(
+            f'<tr><td>{p}</td><td class="num">{_fmt_number(val)}</td></tr>'
+        )
+    if not cash_purpose_rows:
+        cash_purpose_rows.append('<tr><td colspan="2" style="color: #595959; text-align: center;">Sin cash registrado</td></tr>')
+
     html = HTML_TEMPLATE.format(
         fecha=fecha.isoformat(),
         anchor_ccy=anchor_currency,
         pn_formatted=_fmt_number(tp["total_anchor"]),
+        pn_invertible_formatted=_fmt_number(tp["total_investible"]),
+        pn_non_invertible_formatted=_fmt_number(tp["total_non_investible"]),
         warn_html=warn,
         top_holdings_rows="\n".join(top_rows),
         by_account_rows="\n".join(by_acc_rows),
         pnl_year_rows="\n".join(pnl_year_rows),
+        cash_purpose_rows="\n".join(cash_purpose_rows),
+        trade_stats_block=_html_trade_stats_block(fills, anchor_currency),
+        buying_power_block=_html_buying_power_block(conn, holdings, anchor_currency),
+        equity_curve_block=_html_equity_curve_block(conn, anchor_currency),
         data_class_json=json.dumps({
             "labels": list(cls_data.keys()),
             "values": list(cls_data.values()),
@@ -728,6 +1368,7 @@ def export_html(conn, output_path, fecha=None, anchor_currency="USD"):
             "labels": list(ccy_data.keys()),
             "values": list(ccy_data.values()),
         }),
+        equity_curve_json=json.dumps(_equity_curve_chart_data(conn, anchor_currency)),
     )
 
     output_path.write_text(html, encoding="utf-8")

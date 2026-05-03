@@ -156,6 +156,9 @@ CREATE TABLE IF NOT EXISTS accounts (
     card_close_day  INTEGER,                  -- día del mes en que cierra (1-31)
     card_due_day    INTEGER,                  -- día del mes en que vence (1-31)
     card_currency   TEXT,                     -- moneda en la que cierra ('ARS', 'USD')
+    -- Filtros de PN invertible (Sprint B):
+    investible      INTEGER NOT NULL DEFAULT 1,  -- 1 = se incluye en "PN invertible", 0 = excluido (ej: cash de reserva no declarado)
+    cash_purpose    TEXT,                         -- libre: 'OPERATIVO','RESERVA_NO_DECLARADO','GARANTIA_BLOQUEADA',...
     notes        TEXT,
     FOREIGN KEY (currency) REFERENCES currencies(code),
     FOREIGN KEY (card_currency) REFERENCES currencies(code),
@@ -281,6 +284,58 @@ CREATE TABLE IF NOT EXISTS prices (
 CREATE INDEX IF NOT EXISTS idx_prices_ticker_fecha ON prices(ticker, fecha);
 
 -- =============================================================================
+-- Snapshots históricos del PN (Sprint C: equity curve)
+-- =============================================================================
+
+-- Foto del PN por (fecha, cuenta, moneda ancla). Append-only.
+-- Genera la equity curve por cuenta y total.
+CREATE TABLE IF NOT EXISTS pn_snapshots (
+    fecha            TEXT NOT NULL,          -- ISO date
+    account          TEXT NOT NULL,          -- accounts.code (o '__TOTAL__' para total)
+    anchor_currency  TEXT NOT NULL,          -- moneda ancla (USD, USB, ARS)
+    mv_anchor        REAL NOT NULL,          -- valor de mercado en moneda ancla
+    investible_only  INTEGER NOT NULL DEFAULT 0,  -- 1 si excluye cuentas no-invertibles
+    notes            TEXT,
+    created_at       TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (fecha, account, anchor_currency, investible_only)
+);
+
+CREATE INDEX IF NOT EXISTS idx_snapshots_fecha ON pn_snapshots(fecha);
+CREATE INDEX IF NOT EXISTS idx_snapshots_account ON pn_snapshots(account);
+
+-- =============================================================================
+-- Aforos BYMA (Sprint D: poder de compra Cocos/Eco con caución)
+-- =============================================================================
+
+-- Aforo = porcentaje del valor de mercado que se acepta como garantía.
+-- Default por asset_class, override por ticker.
+-- Fuente: tabla publicada por BYMA / MAE / Aclear.
+CREATE TABLE IF NOT EXISTS aforos (
+    scope_type   TEXT NOT NULL,              -- 'CLASS' | 'TICKER'
+    scope_value  TEXT NOT NULL,              -- 'BOND_AR' o 'AL30D'
+    aforo_pct    REAL NOT NULL,              -- 0..1 (ej 0.85 = 85%)
+    source       TEXT,                        -- 'BYMA', 'manual', etc
+    notes        TEXT,
+    PRIMARY KEY (scope_type, scope_value)
+);
+
+-- =============================================================================
+-- Configuración de margin por cuenta (Sprint D: IBKR, etc)
+-- =============================================================================
+
+-- Margin/leverage configurable por cuenta. Solo se aplica donde tiene sentido
+-- (ej IBKR RegT). Cocos/Eco usan tabla de aforos (no este config).
+CREATE TABLE IF NOT EXISTS margin_config (
+    account              TEXT PRIMARY KEY,   -- accounts.code
+    multiplier_overnight REAL NOT NULL DEFAULT 1.0,  -- ej 2.0 (RegT overnight)
+    multiplier_intraday  REAL NOT NULL DEFAULT 1.0,  -- ej 4.0 (RegT day-trade)
+    funding_rate_annual  REAL NOT NULL DEFAULT 0.0,  -- decimal anual (ej 0.06)
+    funding_currency     TEXT,                       -- moneda del fondeo (USD, ARS)
+    notes                TEXT,
+    FOREIGN KEY (account) REFERENCES accounts(code)
+);
+
+-- =============================================================================
 -- Recurrencia y cuotas
 -- =============================================================================
 
@@ -403,14 +458,17 @@ def insert_currency(conn, code, name, is_stable=False, quote_vs=None,
 
 def insert_account(conn, code, name, kind, institution=None, currency=None,
                    card_cycle_kind="NONE", card_close_day=None,
-                   card_due_day=None, card_currency=None, notes=None):
+                   card_due_day=None, card_currency=None,
+                   investible=1, cash_purpose=None, notes=None):
     conn.execute(
         """INSERT OR REPLACE INTO accounts
            (code, name, kind, institution, currency, card_cycle_kind,
-            card_close_day, card_due_day, card_currency, notes)
-           VALUES (?,?,?,?,?,?,?,?,?,?)""",
+            card_close_day, card_due_day, card_currency,
+            investible, cash_purpose, notes)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
         (code, name, kind, institution, currency, card_cycle_kind,
-         card_close_day, card_due_day, card_currency, notes),
+         card_close_day, card_due_day, card_currency,
+         int(bool(investible)), cash_purpose, notes),
     )
 
 
@@ -452,4 +510,40 @@ def insert_movement(conn, event_id, account, asset, qty,
            VALUES (?,?,?,?,?,?,?,?)""",
         (event_id, account, asset, qty, unit_price, price_currency,
          cost_basis, notes),
+    )
+
+
+def insert_aforo(conn, scope_type, scope_value, aforo_pct,
+                 source=None, notes=None):
+    """Inserta un aforo. scope_type: 'CLASS' | 'TICKER'."""
+    conn.execute(
+        """INSERT OR REPLACE INTO aforos
+           (scope_type, scope_value, aforo_pct, source, notes)
+           VALUES (?,?,?,?,?)""",
+        (scope_type, scope_value, float(aforo_pct), source, notes),
+    )
+
+
+def insert_margin_config(conn, account, multiplier_overnight=1.0,
+                         multiplier_intraday=1.0, funding_rate_annual=0.0,
+                         funding_currency=None, notes=None):
+    conn.execute(
+        """INSERT OR REPLACE INTO margin_config
+           (account, multiplier_overnight, multiplier_intraday,
+            funding_rate_annual, funding_currency, notes)
+           VALUES (?,?,?,?,?,?)""",
+        (account, float(multiplier_overnight), float(multiplier_intraday),
+         float(funding_rate_annual), funding_currency, notes),
+    )
+
+
+def insert_pn_snapshot(conn, fecha, account, anchor_currency, mv_anchor,
+                       investible_only=0, notes=None):
+    """Inserta/sobreescribe un snapshot de PN."""
+    conn.execute(
+        """INSERT OR REPLACE INTO pn_snapshots
+           (fecha, account, anchor_currency, mv_anchor, investible_only, notes)
+           VALUES (?,?,?,?,?,?)""",
+        (fecha, account, anchor_currency, float(mv_anchor),
+         int(bool(investible_only)), notes),
     )

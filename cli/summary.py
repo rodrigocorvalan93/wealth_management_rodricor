@@ -20,8 +20,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from engine.importer import import_all
 from engine.holdings import (
-    calculate_holdings, total_pn, by_asset_class, by_account, by_currency
+    calculate_holdings, total_pn, by_asset_class, by_account, by_currency,
+    by_cash_purpose,
 )
+from engine.pnl import calculate_realized_pnl
+from engine.trade_stats import calculate_trade_stats
+from engine.buying_power import buying_power_summary
 
 
 def _fmt_money(value, decimals=2):
@@ -39,6 +43,51 @@ def _fmt_pct(value):
     return f"{value*100:+.2f}%"
 
 
+def print_trade_stats(fills):
+    """Sprint A: imprime métricas de trading."""
+    if not fills:
+        print()
+        print("  TRADING METRICS: sin trades cerrados todavía.")
+        return
+    stats = calculate_trade_stats(fills)
+    print()
+    print("  TRADING METRICS  (PnL Realizado FIFO)")
+    print("  " + "-" * 80)
+    print(f"    {'Moneda':<8} {'#Tr':>5} {'Win':>5} {'Loss':>5} {'WR':>7} "
+          f"{'Net PnL':>14} {'PF':>7} {'Expect':>10} {'AvgHold(d)':>11}")
+    for ccy in sorted(stats.keys()):
+        s = stats[ccy]
+        pf = "∞" if s.profit_factor == float("inf") else f"{s.profit_factor:.2f}"
+        print(f"    {s.currency:<8} {s.n_trades:>5} {s.n_winners:>5} {s.n_losers:>5} "
+              f"{s.winrate*100:>6.1f}% {s.net_pnl:>14,.2f} {pf:>7} "
+              f"{s.expectancy:>10,.2f} {s.avg_holding_days:>11.1f}")
+
+
+def print_buying_power(conn, holdings, anchor_ccy):
+    """Sprint D: imprime poder de compra por cuenta."""
+    summary = buying_power_summary(conn, holdings, anchor_ccy)
+    if not summary:
+        return
+    print()
+    print(f"  PODER DE COMPRA POR CUENTA  ({anchor_ccy})")
+    print("  " + "-" * 80)
+    for item in summary:
+        if item["type"] == "BYMA":
+            bp = item["result"]
+            print(f"    [BYMA] {bp.account:<22} cash {_fmt_money(bp.cash_total):>14} | "
+                  f"holdings {_fmt_money(bp.holdings_mv):>14} | "
+                  f"BP {_fmt_money(bp.poder_de_compra):>14} ({bp.leverage_ratio:.2f}x)")
+        else:
+            bp_o = item["overnight"]
+            bp_i = item["intraday"]
+            print(f"    [MARG] {bp_o.account:<22} equity {_fmt_money(bp_o.equity):>14} | "
+                  f"BP-ON {_fmt_money(bp_o.poder_de_compra):>14} (x{bp_o.multiplier:.0f}) | "
+                  f"BP-ID {_fmt_money(bp_i.poder_de_compra):>14} (x{bp_i.multiplier:.0f})")
+            print(f"           funding {bp_o.funding_rate_annual*100:.2f}%/año "
+                  f"({bp_o.funding_currency or '?'}) — costo/día margen máx: "
+                  f"{_fmt_money(bp_o.funding_cost_per_day, decimals=4)}")
+
+
 def print_summary(holdings, anchor_ccy):
     print()
     print("=" * 90)
@@ -48,6 +97,9 @@ def print_summary(holdings, anchor_ccy):
     tp = total_pn(holdings, anchor_ccy)
     print()
     print(f"  PATRIMONIO NETO TOTAL: {_fmt_money(tp['total_anchor']):>20} {anchor_ccy}")
+    print(f"  PN INVERTIBLE:         {_fmt_money(tp['total_investible']):>20} {anchor_ccy}")
+    if abs(tp['total_non_investible']) > 1e-6:
+        print(f"  PN NO-INVERTIBLE:      {_fmt_money(tp['total_non_investible']):>20} {anchor_ccy}  (cash de reserva, etc)")
     if tp["total_unconverted_count"] > 0:
         print(f"  (⚠ {tp['total_unconverted_count']} posiciones sin FX, no incluidas en total)")
 
@@ -110,6 +162,15 @@ def print_summary(holdings, anchor_ccy):
         for asset, ccy, mv in tp["unconverted"]:
             print(f"    {asset:<22} mv: {_fmt_money(mv):>20} {ccy}")
 
+    # Cash por propósito (Sprint B)
+    purposes = by_cash_purpose(holdings)
+    if len(purposes) > 1:
+        print()
+        print(f"  CASH POR PROPÓSITO  ({anchor_ccy})")
+        print("  " + "-" * 60)
+        for p, val in purposes.items():
+            print(f"    {p:<28} {_fmt_money(val):>20}")
+
     print()
     print("=" * 90)
     print(f"  Total filas: {len(holdings)}")
@@ -148,8 +209,12 @@ def main():
 
     print(f"[summary] calculando holdings al {fecha} (ancla: {anchor_ccy})...")
     holdings = calculate_holdings(conn, fecha=fecha, anchor_currency=anchor_ccy)
+    fills = calculate_realized_pnl(conn, fecha_hasta=fecha)
 
     print_summary(holdings, anchor_ccy)
+    print_trade_stats(fills)
+    print_buying_power(conn, holdings, anchor_ccy)
+    print()
     return 0
 
 
