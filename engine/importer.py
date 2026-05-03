@@ -33,6 +33,7 @@ from .schema import (
     insert_account, insert_currency, insert_asset,
     insert_event, insert_movement,
 )
+from .fx import convert as fx_convert, FxError, auto_load_fx
 
 
 # =============================================================================
@@ -97,6 +98,8 @@ def _read_rows(ws, header_row: int = 4):
     headers = []
     for c in range(1, ws.max_column + 1):
         h = ws.cell(row=header_row, column=c).value
+        if isinstance(h, str):
+            h = h.strip()
         headers.append(h)
     data_start = header_row + 1
     for r in range(data_start, ws.max_row + 1):
@@ -177,8 +180,24 @@ def import_especies(conn, ws):
     return n
 
 
+def _get_asset_currency(conn, ticker: str) -> Optional[str]:
+    """Lee la moneda nativa de un asset desde la tabla `assets`."""
+    cur = conn.execute("SELECT currency FROM assets WHERE ticker=?", (ticker,))
+    row = cur.fetchone()
+    if row is None:
+        return None
+    return row["currency"] if hasattr(row, "keys") else row[0]
+
+
 def import_blotter(conn, ws):
-    """Hoja 'blotter': cada fila → un event TRADE + 2 movements."""
+    """Hoja 'blotter': cada fila → un event TRADE + 2 movements.
+
+    Si la moneda del trade != moneda nativa del asset, convierte el unit_price
+    a la moneda nativa usando FX del día. El cash sigue moviéndose en la
+    moneda real del trade. Esto mantiene:
+      - inventario en moneda nativa del bono (USB para AL30, USD para AAPL)
+      - cash en la moneda real que se intercambió (ARS, USB, USDT, etc)
+    """
     n = 0
     for r, row in _read_rows(ws):
         ticker = _to_str(row.get("Ticker"))
@@ -203,6 +222,26 @@ def import_blotter(conn, ws):
         description = (_to_str(row.get("Description"))
                        or f"{side} {qty} {ticker} @ {precio}")
 
+        # FX: si la moneda del trade != moneda nativa del asset, convertir
+        # el unit_price a moneda nativa para que el inventario sea consistente.
+        asset_ccy = _get_asset_currency(conn, ticker)
+        if asset_ccy is None:
+            # Asset no existe en `assets` — usar moneda del trade como fallback
+            asset_ccy = moneda
+
+        if asset_ccy != moneda:
+            try:
+                # Convertir el precio unitario: precio (en moneda) → precio en asset_ccy
+                precio_native = fx_convert(
+                    conn, precio, moneda, asset_ccy, trade_date,
+                )
+            except FxError as e:
+                # Falla limpia: log y skip esta fila
+                print(f"[importer] WARN blotter row {r}: {e} — skipping")
+                continue
+        else:
+            precio_native = precio
+
         # Crear evento
         eid = insert_event(
             conn, EventType.TRADE,
@@ -213,24 +252,31 @@ def import_blotter(conn, ws):
         )
 
         # Movements:
-        # BUY: cuenta GANA ticker, cuenta_cash PIERDE cash (qty × precio)
+        # BUY: cuenta GANA ticker, cuenta_cash PIERDE cash (qty × precio_trade)
         # SELL: cuenta PIERDE ticker, cuenta_cash GANA cash
         sign = 1 if side == "BUY" else -1
-        cost_total = qty * precio  # siempre positivo
 
-        # Movement 1: el activo
+        # Cost basis y unit_price del INVENTARIO en moneda nativa del asset
+        cost_basis_native = qty * precio_native
+        # Cash en moneda real del trade
+        cash_total = qty * precio  # siempre positivo
+
+        # Movement 1: el activo (precio en moneda nativa)
         insert_movement(
             conn, eid,
             account=cuenta, asset=ticker,
             qty=sign * qty,
-            unit_price=precio, price_currency=moneda,
-            cost_basis=sign * cost_total,
+            unit_price=precio_native,
+            price_currency=asset_ccy,
+            cost_basis=sign * cost_basis_native,
+            notes=(f"FX: {moneda}→{asset_ccy} en {trade_date}"
+                   if asset_ccy != moneda else None),
         )
-        # Movement 2: el cash (con signo opuesto)
+        # Movement 2: el cash (en moneda del trade)
         insert_movement(
             conn, eid,
             account=cuenta_cash, asset=moneda,
-            qty=-sign * cost_total,
+            qty=-sign * cash_total,
         )
 
         # Comisión opcional
@@ -626,8 +672,14 @@ def import_asientos(conn, ws):
 # =============================================================================
 
 def import_all(db_path: str | Path, xlsx_path: str | Path,
-               fecha_corte: date = None) -> dict:
-    """Importa el master Excel completo a la DB. Devuelve estadísticas."""
+               fecha_corte: date = None,
+               fx_csv_path: str | Path = None,
+               data_dir: str | Path = "data") -> dict:
+    """Importa el master Excel completo a la DB. Devuelve estadísticas.
+
+    fx_csv_path: si se pasa, importa ese CSV específicamente.
+                 Si es None, intenta auto-cargar `<data_dir>/fx_historico.csv`.
+    """
     from .schema import init_db
     if fecha_corte is None:
         fecha_corte = date.today()
@@ -650,6 +702,15 @@ def import_all(db_path: str | Path, xlsx_path: str | Path,
     if "especies" in wb.sheetnames:
         stats["especies"] = import_especies(conn, wb["especies"])
 
+    conn.commit()
+
+    # 1b. Cargar FX histórico ANTES de procesar trades
+    #     (necesario para conversión cuando Moneda Trade != asset.currency)
+    if fx_csv_path:
+        from .fx import import_fx_csv
+        stats["fx_rates"] = import_fx_csv(conn, fx_csv_path)
+    else:
+        stats["fx_rates"] = auto_load_fx(conn, data_dir)
     conn.commit()
 
     # 2. Eventos

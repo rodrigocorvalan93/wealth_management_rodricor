@@ -292,6 +292,212 @@ def test_9_v_balances():
         conn.close()
 
 
+def test_10_fx_module():
+    """Tests del módulo fx: get_rate, convert con cross-rates."""
+    print("\nTest 10 (FX module):")
+    from engine.fx import get_rate, convert, FxError
+    from engine.schema import init_db
+
+    with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as f:
+        dbpath = Path(f.name)
+    try:
+        conn = init_db(dbpath, drop_existing=True)
+        # Cargar FX manualmente: USB y USD el 2026-04-30
+        conn.execute(
+            "INSERT INTO fx_rates (fecha, moneda, rate, base, source) VALUES (?,?,?,?,?)",
+            ("2026-04-30", "USB", 1180.0, "ARS", "test"),
+        )
+        conn.execute(
+            "INSERT INTO fx_rates (fecha, moneda, rate, base, source) VALUES (?,?,?,?,?)",
+            ("2026-04-30", "USD", 1380.0, "ARS", "test"),
+        )
+        conn.commit()
+
+        # Caso 1: get_rate exacto
+        assert abs(get_rate(conn, "2026-04-30", "USB") - 1180.0) < 1e-6
+        print(f"  ✓ get_rate exacto: USB/ARS @ 2026-04-30 = 1180.0")
+
+        # Caso 2: moneda == base
+        assert get_rate(conn, "2026-04-30", "ARS") == 1.0
+        print(f"  ✓ ARS/ARS = 1.0")
+
+        # Caso 3: fallback a día anterior
+        rate = get_rate(conn, "2026-05-02", "USB", fallback_days=7)
+        assert abs(rate - 1180.0) < 1e-6
+        print(f"  ✓ Fallback 2 días: USB/ARS @ 2026-05-02 (no hay) → 2026-04-30 = 1180.0")
+
+        # Caso 4: convert ARS → USB (1180 ARS = 1 USB)
+        result = convert(conn, 11800, "ARS", "USB", "2026-04-30")
+        assert abs(result - 10) < 1e-6
+        print(f"  ✓ Convert: 11800 ARS → USB @ 1180 = 10 USB")
+
+        # Caso 5: convert USB → ARS
+        result = convert(conn, 10, "USB", "ARS", "2026-04-30")
+        assert abs(result - 11800) < 1e-6
+        print(f"  ✓ Convert: 10 USB → ARS @ 1180 = 11800 ARS")
+
+        # Caso 6: cross-rate USB → USD
+        # 1 USB = 1180 ARS, 1 USD = 1380 ARS, entonces 1 USB = 1180/1380 USD = 0.855 USD
+        result = convert(conn, 1, "USB", "USD", "2026-04-30")
+        expected = 1180.0 / 1380.0
+        assert abs(result - expected) < 1e-6
+        print(f"  ✓ Cross-rate: 1 USB → USD = {result:.4f} (esperado {expected:.4f})")
+
+        # Caso 7: FX faltante levanta FxError
+        try:
+            convert(conn, 100, "EUR", "ARS", "2026-04-30")
+            assert False, "Esperaba FxError"
+        except FxError as e:
+            print(f"  ✓ Faltante levanta FxError: {e}")
+
+        conn.close()
+    finally:
+        dbpath.unlink(missing_ok=True)
+
+
+def test_11_blotter_with_fx_conversion():
+    """Trade en moneda distinta a la nativa: motor convierte unit_price con FX."""
+    print("\nTest 11 (blotter FX conversion):")
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        xlsx = tmp / "test.xlsx"
+        db = tmp / "test.db"
+        # CSV de FX con USB y USD
+        fxcsv = tmp / "fx_historico.csv"
+        fxcsv.write_text(
+            "fecha,moneda,rate,base,source\n"
+            "2026-04-28,USB,1170.0,ARS,test\n"
+            "2026-04-30,USB,1180.0,ARS,test\n"
+            "2026-04-30,USD,1380.0,ARS,test\n",
+            encoding="utf-8",
+        )
+        build_master(xlsx)
+
+        # Modificar el master: cambiar el ticker de prueba a uno donde
+        # moneda trade != currency. Vamos a usar especies AL30D (currency=USB)
+        # y agregar un trade en ARS de AL30D para forzar conversión.
+        from openpyxl import load_workbook
+        wb = load_workbook(filename=str(xlsx))
+        # Hoja blotter: agregar fila de prueba al final de los ejemplos
+        ws = wb["blotter"]
+        # Las filas existentes son 5 y 6 (TXMJ9). Agrego en fila 7
+        # Trade en ARS de AL30D (que es USB) para forzar conversion
+        ws.cell(row=7, column=1).value = "T9999"        # Trade ID
+        ws.cell(row=7, column=2).value = date(2026, 4, 30)  # Trade Date
+        ws.cell(row=7, column=3).value = date(2026, 4, 30)  # Settle Date
+        ws.cell(row=7, column=4).value = "cocos"        # Cuenta
+        ws.cell(row=7, column=5).value = "BH"            # Strategy
+        ws.cell(row=7, column=6).value = "AL30D"         # Ticker (currency=USB)
+        ws.cell(row=7, column=7).value = "BUY"           # Side
+        ws.cell(row=7, column=8).value = 1000             # Qty
+        ws.cell(row=7, column=9).value = 850             # Precio EN ARS
+        ws.cell(row=7, column=10).value = "ARS"          # Moneda Trade ARS!=USB
+        ws.cell(row=7, column=11).value = "cocos"        # Cuenta Cash
+        ws.cell(row=7, column=12).value = 0              # Comisión
+        ws.cell(row=7, column=13).value = "ARS"          # Moneda Com
+        ws.cell(row=7, column=14).value = "BUY 1000 AL30D pagando ARS"
+        ws.cell(row=7, column=15).value = "FX test"
+        wb.save(str(xlsx))
+
+        # Importar con fx_csv_path explícito
+        stats = import_all(db, xlsx, fecha_corte=date(2026, 5, 2),
+                           fx_csv_path=fxcsv)
+        assert stats.get("fx_rates", 0) >= 3, f"FX cargado: {stats.get('fx_rates')}"
+        print(f"  ✓ FX cargado: {stats['fx_rates']} filas")
+
+        conn = sqlite3.connect(str(db))
+        conn.row_factory = sqlite3.Row
+
+        # Verificar el trade T9999: el cash sale en ARS (850000)
+        cur = conn.execute(
+            """SELECT m.* FROM movements m
+               JOIN events e ON e.event_id=m.event_id
+               WHERE e.external_id='T9999' AND m.account='cocos'"""
+        )
+        rows = list(cur.fetchall())
+        assert len(rows) == 2, f"Esperaba 2 movements, got {len(rows)}"
+
+        # Movement del activo (AL30D):
+        asset_mov = [r for r in rows if r["asset"] == "AL30D"][0]
+        # qty = +1000
+        assert abs(asset_mov["qty"] - 1000) < 1e-3
+        # unit_price convertido a USB: 850 ARS / 1180 ARS-por-USB = 0.7203 USB
+        expected_native = 850 / 1180
+        assert abs(asset_mov["unit_price"] - expected_native) < 1e-4, \
+            f"unit_price native: {asset_mov['unit_price']} vs esperado {expected_native}"
+        # price_currency = USB (la nativa)
+        assert asset_mov["price_currency"] == "USB", \
+            f"price_currency: {asset_mov['price_currency']}"
+        print(f"  ✓ Activo AL30D: qty=1000, unit_price={asset_mov['unit_price']:.4f} USB")
+
+        # Movement del cash (ARS):
+        cash_mov = [r for r in rows if r["asset"] == "ARS"][0]
+        # cash sale: -850 * 1000 = -850000 ARS
+        assert abs(cash_mov["qty"] + 850000) < 1
+        print(f"  ✓ Cash ARS: qty={cash_mov['qty']:,.0f}")
+
+        # Verificación contable:
+        # - inventario AL30D: aumenta en 1000 a precio ~0.72 USB
+        # - cash ARS: cae en 850000 ARS
+        # - 850000 ARS / 1180 = 720.34 USB (que es 1000 × 0.7203 USB)
+        # cost_basis del asset:
+        expected_cost_basis = 1000 * (850 / 1180)
+        assert abs(asset_mov["cost_basis"] - expected_cost_basis) < 1e-2
+        print(f"  ✓ Cost basis AL30D: {asset_mov['cost_basis']:.4f} USB "
+              f"(= 850000 ARS / 1180)")
+        conn.close()
+
+
+def test_12_blotter_without_fx_skips():
+    """Trade en moneda distinta sin FX cargado: skipea fila con warning."""
+    print("\nTest 12 (blotter sin FX → skip con warning):")
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        xlsx = tmp / "test.xlsx"
+        db = tmp / "test.db"
+        build_master(xlsx)
+
+        # Hoja blotter: agregar trade en moneda distinta SIN cargar FX
+        from openpyxl import load_workbook
+        wb = load_workbook(filename=str(xlsx))
+        ws = wb["blotter"]
+        # Trade de AL30D pagando en USDT (sin FX cargado de USDT)
+        ws.cell(row=7, column=1).value = "T_NOFX"
+        ws.cell(row=7, column=2).value = date(2026, 4, 30)
+        ws.cell(row=7, column=3).value = date(2026, 4, 30)
+        ws.cell(row=7, column=4).value = "binance"
+        ws.cell(row=7, column=5).value = "BH"
+        ws.cell(row=7, column=6).value = "AL30D"
+        ws.cell(row=7, column=7).value = "BUY"
+        ws.cell(row=7, column=8).value = 100
+        ws.cell(row=7, column=9).value = 0.85
+        ws.cell(row=7, column=10).value = "USDT"  # No hay FX USDT/ARS cargado
+        ws.cell(row=7, column=11).value = "binance"
+        ws.cell(row=7, column=12).value = 0
+        ws.cell(row=7, column=13).value = "USDT"
+        ws.cell(row=7, column=14).value = "BUY USDT sin FX"
+        ws.cell(row=7, column=15).value = ""
+        wb.save(str(xlsx))
+
+        # Importar sin FX disponible
+        stats = import_all(db, xlsx, fecha_corte=date(2026, 5, 2),
+                           fx_csv_path=tmp / "noexiste.csv")
+        # blotter debería tener solo 2 (los originales TXMJ9), no 3
+        # porque T_NOFX se skipea por falta de FX
+        assert stats["blotter"] == 2, f"blotter trades: {stats['blotter']}"
+        print(f"  ✓ Trade sin FX: skipped (blotter cargados = 2, esperado 2)")
+
+        conn = sqlite3.connect(str(db))
+        conn.row_factory = sqlite3.Row
+        cur = conn.execute(
+            "SELECT COUNT(*) AS n FROM events WHERE external_id='T_NOFX'"
+        )
+        n = cur.fetchone()["n"]
+        assert n == 0, f"T_NOFX no debería estar (n={n})"
+        print(f"  ✓ T_NOFX no creó evento (correcto)")
+        conn.close()
+
+
 # =============================================================================
 # Main
 # =============================================================================
@@ -307,6 +513,9 @@ if __name__ == "__main__":
         test_7_recurrentes_expansion,
         test_8_asientos_apertura,
         test_9_v_balances,
+        test_10_fx_module,
+        test_11_blotter_with_fx_conversion,
+        test_12_blotter_without_fx_skips,
     ]
     for t in tests:
         t()
