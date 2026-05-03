@@ -1,5 +1,4 @@
-﻿DELTA_AHORRO_PLUS_A|Delta Ahorro Plus - Clase A
-DELTA_RENTA_A|Delta Renta - Clase A
+DELTA_AHORRO_PLUS_A|Delta Ahorro Plus - Clase A
 DELTA_ACCIONES_A|Delta Acciones - Clase A
 DELTA_GESTION_VI_A|Delta Gestion VI - Clase A
 DELTA_GESTION_XIII_A|Delta Gestion XIII - Clase A
@@ -7,5 +6,3 @@ DELTA_RETORNO_REAL_A|Delta Retorno Real - Clase A
 DELTA_LATINOAMERICA_A|Delta Latinoamerica - Clase A
 DELTA_RENTA_DOLARES_D|Delta Renta Dolares - Clase D
 DELTA_SELECT_A|Delta Select - Clase A
-FIMA_PREMIUM_DOLARES_A|Fima Premium Dólares - Clase A
-FIMA_RENTA_FIJA_DOLARES_C|Fima Renta Fija Dólares - Clase C

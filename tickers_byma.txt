@@ -4,10 +4,7 @@
 
 # Bonos en USB (MEP)
 AO27D
-AL30D
 AE38D
-GD30D
-GD35D
 MGCND
 
 # Bonos en USD (cable)
@@ -25,6 +22,9 @@ X30S6
 
 # BOPREALEs
 BPC7D
+
+# CEDEAREs
+AAPL
 
 
 

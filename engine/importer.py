@@ -98,8 +98,6 @@ def _read_rows(ws, header_row: int = 4):
     headers = []
     for c in range(1, ws.max_column + 1):
         h = ws.cell(row=header_row, column=c).value
-        if isinstance(h, str):
-            h = h.strip()
         headers.append(h)
     data_start = header_row + 1
     for r in range(data_start, ws.max_row + 1):
@@ -711,6 +709,12 @@ def import_all(db_path: str | Path, xlsx_path: str | Path,
         stats["fx_rates"] = import_fx_csv(conn, fx_csv_path)
     else:
         stats["fx_rates"] = auto_load_fx(conn, data_dir)
+    conn.commit()
+
+    # 1c. Cargar precios de mercado (BYMA + CAFCI + cripto + yfinance)
+    from .prices import auto_load_all as auto_load_prices
+    price_stats = auto_load_prices(conn, data_dir)
+    stats["prices"] = sum(price_stats.values())
     conn.commit()
 
     # 2. Eventos

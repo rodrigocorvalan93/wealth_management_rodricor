@@ -2,22 +2,24 @@
 """
 cafci_loader.py
 
-Loader diario de cuotapartes (VCP) de FCIs desde la API de CAFCI, en formato
-compatible con la planilla personal de finanzas v3.1.
+Loader diario de cuotapartes (VCP) de FCIs desde la API de CAFCI.
 
 CONVENCIÓN:
   - VCP normalizada = vcp_raw / 1000  (la API de CAFCI siempre devuelve en miles)
   - Moneda nativa del FCI sale del campo `moneda` del response (ARS/USD)
+  - PERO si el ticker está en tu hoja `especies` del master Excel, se usa la
+    moneda definida ahí (override). Esto resuelve casos donde CAFCI clasifica
+    un fondo como USD pero vos sabés que es USB-MEP.
 
 OUTPUT (formato compatible con planilla v3.1):
-  precios_historico.csv  →  Fecha, Ticker, Precio, Moneda, Fuente
+  data/precios_cafci.csv  →  Fecha, Ticker, Precio, Moneda, Fuente
 
 Si el archivo destino ya existe, ANEXA filas nuevas (no pisa).
 Si para una (Fecha, Ticker) ya hay una fila cargada, la actualiza con el
 nuevo dato (último gana — útil si corrés el loader varias veces el mismo día).
 
 USO:
-    # último reporte (default — usa get_daily_report)
+    # último reporte (default — usa get_daily_report) con override de moneda
     python cafci_loader.py
 
     # un día específico
@@ -28,6 +30,12 @@ USO:
 
     # output a otra carpeta
     python cafci_loader.py --output-dir ./mi_data
+
+    # NO usar override de moneda (respetar lo que dice CAFCI)
+    python cafci_loader.py --no-xlsx-currency
+
+    # Excel master alternativo (default: inputs/wealth_management_rodricor.xlsx)
+    python cafci_loader.py --xlsx mi_master.xlsx
 
     # solo print, no escribir CSV (modo prueba)
     python cafci_loader.py --dry-run
@@ -105,6 +113,12 @@ BASE_URL = "https://cloud.cafci.org.ar/api"
 DEFAULT_TIMEOUT = 15  # segundos
 _TOKEN_ENV = "CAFCI_TOKEN"
 VCP_DIVISOR = 1000  # convención CAFCI: vcp viene en miles
+
+# CAMBIO: archivo separado de BYMA (antes era "precios_historico.csv")
+DEFAULT_OUTPUT_FILENAME = "precios_cafci.csv"
+
+# Master Excel default (para leer overrides de moneda)
+DEFAULT_XLSX = Path("inputs/wealth_management_rodricor.xlsx")
 
 
 # =============================================================================
@@ -224,6 +238,63 @@ def parse_fcis_file(path: Path) -> List[FCIMapping]:
 
 
 # =============================================================================
+# NUEVO: Override de moneda desde hoja `especies` del Excel master
+# =============================================================================
+
+def load_currency_overrides_from_xlsx(xlsx_path: Path) -> Dict[str, str]:
+    """Lee la hoja `especies` del master Excel y devuelve {ticker: currency}.
+
+    Esto se usa para forzar la moneda de un FCI cuando vos sabés que la
+    clasificación de CAFCI es incorrecta (ej fondos USB que CAFCI clasifica USD).
+
+    Si el archivo no existe o no tiene la hoja, devuelve {} (silencioso, no error).
+    """
+    if not xlsx_path.is_file():
+        return {}
+
+    try:
+        from openpyxl import load_workbook
+    except ImportError:
+        print("[xlsx] WARN: openpyxl no instalado, no puedo leer overrides de moneda")
+        return {}
+
+    try:
+        wb = load_workbook(filename=str(xlsx_path), data_only=True)
+    except Exception as e:
+        print(f"[xlsx] WARN no pude abrir {xlsx_path}: {e}")
+        return {}
+
+    if "especies" not in wb.sheetnames:
+        return {}
+
+    ws = wb["especies"]
+    # Headers en fila 4
+    headers = []
+    for c in range(1, ws.max_column + 1):
+        h = ws.cell(row=4, column=c).value
+        if isinstance(h, str):
+            h = h.strip()
+        headers.append(h)
+
+    try:
+        ticker_idx = headers.index("Ticker")
+        currency_idx = headers.index("Currency")
+    except ValueError:
+        return {}
+
+    out: Dict[str, str] = {}
+    for r in range(5, ws.max_row + 1):
+        ticker = ws.cell(row=r, column=ticker_idx + 1).value
+        currency = ws.cell(row=r, column=currency_idx + 1).value
+        if isinstance(ticker, str): ticker = ticker.strip()
+        if isinstance(currency, str): currency = currency.strip()
+        if ticker and currency:
+            out[ticker] = currency
+
+    return out
+
+
+# =============================================================================
 # Lookup en el report
 # =============================================================================
 
@@ -234,7 +305,8 @@ class FCISnapshot:
     nombre_cafci: str
     fecha: str       # ISO YYYY-MM-DD (lo que viene de la API)
     vcp: float       # ya dividida por 1000
-    moneda: str      # 'ARS' | 'USD' (del campo moneda del report)
+    moneda: str      # 'ARS' | 'USD' | 'USB' (después del override)
+    moneda_cafci: str  # moneda original que dijo CAFCI (para auditoría)
 
     @property
     def is_valid(self) -> bool:
@@ -250,8 +322,13 @@ class FCISnapshot:
 def lookup_fcis_in_report(
     df_report: pd.DataFrame,
     fcis: List[FCIMapping],
+    currency_overrides: Optional[Dict[str, str]] = None,
 ) -> Tuple[List[FCISnapshot], List[str]]:
-    """Busca cada FCI en el report. Devuelve (snapshots_validos, tickers_no_encontrados)."""
+    """Busca cada FCI en el report. Devuelve (snapshots_validos, tickers_no_encontrados).
+
+    Si `currency_overrides` está definido y el ticker está en el dict,
+    usa esa moneda en lugar de la que dice CAFCI.
+    """
     required_cols = {"nombreDeLaClaseDeFondo", "vcp", "fecha", "moneda"}
     missing_cols = required_cols - set(df_report.columns)
     if missing_cols:
@@ -268,6 +345,7 @@ def lookup_fcis_in_report(
         if isinstance(nombre, str):
             by_name[nombre] = row.to_dict()
 
+    overrides = currency_overrides or {}
     snapshots: List[FCISnapshot] = []
     not_found: List[str] = []
 
@@ -276,12 +354,18 @@ def lookup_fcis_in_report(
         if row is None:
             not_found.append(fci.ticker)
             continue
+
+        moneda_cafci = str(row.get("moneda", "")).strip().upper() or "ARS"
+        # Override si está definido para este ticker
+        moneda_final = overrides.get(fci.ticker, moneda_cafci)
+
         snap = FCISnapshot(
             ticker=fci.ticker,
             nombre_cafci=fci.nombre_cafci,
             fecha=str(row.get("fecha", "")),
             vcp=vcp_normalizada(row.get("vcp")),
-            moneda=str(row.get("moneda", "")).strip().upper() or "ARS",
+            moneda=moneda_final,
+            moneda_cafci=moneda_cafci,
         )
         if snap.is_valid:
             snapshots.append(snap)
@@ -349,6 +433,8 @@ def run(
     output_dir: Path,
     fecha: Optional[str] = None,
     dry_run: bool = False,
+    use_xlsx_currency: bool = True,
+    xlsx_path: Optional[Path] = None,
 ) -> int:
     """Punto de entrada principal. Devuelve exit code (0 OK, 1 error)."""
 
@@ -369,6 +455,19 @@ def run(
 
     print(f"[fcis] {len(fcis)} FCIs a buscar (desde {fcis_file.name})")
 
+    # 1b. NUEVO: Cargar overrides de moneda desde Excel
+    overrides: Dict[str, str] = {}
+    if use_xlsx_currency:
+        xlsx_to_use = xlsx_path or DEFAULT_XLSX
+        overrides = load_currency_overrides_from_xlsx(xlsx_to_use)
+        if overrides:
+            # Filtrar solo a los tickers de FCIs (el resto del Excel es ruido para esto)
+            fci_tickers = {f.ticker for f in fcis}
+            overrides = {t: c for t, c in overrides.items() if t in fci_tickers}
+            print(f"[xlsx] cargado {len(overrides)} overrides de moneda desde {xlsx_to_use.name}")
+        else:
+            print(f"[xlsx] no se cargaron overrides (Excel no encontrado o sin hoja `especies`)")
+
     # 2. Descargar report
     try:
         if fecha:
@@ -385,7 +484,7 @@ def run(
 
     # 3. Lookup
     try:
-        snapshots, not_found = lookup_fcis_in_report(df_report, fcis)
+        snapshots, not_found = lookup_fcis_in_report(df_report, fcis, overrides)
     except RuntimeError as e:
         print(f"[error] {e}", file=sys.stderr)
         return 1
@@ -394,12 +493,18 @@ def run(
     if not_found:
         print(f"[lookup] sin datos: {', '.join(not_found)}")
 
-    # 4. Mostrar snapshots
+    # 4. Mostrar snapshots (con override si aplica)
     print()
-    print(f"  {'TICKER':<18} {'FECHA':<12} {'VCP':>14} {'MONEDA':<6}  NOMBRE")
-    print(f"  {'-'*18} {'-'*12} {'-'*14} {'-'*6}  {'-'*40}")
+    print(f"  {'TICKER':<28} {'FECHA':<12} {'VCP':>14} {'MONEDA':<8} {'NOMBRE':<40}")
+    print(f"  {'-'*28} {'-'*12} {'-'*14} {'-'*8} {'-'*40}")
     for s in snapshots:
-        print(f"  {s.ticker:<18} {s.fecha:<12} {s.vcp:>14,.6f} {s.moneda:<6}  {s.nombre_cafci}")
+        moneda_display = s.moneda
+        if s.moneda != s.moneda_cafci:
+            moneda_display = f"{s.moneda}*"  # marca override
+        print(f"  {s.ticker:<28} {s.fecha:<12} {s.vcp:>14,.6f} {moneda_display:<8} {s.nombre_cafci}")
+    overrides_aplicados = sum(1 for s in snapshots if s.moneda != s.moneda_cafci)
+    if overrides_aplicados:
+        print(f"\n  * = moneda override aplicado ({overrides_aplicados} FCIs)")
     print()
 
     if not snapshots:
@@ -416,19 +521,20 @@ def run(
             "Fecha": s.fecha,
             "Ticker": s.ticker,
             "Precio": round(s.vcp, 6),
-            "Moneda": s.moneda,
+            "Moneda": s.moneda,  # ya con override aplicado si corresponde
             "Fuente": "CAFCI daily VCP",
         }
         for s in snapshots
     ]
 
+    output_path = output_dir / DEFAULT_OUTPUT_FILENAME
     n_new, n_upd = upsert_csv(
-        path=output_dir / "precios_historico.csv",
+        path=output_path,
         new_rows=rows,
         key_cols=["Fecha", "Ticker"],
         column_order=["Fecha", "Ticker", "Precio", "Moneda", "Fuente"],
     )
-    print(f"[csv] {len(rows)} filas → {n_new} nuevos, {n_upd} actualizados")
+    print(f"[csv] {output_path}: {len(rows)} filas → {n_new} nuevos, {n_upd} actualizados")
     print(f"[done] OK")
     return 0
 
@@ -459,6 +565,14 @@ def main(argv: Optional[List[str]] = None) -> int:
         "--dry-run", action="store_true",
         help="No escribir CSV, solo mostrar resultado",
     )
+    p.add_argument(
+        "--no-xlsx-currency", action="store_true",
+        help="NO usar override de moneda desde el Excel (default: usar override)",
+    )
+    p.add_argument(
+        "--xlsx", type=Path, default=DEFAULT_XLSX,
+        help=f"Excel master para leer overrides de moneda (default: {DEFAULT_XLSX})",
+    )
 
     args = p.parse_args(argv)
 
@@ -476,6 +590,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         output_dir=args.output_dir,
         fecha=args.fecha,
         dry_run=args.dry_run,
+        use_xlsx_currency=not args.no_xlsx_currency,
+        xlsx_path=args.xlsx,
     )
 
 
