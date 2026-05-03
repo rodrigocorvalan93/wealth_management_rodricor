@@ -3,9 +3,12 @@
 # Solo tickers BYMA (sin prefijo MERV ni sufijo de plazo).
 
 # Bonos en USB (MEP)
+AO27D
 AL30D
+AE38D
 GD30D
 GD35D
+MGCND
 
 # Bonos en USD (cable)
 GD30C
@@ -16,6 +19,12 @@ TX26
 TXMJ9
 S31L6
 T30J6
+TZXO6
+TZX28
+X30S6
 
 # BOPREALEs
 BPC7D
+
+
+
