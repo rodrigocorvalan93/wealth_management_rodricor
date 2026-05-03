@@ -1,0 +1,86 @@
+# =============================================================================
+# wm_engine — .gitignore
+# =============================================================================
+
+# === Secrets — NUNCA commitear ===
+secrets.txt
+.env
+.env.local
+.env.*.local
+
+# === Datos personales/privados ===
+# Excels master con datos personales
+inputs/
+*.xlsx
+*.xls
+*.xlsm
+
+# DBs sqlite generadas
+data/*.db
+data/*.db-journal
+data/*.db-wal
+data/*.db-shm
+
+# CSVs de precios/FX descargados (privacidad: tickers que tracquéas)
+data/*.csv
+
+# Reportes generados (PN total, posiciones)
+reports/
+
+# === Scripts temporales / debug ===
+# Por convención: archivos que empiezan con `_` son one-off
+_*.py
+!_carga_inicial_template.py  # excepción: template (si lo creamos)
+
+# === Python ===
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.eggs/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtualenvs
+venv/
+env/
+.venv/
+ENV/
+
+# === Editores ===
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.project
+.pydevproject
+
+# === Sistemas operativos ===
+.DS_Store
+._*
+.AppleDouble
+.LSOverride
+Thumbs.db
+Desktop.ini
+
+# === Jupyter ===
+.ipynb_checkpoints/
+*.ipynb_meta
+
+# === Logs ===
+*.log
+logs/
+
+# === Excepciones: SÍ subir los ejemplos ===
+!secrets.example.txt
+!tickers_ejemplo.txt
+!fcis_cafci.txt
+!mis_tickers.txt
+!data/.gitkeep
+!reports/.gitkeep

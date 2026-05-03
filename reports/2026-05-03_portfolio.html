@@ -1,0 +1,171 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<title>Portfolio — 2026-05-03</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+<style>
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    background: #f5f5f7;
+    color: #1d1d1f;
+    margin: 0;
+    padding: 20px;
+  }
+  .container { max-width: 1200px; margin: 0 auto; }
+  h1 { color: #1F3864; font-size: 28px; margin: 0 0 8px 0; }
+  .subtitle { color: #595959; font-size: 14px; margin-bottom: 24px; }
+  .kpi {
+    background: white; border-radius: 12px; padding: 24px;
+    margin-bottom: 24px; box-shadow: 0 2px 4px rgba(0,0,0,0.05);
+  }
+  .kpi-label { color: #595959; font-size: 12px; text-transform: uppercase; }
+  .kpi-value { font-size: 36px; font-weight: bold; color: #1F3864; }
+  .kpi-currency { font-size: 16px; color: #595959; }
+  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 24px; }
+  .card {
+    background: white; border-radius: 12px; padding: 20px;
+    box-shadow: 0 2px 4px rgba(0,0,0,0.05);
+  }
+  h2 { color: #1F3864; font-size: 18px; margin: 0 0 16px 0; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th {
+    background: #1F3864; color: white; padding: 10px;
+    text-align: left; font-weight: 600;
+  }
+  td { padding: 8px 10px; border-bottom: 1px solid #e0e0e0; }
+  tr:hover { background: #f9f9f9; }
+  .num { text-align: right; font-variant-numeric: tabular-nums; }
+  .positive { color: #00B050; }
+  .negative { color: #C00000; }
+  .chart-container { position: relative; height: 300px; }
+  .warn {
+    background: #FFF3CD; border-left: 4px solid #FFC107;
+    padding: 12px; border-radius: 4px; margin-bottom: 16px; font-size: 13px;
+  }
+</style>
+</head>
+<body>
+<div class="container">
+  <h1>📊 Portfolio</h1>
+  <div class="subtitle">Fecha: 2026-05-03  ·  Moneda ancla: USD</div>
+
+  <div class="kpi">
+    <div class="kpi-label">Patrimonio Neto Total</div>
+    <div class="kpi-value">1,532,834.95</div>
+    <div class="kpi-currency">USD</div>
+  </div>
+
+  
+
+  <div class="grid">
+    <div class="card">
+      <h2>Por Asset Class</h2>
+      <div class="chart-container"><canvas id="chartClass"></canvas></div>
+    </div>
+    <div class="card">
+      <h2>Por Moneda Nativa</h2>
+      <div class="chart-container"><canvas id="chartCcy"></canvas></div>
+    </div>
+  </div>
+
+  <div class="card" style="margin-top: 24px;">
+    <h2>Top 15 Posiciones</h2>
+    <table>
+      <thead>
+        <tr>
+          <th>Cuenta</th>
+          <th>Activo</th>
+          <th>Asset Class</th>
+          <th class="num">Qty</th>
+          <th class="num">Mkt Price</th>
+          <th class="num">MV (USD)</th>
+          <th class="num">Unrealized %</th>
+        </tr>
+      </thead>
+      <tbody>
+<tr><td>cash_reserva_usb</td><td>USB</td><td>CASH</td><td class="num">640,000.0000</td><td class="num">1.0000</td><td class="num">618,359.56</td><td class="num"><span class="">+0.00%</span></td></tr>
+<tr><td>galicia</td><td>FIMA_RENTA_FIJA_DOLARES_C</td><td>FCI</td><td class="num">432,310.7600</td><td class="num">1.1120</td><td class="num">464,465.79</td><td class="num"><span class="">+0.00%</span></td></tr>
+<tr><td>galicia</td><td>FIMA_PREMIUM_DOLARES_A</td><td>FCI</td><td class="num">98,799.9800</td><td class="num">1.0133</td><td class="num">96,726.27</td><td class="num"><span class="negative">-0.00%</span></td></tr>
+<tr><td>cocos</td><td>MGCND</td><td>BOND_AR</td><td class="num">50,000.0000</td><td class="num">1.0277</td><td class="num">49,648.48</td><td class="num"><span class="">+0.00%</span></td></tr>
+<tr><td>cocos</td><td>AO27D</td><td>BOND_AR</td><td class="num">48,746.0000</td><td class="num">1.0159</td><td class="num">47,845.17</td><td class="num"><span class="">+0.00%</span></td></tr>
+<tr><td>binance</td><td>BTC</td><td>CRYPTO</td><td class="num">0.4626</td><td class="num">78,436.0000</td><td class="num">36,288.05</td><td class="num"><span class="positive">+0.56%</span></td></tr>
+<tr><td>delta_fci</td><td>DELTA_AHORRO_PLUS_A</td><td>FCI</td><td class="num">129,488.3268</td><td class="num">367.3711</td><td class="num">31,851.53</td><td class="num"><span class="">+0.00%</span></td></tr>
+<tr><td>cash_transac_usb</td><td>USB</td><td>CASH</td><td class="num">30,300.0000</td><td class="num">1.0000</td><td class="num">29,275.46</td><td class="num"><span class="">+0.00%</span></td></tr>
+<tr><td>icbc_caja_usb</td><td>USB</td><td>CASH</td><td class="num">26,000.0000</td><td class="num">1.0000</td><td class="num">25,120.86</td><td class="num"><span class="">+0.00%</span></td></tr>
+<tr><td>galicia_caja_ars</td><td>ARS</td><td>CASH</td><td class="num">21,370,000.0000</td><td class="num">1.0000</td><td class="num">14,308.67</td><td class="num"><span class="">+0.00%</span></td></tr>
+<tr><td>delta_fci</td><td>DELTA_ACCIONES_A</td><td>FCI</td><td class="num">12,312.6547</td><td class="num">1,541.0372</td><td class="num">12,704.56</td><td class="num"><span class="">+0.00%</span></td></tr>
+<tr><td>binance</td><td>ETH</td><td>CRYPTO</td><td class="num">4.9555</td><td class="num">2,310.7000</td><td class="num">11,450.77</td><td class="num"><span class="positive">+0.16%</span></td></tr>
+<tr><td>cocos</td><td>X30S6</td><td>BOND_AR</td><td class="num">15,450,000.0000</td><td class="num">1.0565</td><td class="num">10,929.31</td><td class="num"><span class="">+0.00%</span></td></tr>
+<tr><td>cocos</td><td>AE38D</td><td>BOND_AR</td><td class="num">12,432.0000</td><td class="num">0.7958</td><td class="num">9,558.53</td><td class="num"><span class="">+0.00%</span></td></tr>
+<tr><td>delta_fci</td><td>DELTA_GESTION_VI_A</td><td>FCI</td><td class="num">685,249.4938</td><td class="num">19.6164</td><td class="num">9,000.41</td><td class="num"><span class="">+0.00%</span></td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="grid" style="margin-top: 24px;">
+    <div class="card">
+      <h2>PN por Cuenta</h2>
+      <table>
+        <thead><tr><th>Cuenta</th><th class="num">MV (USD)</th><th class="num">%</th></tr></thead>
+        <tbody><tr><td>cash_reserva_usb</td><td class="num">618,359.56</td><td class="num">40.3%</td></tr>
+<tr><td>galicia</td><td class="num">561,192.06</td><td class="num">36.6%</td></tr>
+<tr><td>cocos</td><td class="num">129,530.99</td><td class="num">8.5%</td></tr>
+<tr><td>delta_fci</td><td class="num">71,625.55</td><td class="num">4.7%</td></tr>
+<tr><td>binance</td><td class="num">49,112.17</td><td class="num">3.2%</td></tr>
+<tr><td>cash_transac_usb</td><td class="num">29,275.46</td><td class="num">1.9%</td></tr>
+<tr><td>ibkr</td><td class="num">25,652.26</td><td class="num">1.7%</td></tr>
+<tr><td>icbc_caja_usb</td><td class="num">25,120.86</td><td class="num">1.6%</td></tr>
+<tr><td>galicia_caja_ars</td><td class="num">14,308.67</td><td class="num">0.9%</td></tr>
+<tr><td>metamask_linea</td><td class="num">3,130.14</td><td class="num">0.2%</td></tr>
+<tr><td>santander_caja_usb</td><td class="num">2,105.67</td><td class="num">0.1%</td></tr>
+<tr><td>icbc_caja_ars</td><td class="num">1,004.35</td><td class="num">0.1%</td></tr>
+<tr><td>galicia_caja_usb</td><td class="num">988.41</td><td class="num">0.1%</td></tr>
+<tr><td>metamask_bsc</td><td class="num">747.50</td><td class="num">0.0%</td></tr>
+<tr><td>santander_caja_ars</td><td class="num">668.53</td><td class="num">0.0%</td></tr></tbody>
+      </table>
+    </div>
+    <div class="card">
+      <h2>PnL Realizado por Año + Moneda</h2>
+      <table>
+        <thead><tr><th>Año</th><th>Moneda</th><th class="num"># Trades</th><th class="num">PnL Total</th></tr></thead>
+        <tbody><tr><td>2026</td><td>ARS</td><td class="num">1</td><td class="num"><span class="positive">8,750,000.00</span></td></tr></tbody>
+      </table>
+    </div>
+  </div>
+
+  <div class="subtitle" style="margin-top: 24px; text-align: center;">
+    Generado por wm_engine
+  </div>
+</div>
+
+<script>
+const dataClass = {"labels": ["CASH", "FCI", "BOND_AR", "CRYPTO", "EQUITY_US", "STABLECOIN"], "values": [709251.8947104118, 632817.6110095204, 120012.37532018752, 52534.904941624794, 18162.260000000002, 55.900499733081]};
+const dataCcy = {"labels": ["USB", "ARS", "USD", "USDC"], "values": [1355319.453694223, 98873.42734589629, 78243.06544135787, 399.0]};
+
+new Chart(document.getElementById('chartClass'), {
+  type: 'doughnut',
+  data: {
+    labels: dataClass.labels,
+    datasets: [{
+      data: dataClass.values,
+      backgroundColor: ['#1F3864','#2E5B9C','#4F81BD','#8DB4E2','#B8CCE4','#DCE6F1','#F2F2F2'],
+    }]
+  },
+  options: { responsive: true, maintainAspectRatio: false }
+});
+
+new Chart(document.getElementById('chartCcy'), {
+  type: 'doughnut',
+  data: {
+    labels: dataCcy.labels,
+    datasets: [{
+      data: dataCcy.values,
+      backgroundColor: ['#1F3864','#00B050','#C00000','#FFC107','#9C27B0','#FF5722'],
+    }]
+  },
+  options: { responsive: true, maintainAspectRatio: false }
+});
+</script>
+</body>
+</html>

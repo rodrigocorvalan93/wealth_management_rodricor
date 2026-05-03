@@ -1,80 +1,90 @@
-# Loader histórico BYMA → CSV planilla v3.1
+# wm_engine — Wealth Management Engine
 
-Script Python que se loguea contra el OMS, descarga precios de cierre BYMA
-(con fallback CL → ACP → LA) para una lista de tickers, y calcula el FX
-MEP (USB) y CCL (USD) implícitos por promedio ponderado por volumen sobre
-los pares AL30/AL30D|C, GD30/GD30D|C, GD35/GD35D|C.
+Sistema personal de wealth management para portfolio multi-cuenta, multi-moneda
+y multi-asset orientado al mercado argentino. Lleva el ledger del portfolio
+(activos, cash, tarjetas, pasivos), valoriza a precios de mercado, calcula PnL
+realizado FIFO y genera reportes Excel/HTML.
 
-Genera dos CSVs en el formato exacto que espera la planilla v3.1:
-- `precios_historico.csv` → para pegar en hoja **Precios Histórico**
-- `fx_historico.csv` → para pegar en hoja **FX Histórico**
-
-## Convención de valuación
-
-**Todo en plazo 24hs (T+1)** — bonos AR, acciones, CEDEARs, BOPREALEs, AL30/GD30/GD35.
-Cripto va aparte (no incluido en este loader).
-
-## Setup
-
-1. Asegurate de tener `secrets.txt` en la misma carpeta del script (o las
-   env vars `OMS_USER` y `OMS_PASS` seteadas):
-
-   ```
-   OMS_USER=tu_usuario
-   OMS_PASS=tu_password
-   ```
-
-2. Dependencias: `pip install pandas numpy requests`
-
-## Uso
+## Quick start
 
 ```bash
-# Un ticker
-python historico_byma_loader.py --tickers AL30D
+# 1. Instalar deps
+pip install -r requirements.txt
 
-# Varios
-python historico_byma_loader.py --tickers AL30D GD30C TX26 TXMJ9
+# 2. Configurar secrets
+cp secrets.example.txt secrets.txt
+# editá secrets.txt con tus credenciales reales
 
-# Desde archivo
-python historico_byma_loader.py --tickers-file tickers_ejemplo.txt
+# 3. Generar Excel master
+python build_master.py inputs/wealth_management.xlsx
+python add_carga_inicial_sheet.py inputs/wealth_management.xlsx
 
-# Solo recalcular FX (sin lista de tickers)
-python historico_byma_loader.py --solo-fx
+# 4. Cargar saldos iniciales en hoja `_carga_inicial` del Excel, después:
+python -m cli.cargar_iniciales --fecha 2026-04-30
 
-# Solo precios, sin FX
-python historico_byma_loader.py --tickers AL30D --skip-fx
+# 5. Bajar precios de mercado
+python fx_loader.py
+python byma_loader.py --tickers-file mis_tickers.txt
+python cafci_loader.py
+python cripto_loader.py
+python yfinance_loader.py
 
-# Output a otra carpeta (default es ./data)
-python historico_byma_loader.py --tickers AL30D --output-dir ./mi_finanzas
-
-# Forzar fecha (default: hoy). Útil si corrés tarde y querés marcar la
-# fecha del cierre que estás capturando.
-python historico_byma_loader.py --tickers AL30D --fecha 2026-04-30
+# 6. Generar reporte
+python -m cli.report --xlsx --html
 ```
 
-## Comportamiento
+## Arquitectura
 
-- **Anexa, no pisa**: si el CSV ya existe, agrega filas nuevas y actualiza
-  filas existentes que matcheen por (Fecha, Ticker) o (Fecha, Moneda).
-- **Robusto**: si un ticker no responde o no tiene CL/ACP/LA válido, lo
-  loggea y sigue con los demás.
-- **Auto-incluye los 6 tickers FX** (AL30, AL30D, AL30C, GD30, GD30D,
-  GD30C, GD35, GD35D, GD35C) en cada corrida — no hace falta pasarlos.
-  Si pasás `--skip-fx`, no los pide.
-- **Promedio ponderado por volumen** sobre los pares disponibles. Si para
-  una fecha no hay volumen en ningún par, cae a promedio simple. Si ningún
-  par cotizó, no escribe el FX de ese día.
-
-## Workflow sugerido
-
-Crontab (Linux) o Task Scheduler (Windows) para correrlo cada día hábil
-después del cierre BYMA (~17:30 hora Argentina):
-
-```cron
-30 17 * * 1-5 cd /ruta/al/loader && python historico_byma_loader.py --tickers-file mis_tickers.txt --output-dir /ruta/a/mis_csvs
+```
+INPUT
+└─ inputs/wealth_management_*.xlsx (Excel master, 16 hojas)
+       │
+       ↓
+LOADERS DE PRECIOS (cron-friendly)
+├─ fx_loader.py        → data/fx_historico.csv     (MEP, CCL, mayorista)
+├─ byma_loader.py      → data/precios_historico.csv (bonos, acciones, CEDEAR)
+├─ cafci_loader.py     → data/precios_cafci.csv     (FCIs)
+├─ cripto_loader.py    → data/precios_cripto.csv    (BTC, ETH, USDT, USDC)
+└─ yfinance_loader.py  → data/precios_us.csv        (ADRs IBKR)
+       │
+       ↓
+MOTOR (engine/)
+├─ schema.py        → SQLite ledger doble entrada
+├─ importer.py      → Excel → SQLite (events + movements)
+├─ fx.py            → cross-rates con paridad implícita stablecoins
+├─ prices.py        → upsert precios desde CSVs
+├─ holdings.py      → posiciones + valuación a mercado
+├─ pnl.py           → PnL realizado FIFO + no-realizado
+├─ liabilities.py   → tarjetas (saldo actual / último resumen / próximo vto)
+└─ exporter.py      → Excel multi-sheet + HTML autocontenido
+       │
+       ↓
+CLI (cli/)
+├─ cli.tarjetas        → resumen tarjetas en consola
+├─ cli.summary         → portfolio summary en consola
+├─ cli.cargar_iniciales → procesa hoja _carga_inicial → asientos_contables
+└─ cli.report          → genera Excel + HTML en reports/
 ```
 
-Después abrís los CSVs en Excel y pegás las filas nuevas en las hojas
-`Precios Histórico` y `FX Histórico` de la planilla. O pegás todo y
-ordenás por fecha (la planilla resuelve por la fecha más cercana ≤
-fecha del trade).
+## Capacidades
+
+- **Multi-currency** con cross-rates automáticos (ARS ↔ USB ↔ USD CCL ↔ stablecoins)
+- **Multi-cuenta**: bancos, brokers, wallets cripto, tarjetas, cash físico
+- **Multi-asset**: bonos AR, ADRs, CEDEAR, FCIs, cripto, equity
+- **PnL FIFO** realizado y no-realizado, separado por moneda
+- **Tarjetas** con cálculo automático de cierre/vencimiento
+- **Conversión FX** automática en imports (cargás cost en una moneda, motor convierte a la nativa)
+- **Idempotente**: re-correr no duplica data
+- **Tolerante a falta de precios**: fallback a cost basis con marca visual
+
+## Documentación
+
+- [docs/setup.md](docs/setup.md) — instalación y configuración inicial
+- [docs/excel_master.md](docs/excel_master.md) — guía de las 16 hojas del Excel
+- [docs/loaders.md](docs/loaders.md) — loaders de precios y automatización
+- [docs/cli.md](docs/cli.md) — comandos CLI y flujo diario
+- [docs/architecture.md](docs/architecture.md) — modelo de datos del motor
+
+## Licencia
+
+Uso personal. No redistribuir.

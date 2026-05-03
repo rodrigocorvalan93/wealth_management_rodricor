@@ -52,6 +52,8 @@ def get_rate(conn, fecha, moneda: str, base: str = DEFAULT_BASE,
 
     Si moneda == base devuelve 1.0.
     Si no encuentra rate exacto, busca hasta `fallback_days` hacia atrás.
+    Si moneda es una stablecoin (currencies.is_stable=1), redirige al rate de
+    su quote_vs (ej USDC → usa rate de USD, paridad implícita 1:1).
     Devuelve None si no encuentra nada (caller decide qué hacer).
     """
     if moneda == base:
@@ -82,6 +84,22 @@ def get_rate(conn, fecha, moneda: str, base: str = DEFAULT_BASE,
         row = cur.fetchone()
         if row is not None:
             return float(row["rate"] if hasattr(row, "keys") else row[1])
+
+    # Si llegamos acá, no encontramos rate explícito.
+    # Resolución implícita para stablecoins: si la moneda es stable y tiene
+    # `quote_vs`, redirigir al rate de quote_vs (paridad 1:1).
+    # Ej: USDC stable, quote_vs=USD → usa rate(USD) como rate(USDC).
+    cur = conn.execute(
+        "SELECT is_stable, quote_vs FROM currencies WHERE code=?",
+        (moneda,),
+    )
+    row = cur.fetchone()
+    if row is not None:
+        is_stable = row["is_stable"] if hasattr(row, "keys") else row[0]
+        quote_vs = row["quote_vs"] if hasattr(row, "keys") else row[1]
+        if is_stable and quote_vs and quote_vs != moneda:
+            # Recursión 1-nivel: pedir rate del quote_vs
+            return get_rate(conn, fecha, quote_vs, base, fallback_days)
 
     return None
 
