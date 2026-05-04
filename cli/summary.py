@@ -21,7 +21,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from engine.importer import import_all
 from engine.holdings import (
     calculate_holdings, total_pn, by_asset_class, by_account, by_currency,
-    by_cash_purpose, filter_investible,
+    by_cash_purpose, filter_investible, filter_liabilities,
 )
 from engine.pnl import calculate_realized_pnl
 from engine.trade_stats import calculate_trade_stats
@@ -41,6 +41,25 @@ def _fmt_pct(value):
     if value is None:
         return "-"
     return f"{value*100:+.2f}%"
+
+
+def print_pasivos(holdings, anchor_ccy):
+    """Imprime detalle de pasivos (cauciones, tarjetas, préstamos)."""
+    liabs = filter_liabilities(holdings)
+    liabs = [h for h in liabs if h.get("mv_anchor") is not None
+             and abs(h["mv_anchor"]) > 1e-6]
+    if not liabs:
+        return
+    liabs.sort(key=lambda h: -(h["mv_anchor"] or 0))
+    print()
+    print(f"  PASIVOS — DETALLE  ({anchor_ccy})")
+    print("  " + "-" * 80)
+    print(f"    {'Cuenta':<28} {'Tipo':<14} {'Mon':<6} {'Saldo':>16}  {'Impacto PN':>14}")
+    for h in liabs:
+        bal = h["mv_anchor"] or 0
+        pn_imp = h.get("mv_pn_anchor") or 0
+        print(f"    {h['account']:<28} {(h.get('account_kind') or ''):<14} "
+              f"{h['asset']:<6} {bal:>16,.2f}  {pn_imp:>14,.2f}")
 
 
 def print_trade_stats(fills):
@@ -99,6 +118,9 @@ def print_summary(holdings, anchor_ccy, view_label=None):
 
     tp = total_pn(holdings, anchor_ccy)
     print()
+    print(f"  ACTIVOS TOTALES:       {_fmt_money(tp['total_assets']):>20} {anchor_ccy}")
+    print(f"  PASIVOS TOTALES:       {_fmt_money(-tp['total_liabilities']):>20} {anchor_ccy}  (cauciones, tarjetas, préstamos)")
+    print(f"  ─────────────────────────────────────────────────────────")
     print(f"  PATRIMONIO NETO TOTAL: {_fmt_money(tp['total_anchor']):>20} {anchor_ccy}")
     print(f"  PN INVERTIBLE:         {_fmt_money(tp['total_investible']):>20} {anchor_ccy}")
     if abs(tp['total_non_investible']) > 1e-6:
@@ -106,14 +128,14 @@ def print_summary(holdings, anchor_ccy, view_label=None):
     if tp["total_unconverted_count"] > 0:
         print(f"  (⚠ {tp['total_unconverted_count']} posiciones sin FX, no incluidas en total)")
 
-    # Por asset class
+    # Por asset class — usa abs() para que % no quede raro con pasivos
     print()
     print("  POR ASSET CLASS")
     print("  " + "-" * 60)
     cls = by_asset_class(holdings)
-    total = sum(cls.values())
+    abs_total = sum(abs(v) for v in cls.values()) or 1
     for c, v in cls.items():
-        pct = (v / total * 100) if total else 0
+        pct = (abs(v) / abs_total * 100)
         print(f"    {c:<18} {_fmt_money(v):>20} {anchor_ccy}   {pct:>5.1f}%")
 
     # Por moneda
@@ -121,27 +143,31 @@ def print_summary(holdings, anchor_ccy, view_label=None):
     print("  POR MONEDA NATIVA")
     print("  " + "-" * 60)
     cur = by_currency(holdings)
-    total = sum(cur.values())
+    abs_total = sum(abs(v) for v in cur.values()) or 1
     for c, v in cur.items():
-        pct = (v / total * 100) if total else 0
+        pct = (abs(v) / abs_total * 100)
         print(f"    {c:<18} {_fmt_money(v):>20} {anchor_ccy}   {pct:>5.1f}%")
 
-    # Por cuenta (top 10)
+    # Por cuenta (top 10) — excluye pasivos (van a su propia sección)
     print()
-    print("  POR CUENTA (top 10)")
+    print("  POR CUENTA (top 10, solo activos)")
     print("  " + "-" * 60)
-    accs = by_account(holdings)
-    total = sum(accs.values())
-    for c, v in list(accs.items())[:10]:
-        pct = (v / total * 100) if total else 0
+    accs_assets = {a: h_sum for a, h_sum in by_account(
+        [h for h in holdings if not h.get("is_liability")]
+    ).items()}
+    abs_total = sum(abs(v) for v in accs_assets.values()) or 1
+    for c, v in list(accs_assets.items())[:10]:
+        pct = (abs(v) / abs_total * 100)
         print(f"    {c:<22} {_fmt_money(v):>20} {anchor_ccy}   {pct:>5.1f}%")
 
-    # Top 10 holdings individuales
+    # Top 10 posiciones individuales (excluye pasivos)
     print()
-    print("  TOP 10 POSICIONES")
+    print("  TOP 10 POSICIONES (solo activos)")
     print("  " + "-" * 80)
     print(f"    {'Activo':<22} {'Cuenta':<18} {'Qty':>14} {'Mkt Px':>10} {'MV (' + anchor_ccy + ')':>14}")
-    for h in holdings[:10]:
+    asset_holdings = [h for h in holdings if not h.get("is_liability")]
+    asset_holdings.sort(key=lambda h: -(h.get("mv_anchor") or 0))
+    for h in asset_holdings[:10]:
         if h["mv_anchor"] is None:
             continue
         flag = "*" if h["price_fallback"] else " "
@@ -235,6 +261,9 @@ def main():
 
     for holdings, label in views:
         print_summary(holdings, anchor_ccy, view_label=label)
+
+    # Pasivos (siempre desde la vista completa)
+    print_pasivos(holdings_all, anchor_ccy)
 
     # Trade stats y BP no dependen del filtro (los trades cerrados son cerrados,
     # el BP es por cuenta — siempre se muestran completos)

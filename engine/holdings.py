@@ -41,6 +41,10 @@ SYSTEM_ACCOUNTS = {
     "interest_expense",
 }
 
+# Cuentas que representan PASIVOS (deudas). Su saldo positivo = lo que debés.
+# En el cómputo de PN se RESTAN (PN = activos - pasivos).
+LIABILITY_KINDS = {"LIABILITY", "CARD_CREDIT"}
+
 # Activos que son cash (la moneda misma usada como activo en movements)
 def _is_cash_asset(ticker, currencies_set):
     """True si el ticker es una moneda (cash) y no un activo financiero."""
@@ -305,6 +309,18 @@ def calculate_holdings(conn, fecha=None, anchor_currency="USD"):
         )
 
         meta = account_meta.get(account, {"investible": True, "cash_purpose": None, "kind": None})
+        is_liability = meta["kind"] in LIABILITY_KINDS
+
+        # PN-signed: pasivos restan al PN. Activos suman.
+        # mv_anchor sigue siendo el "balance" (siempre positivo si tenés saldo).
+        # mv_pn_anchor es el aporte SIGNADO al PN (negativo para pasivos).
+        if is_liability and mv_anchor is not None:
+            mv_pn_anchor = -mv_anchor
+            mv_pn_native = -mv_native if mv_native is not None else None
+        else:
+            mv_pn_anchor = mv_anchor
+            mv_pn_native = mv_native
+
         holdings.append({
             "account": account,
             "asset": asset,
@@ -322,10 +338,13 @@ def calculate_holdings(conn, fecha=None, anchor_currency="USD"):
             "mv_native": mv_native,
             "mv_anchor": mv_anchor,
             "mv_anchor_ok": mv_anchor_ok,
+            "mv_pn_anchor": mv_pn_anchor,    # signed: pasivos negativos
+            "mv_pn_native": mv_pn_native,
             "anchor_currency": anchor_currency,
             "unrealized_pnl_native": unrealized_pnl_native,
             "unrealized_pct": unrealized_pct,
             "is_cash": is_cash,
+            "is_liability": is_liability,
             "investible": meta["investible"],
             "cash_purpose": meta["cash_purpose"],
             "account_kind": meta["kind"],
@@ -341,11 +360,15 @@ def calculate_holdings(conn, fecha=None, anchor_currency="USD"):
 def total_pn(holdings, anchor_currency="USD"):
     """Calcula PN total del portfolio en moneda ancla.
 
+    PN = activos - pasivos (cuentas LIABILITY y CARD_CREDIT restan).
+
     Devuelve dict:
         {
-            total_anchor: float,            # PN total (incluye no-invertibles)
-            total_investible: float,        # PN solo cuentas invertibles
-            total_non_investible: float,    # PN cuentas excluidas
+            total_anchor: float,            # PN total NETO (activos - pasivos)
+            total_investible: float,        # PN solo cuentas invertibles, neto de pasivos
+            total_non_investible: float,    # PN cuentas excluidas (también neto)
+            total_assets: float,            # solo activos (sin restar pasivos)
+            total_liabilities: float,       # total pasivos (positivo)
             total_anchor_ok: float,         # alias compat
             total_unconverted_count: int,   # posiciones sin FX
             unconverted: [(asset, native_ccy, mv_native), ...],
@@ -354,20 +377,29 @@ def total_pn(holdings, anchor_currency="USD"):
     total = 0.0
     total_inv = 0.0
     total_non_inv = 0.0
+    total_assets = 0.0
+    total_liab = 0.0
     unconverted = []
     for h in holdings:
-        if h["mv_anchor_ok"] and h["mv_anchor"] is not None:
-            total += h["mv_anchor"]
+        if h["mv_anchor_ok"] and h.get("mv_pn_anchor") is not None:
+            mv_pn = h["mv_pn_anchor"]
+            total += mv_pn
             if h.get("investible", True):
-                total_inv += h["mv_anchor"]
+                total_inv += mv_pn
             else:
-                total_non_inv += h["mv_anchor"]
+                total_non_inv += mv_pn
+            if h.get("is_liability"):
+                total_liab += abs(h["mv_anchor"])
+            else:
+                total_assets += h["mv_anchor"]
         else:
             unconverted.append((h["asset"], h["native_currency"], h["mv_native"]))
     return {
         "total_anchor": total,
         "total_investible": total_inv,
         "total_non_investible": total_non_inv,
+        "total_assets": total_assets,
+        "total_liabilities": total_liab,
         "total_anchor_ok": total,
         "anchor_currency": anchor_currency,
         "total_unconverted_count": len(unconverted),
@@ -376,35 +408,48 @@ def total_pn(holdings, anchor_currency="USD"):
 
 
 def by_asset_class(holdings):
-    """Agrupa holdings por asset_class. Devuelve {clase: total_anchor}."""
+    """Agrupa holdings por asset_class. Pasivos restan (mv_pn_anchor)."""
     out = {}
     for h in holdings:
-        if h["mv_anchor"] is None:
+        v = h.get("mv_pn_anchor")
+        if v is None:
             continue
         cls = h["asset_class"] or "UNKNOWN"
-        out[cls] = out.get(cls, 0.0) + h["mv_anchor"]
+        out[cls] = out.get(cls, 0.0) + v
     return dict(sorted(out.items(), key=lambda kv: -kv[1]))
 
 
 def by_account(holdings):
-    """Agrupa holdings por account. Devuelve {account: total_anchor}."""
+    """Agrupa holdings por account. Pasivos restan (mv_pn_anchor)."""
     out = {}
     for h in holdings:
-        if h["mv_anchor"] is None:
+        v = h.get("mv_pn_anchor")
+        if v is None:
             continue
-        out[h["account"]] = out.get(h["account"], 0.0) + h["mv_anchor"]
+        out[h["account"]] = out.get(h["account"], 0.0) + v
     return dict(sorted(out.items(), key=lambda kv: -kv[1]))
 
 
 def by_currency(holdings):
-    """Agrupa holdings por native_currency. Devuelve {ccy: total_anchor}."""
+    """Agrupa holdings por native_currency. Pasivos restan (mv_pn_anchor)."""
     out = {}
     for h in holdings:
-        if h["mv_anchor"] is None:
+        v = h.get("mv_pn_anchor")
+        if v is None:
             continue
         ccy = h["native_currency"]
-        out[ccy] = out.get(ccy, 0.0) + h["mv_anchor"]
+        out[ccy] = out.get(ccy, 0.0) + v
     return dict(sorted(out.items(), key=lambda kv: -kv[1]))
+
+
+def filter_assets(holdings):
+    """Devuelve solo holdings de cuentas-activo (NO pasivos)."""
+    return [h for h in holdings if not h.get("is_liability")]
+
+
+def filter_liabilities(holdings):
+    """Devuelve solo holdings de cuentas-pasivo (LIABILITY, CARD_CREDIT)."""
+    return [h for h in holdings if h.get("is_liability")]
 
 
 # =============================================================================
@@ -428,7 +473,7 @@ def filter_non_investible(holdings):
 
 
 def by_cash_purpose(holdings):
-    """Agrupa cash holdings por su 'cash_purpose'.
+    """Agrupa cash holdings POR PROPÓSITO (excluye pasivos).
 
     Útil para distinguir 'OPERATIVO' vs 'RESERVA_NO_DECLARADO'.
     Devuelve {purpose: total_anchor}.
@@ -437,6 +482,8 @@ def by_cash_purpose(holdings):
     for h in holdings:
         if not h.get("is_cash"):
             continue
+        if h.get("is_liability"):
+            continue   # pasivos van a su sección propia
         if h["mv_anchor"] is None:
             continue
         key = h.get("cash_purpose") or "(sin clasificar)"
