@@ -190,9 +190,11 @@ def create_app() -> Flask:
             return jsonify({
                 "fecha": fecha.isoformat(),
                 "anchor": anchor,
-                "patrimonio_total": tp["total_anchor"],
+                "patrimonio_total": tp["total_anchor"],            # NETO
                 "patrimonio_invertible": tp["total_investible"],
                 "patrimonio_no_invertible": tp["total_non_investible"],
+                "total_assets": tp["total_assets"],
+                "total_liabilities": tp["total_liabilities"],
                 "unconverted_count": tp["total_unconverted_count"],
                 "by_asset_class": by_asset_class(holdings),
                 "by_account": by_account(holdings),
@@ -735,29 +737,11 @@ def create_app() -> Flask:
                     if cur_m > 12:
                         cur_m = 1; cur_y += 1
 
-            # 3. Cauciones que vencen
-            cur = conn.execute(
-                """SELECT external_id, event_date, description, notes
-                   FROM events
-                   WHERE event_type='FUNDING_OPEN'
-                     AND external_id IS NOT NULL"""
-            )
-            # Para cada FUNDING_OPEN, buscar si tiene FUNDING_CLOSE
-            for r in cur.fetchall():
-                # Si ya tiene close, skip
-                close_check = conn.execute(
-                    "SELECT 1 FROM events WHERE event_type='FUNDING_CLOSE' AND external_id=?",
-                    (r["external_id"],),
-                ).fetchone()
-                if close_check:
-                    continue
-                # No cerrada — leemos del Excel para ver Fecha Fin
-                # (más simple: leer la hoja funding directamente)
-            # Trick: leer del Excel para tener Fecha Fin, monto y status
-            from .excel_io import list_rows as _list_rows
-            from .state import get_settings as _get_settings
+            # 3. Cauciones que vencen — leemos del Excel para tener
+            #    Fecha Fin / Status / Monto sin tener que reconstruirlo
+            #    desde events.
             try:
-                fund_rows = _list_rows(_get_settings().xlsx_path, "funding")
+                fund_rows = list_rows(get_settings().xlsx_path, "funding")
             except Exception:
                 fund_rows = []
             for fr in fund_rows:

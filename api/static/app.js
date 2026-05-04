@@ -155,20 +155,32 @@
   let _meta = null;
   async function loadMeta() {
     if (_meta) return _meta;
-    // Por simplicidad, traemos todo via summary (devuelve breakdowns por cuenta).
-    // Para selects necesitamos lista completa de cuentas/tickers/monedas.
-    // Usamos endpoint /api/holdings (incluye account/asset/native_currency).
+    // Cuentas: traemos de /api/sheets/cuentas (las que vos definiste en Excel,
+    // SIN las auto-creadas como caucion_pasivo_*).
+    // Especies: traemos de /api/sheets/especies (todas las que cargaste, no
+    // solo las que tenés en posición ahora).
+    // Monedas: traemos de /api/sheets/monedas.
     try {
-      const [s, h] = await Promise.all([API.summary(), API.holdings()]);
-      const accounts = Array.from(new Set(h.items.map(x => x.account))).sort();
-      const tickers = Array.from(new Set(
-        h.items.filter(x => !x.is_cash).map(x => x.asset)
-      )).sort();
-      const currencies = Array.from(new Set(h.items.map(x => x.native_currency))).sort();
-      _meta = { accounts, tickers, currencies, summary: s };
+      const [cuentas, especies, monedas] = await Promise.all([
+        API.listSheet("cuentas"),
+        API.listSheet("especies"),
+        API.listSheet("monedas"),
+      ]);
+      const accounts = (cuentas.items || [])
+        .filter(c => c.Code &&
+                     !["EXTERNAL", "OPENING_BALANCE",
+                       "INTEREST_EXPENSE", "INTEREST_INCOME"]
+                       .includes(c.Kind))
+        .map(c => c.Code).sort();
+      const tickers = (especies.items || [])
+        .filter(e => e.Ticker).map(e => e.Ticker).sort();
+      const currencies = (monedas.items || [])
+        .filter(m => m.Code).map(m => m.Code).sort();
+      _meta = { accounts, tickers, currencies };
       return _meta;
     } catch (e) {
-      return { accounts: [], tickers: [], currencies: [], summary: null };
+      console.warn("loadMeta failed:", e);
+      return { accounts: [], tickers: [], currencies: [] };
     }
   }
   function invalidateMeta() { _meta = null; }
@@ -574,15 +586,20 @@
         <div class="kpi-grid">
           <div class="kpi">
             <div class="kpi-label">📈 Activos</div>
-            <div class="kpi-value positive">${fmt.money(s.patrimonio_total + (s.patrimonio_total < 0 ? 0 : 0))}</div>
+            <div class="kpi-value positive">${fmt.money(s.total_assets || 0)}</div>
             <div class="kpi-currency">${API.anchor()}</div>
           </div>
           <div class="kpi">
-            <div class="kpi-label">📉 No-Invertible</div>
-            <div class="kpi-value">${fmt.money(s.patrimonio_no_invertible || 0)}</div>
-            <div class="kpi-currency">cash de reserva</div>
+            <div class="kpi-label">📉 Pasivos</div>
+            <div class="kpi-value negative">${fmt.money(s.total_liabilities || 0)}</div>
+            <div class="kpi-currency">cauciones, tarjetas...</div>
           </div>
         </div>
+        ${s.patrimonio_no_invertible && Math.abs(s.patrimonio_no_invertible) > 0.01 ? `
+          <div class="card compact muted" style="margin-bottom: 16px; font-size: 12px;">
+            ℹ Cash no-invertible (reserva no declarada): ${fmt.money(s.patrimonio_no_invertible)} ${API.anchor()}
+          </div>
+        ` : ""}
 
         <section>
           <h2>Por asset class</h2>
@@ -1050,11 +1067,13 @@
     const noStrat = [];
 
     fills.forEach(fl => {
-      // Buscar trade por ticker+account+precio_compra
+      // Match por ticker + cuenta + fecha_compra (NO por precio, porque
+      // trade.Precio puede estar en moneda Trade ≠ fill.precio_compra que
+      // está en moneda nativa post-conversión FX)
+      const fechaCompra = String(fl.fecha_compra || "").slice(0, 10);
       const matchTrades = (trades.items || []).filter(t =>
         t.Ticker === fl.asset && t.Cuenta === fl.account &&
-        Math.abs((parseFloat(t.Precio) || 0) - fl.precio_compra) /
-          Math.max(fl.precio_compra, 1) < 0.01
+        String(t["Trade Date"] || "").slice(0, 10) === fechaCompra
       );
       const strat = matchTrades.length > 0 && matchTrades[0].Strategy
         ? matchTrades[0].Strategy
@@ -1400,15 +1419,17 @@
     // Capital propio = lo que pusiste de tu bolsillo = notional - monto cauci
     const capitalPropio = Math.max(0, tradeNotional - monto);
 
-    // P&L del trade: buscamos fills donde matche ticker+account+precio_compra
+    // P&L del trade: matcheamos fills por ticker + cuenta + fecha_compra
+    // (NO por precio, porque trade.Precio puede estar en otra moneda que
+    // fill.precio_compra después de la conversión FX del importer)
     let tradePnl = 0;
     let pnlCurrency = trade ? trade["Moneda Trade"] : null;
     if (trade) {
-      // Buscamos fills cuyos precio_compra ≈ tradePrice y ticker/account match
+      const tradeDate = String(trade["Trade Date"] || "").slice(0, 10);
       const matched = fills.filter(fl =>
         fl.account === trade.Cuenta &&
         fl.asset === trade.Ticker &&
-        Math.abs(fl.precio_compra - tradePrice) / Math.max(tradePrice, 1) < 0.05
+        String(fl.fecha_compra || "").slice(0, 10) === tradeDate
       );
       tradePnl = matched.reduce((s, fl) => s + fl.pnl_realizado, 0);
       if (matched.length > 0) pnlCurrency = matched[0].currency;

@@ -1,12 +1,13 @@
-/* Service Worker simple: cache-first para shell, network-first para API */
-const VERSION = "wm-v1";
+/* Service Worker simple: cache-first para shell, network-first para API.
+   IMPORTANTE: bumpear VERSION cada vez que se modifica app.js o style.css
+   para forzar a clientes existentes a re-descargar. */
+const VERSION = "wm-v3";
 const SHELL = [
   "/",
   "/static/style.css",
   "/static/app.js",
   "/static/icon.svg",
   "/static/manifest.json",
-  "https://cdn.jsdelivr.net/npm/alpinejs@3.13.5/dist/cdn.min.js",
   "https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js",
 ];
 
