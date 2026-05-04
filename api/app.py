@@ -1023,8 +1023,22 @@ def create_app() -> Flask:
             build_master(new_settings.xlsx_path)
             if add_carga_inicial_sheet:
                 add_carga_inicial_sheet(new_settings.xlsx_path)
+            # Limpiar las filas de ejemplo de TODAS las hojas de eventos
+            # (blotter, ingresos, gastos, etc) para que el user nuevo arranque
+            # con master vacío, listo para que cargue su data inicial.
+            _blank_event_sheets(new_settings.xlsx_path)
         except Exception as e:
             abort(500, f"No se pudo crear el master para '{user_id}': {e}")
+
+        # Auto-import: crear la DB del user para que /api/summary y similares
+        # funcionen apenas hace login. Sin este import, switch read-only crashea
+        # con FileNotFoundError porque la DB no existe.
+        import_stats = None
+        try:
+            import_stats = reimport_excel(settings=new_settings)
+        except Exception as e:
+            print(f"[admin_create_user] WARN auto-import falló para "
+                  f"'{user_id}': {e} — el user va a tener que hacer refresh manual")
 
         # Persistir en config in-memory (NO sobrevive un reload del web app)
         add_user_to_config(user_id, token, display_name=display_name,
@@ -1038,11 +1052,33 @@ def create_app() -> Flask:
             "token": token,
             "url": request.host_url.rstrip("/"),
             "wsgi_snippet": _build_wsgi_snippet(),
+            "import_stats": import_stats,
             "warning": ("Para que el user persista a través de reloads del web "
                         "app, copiá el snippet de wsgi_snippet al WSGI file de "
                         "PythonAnywhere. Mientras tanto, el user funciona en "
                         "memoria del server."),
         }), 201
+
+    def _blank_event_sheets(xlsx_path):
+        """Borra las filas de DATOS (no headers) de las hojas de eventos del
+        master de un user nuevo. Mantiene cuentas/monedas/especies/aforos
+        completos como templates. Header en row 4."""
+        from openpyxl import load_workbook
+        wb = load_workbook(filename=str(xlsx_path))
+        EVENT_SHEETS = (
+            "blotter", "ingresos", "gastos",
+            "transferencias_cash", "transferencias_activos",
+            "funding", "pasivos", "pagos_pasivos",
+            "recurrentes", "asientos_contables",
+        )
+        HEADER_ROW = 4
+        for sheet_name in EVENT_SHEETS:
+            if sheet_name not in wb.sheetnames:
+                continue
+            ws = wb[sheet_name]
+            if ws.max_row > HEADER_ROW:
+                ws.delete_rows(HEADER_ROW + 1, ws.max_row - HEADER_ROW)
+        wb.save(str(xlsx_path))
 
     @app.post("/api/admin/users/<user_id>/seed-demo")
     def admin_seed_demo(user_id):
