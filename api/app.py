@@ -46,7 +46,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from flask import (
     Flask, request, jsonify, send_file, send_from_directory,
-    abort, Response, render_template,
+    abort, Response, render_template, g,
 )
 
 from engine.holdings import (
@@ -65,8 +65,16 @@ from engine.buying_power import buying_power_summary
 from engine.exporter import export_excel, export_html
 
 from .state import (
-    get_settings, db_conn, excel_write_lock, backup_excel,
+    get_settings, get_user_settings, list_user_ids,
+    db_conn, excel_write_lock, backup_excel,
     list_backups, prune_backups, reimport_excel,
+    DEFAULT_USER_ID,
+)
+from .users import (
+    load_users, resolve_user_by_token, get_active_user,
+    admin_switch_to, admin_switch_clear, is_switched,
+    add_user_to_config, remove_user_from_config, export_users_json,
+    UserConfig,
 )
 from .excel_io import (
     SHEET_PREFIX, MASTER_SHEETS, ALLOWED_SHEETS, is_master_sheet,
@@ -106,17 +114,66 @@ def create_app() -> Flask:
     def cors_preflight(_):
         return ("", 204)
 
-    # --- Auth ---
-    def _require_auth():
-        s = get_settings()
-        if not s.api_token:
-            abort(500, "WM_API_TOKEN no configurado en el server")
+    # --- Auth + user resolution (multi-tenant) ---
+
+    @app.before_request
+    def _resolve_user():
+        """Resuelve el user activo desde el bearer token y lo setea en g.
+
+        - g.auth_user: el user dueño del token
+        - g.active_user_id: el user_id efectivamente activo (=auth_user, o
+          el target si el admin hizo switch)
+        - g.is_admin: True si el auth_user es admin
+        - g.is_switched: True si el admin está viendo datos de otro
+        """
+        # Endpoints públicos: no resolver user
+        if not request.path.startswith("/api/"):
+            return
+        if request.method == "OPTIONS":
+            return
+        if request.path == "/api/health":
+            return
+
         auth = request.headers.get("Authorization", "")
         if not auth.startswith("Bearer "):
-            abort(401, "Falta header Authorization: Bearer <token>")
+            return  # _require_auth abortará después
         token = auth[len("Bearer "):].strip()
-        if token != s.api_token:
-            abort(401, "Token inválido")
+
+        active = get_active_user(token)
+        if active is None:
+            return  # _require_auth abortará
+
+        auth_user, switched = active
+        # auth_user es el user dueño del token (puede ser admin con switch)
+        # Buscamos el user real al que apunta:
+        actual_token_owner = resolve_user_by_token(token)
+        g.auth_user = actual_token_owner
+        g.active_user_id = auth_user.user_id
+        g.is_admin = bool(actual_token_owner and actual_token_owner.is_admin)
+        g.is_switched = switched
+        g.user_token = token
+
+    def _require_auth():
+        """Verifica que haya user resuelto en g."""
+        if not load_users():
+            abort(500, "Sin users configurados. Setea WM_USERS_JSON o WM_API_TOKEN.")
+        if not getattr(g, "active_user_id", None):
+            abort(401, "Token inválido o ausente")
+
+    def _require_admin():
+        """Verifica que el caller sea admin (independiente de switch state)."""
+        _require_auth()
+        if not getattr(g, "is_admin", False):
+            abort(403, "Acción solo para admin")
+
+    def _block_if_switched_mutation():
+        """En vista 'switched', el admin no puede mutar datos del target user.
+        Aborta 403 si la request es POST/PUT/DELETE y está switched."""
+        if request.method in ("POST", "PUT", "DELETE", "PATCH"):
+            if getattr(g, "is_switched", False):
+                abort(403,
+                      "Estás en modo 'switch user' (read-only). Volvé a tu user "
+                      "para mutar datos.")
 
     # --- Helpers ---
     def _holdings(fecha=None, anchor=None):
@@ -146,29 +203,39 @@ def create_app() -> Flask:
 
     @app.get("/api/health")
     def health():
-        s = get_settings()
-        xlsx_exists = s.xlsx_path.is_file()
-        db_exists = s.db_path.is_file()
-        return jsonify({
+        import os as _os
+        users = load_users()
+        is_multi = bool(_os.environ.get("WM_USERS_JSON"))
+        # Back-compat: si single-tenant, exponer flags del user "default"
+        # para que clientes viejos sigan funcionando.
+        body = {
             "status": "ok",
-            "version": "1.0",
-            "xlsx_present": xlsx_exists,
-            "db_present": db_exists,
-            "anchor_default": s.anchor,
-            "auth_configured": bool(s.api_token),
+            "version": "2.0",
+            "auth_configured": len(users) > 0,
+            "n_users": len(users),
+            "multi_tenant": is_multi,
             "now": datetime.now().isoformat(),
-        })
+        }
+        if not is_multi and users:
+            s = get_user_settings(users[0].user_id)
+            body["xlsx_present"] = s.xlsx_path.is_file()
+            body["db_present"] = s.db_path.is_file()
+            body["anchor_default"] = s.anchor
+        return jsonify(body)
 
     @app.get("/api/config")
     def config():
-        _require_auth()
+        _require_auth(); _block_if_switched_mutation()
         s = get_settings()
         return jsonify({
-            "base_dir": str(s.base_dir),
+            "user_id": g.active_user_id,
+            "is_admin": g.is_admin,
+            "is_switched": g.is_switched,
+            "auth_user_id": g.auth_user.user_id if g.auth_user else None,
+            "auth_user_display_name": g.auth_user.display_name if g.auth_user else None,
             "xlsx_path": str(s.xlsx_path),
-            "db_path": str(s.db_path),
-            "data_dir": str(s.data_dir),
-            "backups_dir": str(s.backups_dir),
+            "xlsx_present": s.xlsx_path.is_file(),
+            "db_present": s.db_path.is_file(),
             "anchor": s.anchor,
             "supported_sheets": sorted(ALLOWED_SHEETS),
             "event_sheets": list(SHEET_PREFIX.keys()),
@@ -181,7 +248,7 @@ def create_app() -> Flask:
 
     @app.get("/api/summary")
     def summary():
-        _require_auth()
+        _require_auth(); _block_if_switched_mutation()
         anchor = _parse_query_anchor()
         fecha = _parse_query_fecha()
         holdings, conn = _holdings(fecha, anchor)
@@ -207,7 +274,7 @@ def create_app() -> Flask:
 
     @app.get("/api/holdings")
     def holdings_endpoint():
-        _require_auth()
+        _require_auth(); _block_if_switched_mutation()
         anchor = _parse_query_anchor()
         fecha = _parse_query_fecha()
         holdings, conn = _holdings(fecha, anchor)
@@ -235,7 +302,7 @@ def create_app() -> Flask:
 
     @app.get("/api/equity-curve")
     def equity_curve():
-        _require_auth()
+        _require_auth(); _block_if_switched_mutation()
         anchor = _parse_query_anchor()
         investible_only = request.args.get("investible") == "true"
         per_account = request.args.get("per_account") == "true"
@@ -261,7 +328,7 @@ def create_app() -> Flask:
 
     @app.get("/api/buying-power")
     def buying_power_endpoint():
-        _require_auth()
+        _require_auth(); _block_if_switched_mutation()
         anchor = _parse_query_anchor()
         fecha = _parse_query_fecha()
         holdings, conn = _holdings(fecha, anchor)
@@ -288,7 +355,7 @@ def create_app() -> Flask:
 
     @app.get("/api/trade-stats")
     def trade_stats_endpoint():
-        _require_auth()
+        _require_auth(); _block_if_switched_mutation()
         anchor = _parse_query_anchor()
         fecha = _parse_query_fecha()
         conn = db_conn()
@@ -312,7 +379,7 @@ def create_app() -> Flask:
 
     @app.get("/api/realized-pnl")
     def realized_pnl_endpoint():
-        _require_auth()
+        _require_auth(); _block_if_switched_mutation()
         fecha = _parse_query_fecha()
         conn = db_conn()
         try:
@@ -345,7 +412,7 @@ def create_app() -> Flask:
 
     @app.get("/api/sheets/<sheet>")
     def list_sheet(sheet):
-        _require_auth()
+        _require_auth(); _block_if_switched_mutation()
         s = get_settings()
         if sheet not in ALLOWED_SHEETS:
             abort(404, f"Sheet '{sheet}' no soportada. Disponibles: {list(SHEET_PREFIX.keys())}")
@@ -356,7 +423,7 @@ def create_app() -> Flask:
 
     @app.get("/api/sheets/<sheet>/<row_id>")
     def get_sheet_row(sheet, row_id):
-        _require_auth()
+        _require_auth(); _block_if_switched_mutation()
         s = get_settings()
         if sheet not in ALLOWED_SHEETS:
             abort(404)
@@ -367,7 +434,7 @@ def create_app() -> Flask:
 
     @app.post("/api/sheets/<sheet>")
     def create_sheet_row(sheet):
-        _require_auth()
+        _require_auth(); _block_if_switched_mutation()
         s = get_settings()
         if sheet not in ALLOWED_SHEETS:
             abort(404)
@@ -390,7 +457,7 @@ def create_app() -> Flask:
 
     @app.put("/api/sheets/<sheet>/<row_id>")
     def update_sheet_row(sheet, row_id):
-        _require_auth()
+        _require_auth(); _block_if_switched_mutation()
         s = get_settings()
         if sheet not in ALLOWED_SHEETS:
             abort(404)
@@ -414,7 +481,7 @@ def create_app() -> Flask:
 
     @app.delete("/api/sheets/<sheet>/<row_id>")
     def delete_sheet_row(sheet, row_id):
-        _require_auth()
+        _require_auth(); _block_if_switched_mutation()
         s = get_settings()
         if sheet not in ALLOWED_SHEETS:
             abort(404)
@@ -433,7 +500,7 @@ def create_app() -> Flask:
 
     @app.post("/api/upload/excel")
     def upload_excel():
-        _require_auth()
+        _require_auth(); _block_if_switched_mutation()
         s = get_settings()
         if "file" not in request.files:
             abort(400, "Subí el archivo en form-data como 'file'")
@@ -454,7 +521,7 @@ def create_app() -> Flask:
 
     @app.get("/api/download/excel")
     def download_excel():
-        _require_auth()
+        _require_auth(); _block_if_switched_mutation()
         s = get_settings()
         if not s.xlsx_path.is_file():
             abort(404, "No hay Excel master")
@@ -466,7 +533,7 @@ def create_app() -> Flask:
 
     @app.post("/api/upload/prices")
     def upload_prices():
-        _require_auth()
+        _require_auth(); _block_if_switched_mutation()
         s = get_settings()
         if "file" not in request.files:
             abort(400, "Subí el CSV en form-data como 'file'")
@@ -488,14 +555,14 @@ def create_app() -> Flask:
 
     @app.post("/api/refresh")
     def refresh():
-        _require_auth()
+        _require_auth(); _block_if_switched_mutation()
         with excel_write_lock():
             stats = reimport_excel()
         return jsonify({"refreshed": True, "import_stats": stats})
 
     @app.get("/api/backups")
     def backups():
-        _require_auth()
+        _require_auth(); _block_if_switched_mutation()
         return jsonify({
             "backups": [
                 {
@@ -519,7 +586,7 @@ def create_app() -> Flask:
           ?ticker=AL30D        — filtra por uno
           ?asset_class=BOND_AR — filtra por clase
         """
-        _require_auth()
+        _require_auth(); _block_if_switched_mutation()
         conn = db_conn()
         try:
             ticker = request.args.get("ticker")
@@ -566,7 +633,7 @@ def create_app() -> Flask:
     @app.get("/api/fx-rates")
     def fx_rates_endpoint():
         """Devuelve la última cotización FX conocida por (moneda, base)."""
-        _require_auth()
+        _require_auth(); _block_if_switched_mutation()
         conn = db_conn()
         try:
             sql = """
@@ -601,7 +668,7 @@ def create_app() -> Flask:
 
         Query: ?anchor=USD para incluir conversión a moneda ancla.
         """
-        _require_auth()
+        _require_auth(); _block_if_switched_mutation()
         anchor = _parse_query_anchor()
         fecha = _parse_query_fecha()
         holdings, conn = _holdings(fecha, anchor)
@@ -658,7 +725,7 @@ def create_app() -> Flask:
           - Funding cierres (cauciones que vencen)
           - Recurrentes próximos (sueldo, alquiler, servicios)
         """
-        _require_auth()
+        _require_auth(); _block_if_switched_mutation()
         from datetime import timedelta
         import calendar as _cal
         days_ahead = int(request.args.get("days", 60))
@@ -796,12 +863,171 @@ def create_app() -> Flask:
             conn.close()
 
     # =========================================================================
+    # Admin: gestión de usuarios + switch view
+    # =========================================================================
+
+    @app.get("/api/admin/users")
+    def admin_list_users():
+        """Lista todos los users (sin tokens completos, solo preview)."""
+        _require_admin()
+        users = load_users()
+        # Si hay folders sin user en config, también listamos
+        config_ids = set(u.user_id for u in users)
+        disk_ids = set(list_user_ids())
+        orphans = disk_ids - config_ids
+        return jsonify({
+            "users": [
+                {
+                    "user_id": u.user_id,
+                    "display_name": u.display_name,
+                    "is_admin": u.is_admin,
+                    "token_preview": u.token[:8] + "..." if len(u.token) > 8 else "?",
+                    "has_xlsx": (get_user_settings(u.user_id).xlsx_path).is_file(),
+                    "has_db": (get_user_settings(u.user_id).db_path).is_file(),
+                }
+                for u in users
+            ],
+            "orphan_folders": sorted(orphans),
+            "n_users": len(users),
+        })
+
+    @app.post("/api/admin/users")
+    def admin_create_user():
+        """Crea un nuevo user.
+
+        Body JSON:
+          { "user_id": "amigo", "display_name": "Marcos", "is_admin": false,
+            "token": "auto"   ← si "auto", se genera random }
+
+        Acciones:
+          1. Genera token (si no se pasa)
+          2. Crea folder inputs/<user_id>/
+          3. Genera el Excel master (build_master + add_carga_inicial_sheet)
+          4. Agrega user a WM_USERS_JSON in-memory
+          5. Devuelve el token al admin para que lo comparta
+
+        IMPORTANTE: el WSGI file de PythonAnywhere tiene que actualizarse
+        para que el user persista entre reloads. La response incluye el
+        snippet a copiar en el WSGI.
+        """
+        _require_admin()
+        body = request.get_json(silent=True) or {}
+        user_id = (body.get("user_id") or "").strip().lower()
+        if not user_id or not user_id.replace("_", "").replace("-", "").isalnum():
+            abort(400, "user_id inválido (solo letras/números/_/-, lowercase)")
+        # Verificar duplicado
+        existing = resolve_user_by_token("__never_match__")  # noop, just to ensure load
+        for u in load_users():
+            if u.user_id == user_id:
+                abort(400, f"Ya existe un user con id '{user_id}'")
+
+        display_name = body.get("display_name") or user_id
+        is_admin = bool(body.get("is_admin", False))
+        token = body.get("token") or ""
+        if not token or token == "auto":
+            import secrets
+            token = secrets.token_hex(32)
+
+        # Crear folders y master vacío
+        new_settings = get_user_settings(user_id)
+        new_settings.inputs_dir.mkdir(parents=True, exist_ok=True)
+        new_settings.user_data_dir.mkdir(parents=True, exist_ok=True)
+        new_settings.backups_dir.mkdir(parents=True, exist_ok=True)
+
+        # Generar master con build_master + add_carga_inicial
+        from build_master import build_master
+        try:
+            from add_carga_inicial_sheet import add_carga_inicial_sheet
+        except ImportError:
+            add_carga_inicial_sheet = None
+
+        try:
+            build_master(new_settings.xlsx_path)
+            if add_carga_inicial_sheet:
+                add_carga_inicial_sheet(new_settings.xlsx_path)
+        except Exception as e:
+            abort(500, f"No se pudo crear el master para '{user_id}': {e}")
+
+        # Persistir en config in-memory (NO sobrevive un reload del web app)
+        add_user_to_config(user_id, token, display_name=display_name,
+                            is_admin=is_admin)
+
+        return jsonify({
+            "created": True,
+            "user_id": user_id,
+            "display_name": display_name,
+            "is_admin": is_admin,
+            "token": token,
+            "url": request.host_url.rstrip("/"),
+            "wsgi_snippet": _build_wsgi_snippet(),
+            "warning": ("Para que el user persista a través de reloads del web "
+                        "app, copiá el snippet de wsgi_snippet al WSGI file de "
+                        "PythonAnywhere. Mientras tanto, el user funciona en "
+                        "memoria del server."),
+        }), 201
+
+    @app.delete("/api/admin/users/<user_id>")
+    def admin_delete_user(user_id):
+        """Borra un user del config in-memory. NO borra los archivos del disk
+        (por seguridad). Si querés borrar también, usá ?delete_data=true."""
+        _require_admin()
+        if user_id == g.auth_user.user_id:
+            abort(400, "No podés borrar tu propio user")
+        if not any(u.user_id == user_id for u in load_users()):
+            abort(404, f"User '{user_id}' no existe")
+
+        delete_data = request.args.get("delete_data") == "true"
+        remove_user_from_config(user_id)
+
+        if delete_data:
+            import shutil
+            try:
+                ud = get_user_settings(user_id).user_data_dir
+                if ud.is_dir(): shutil.rmtree(ud)
+                inp = get_user_settings(user_id).inputs_dir
+                if inp.is_dir(): shutil.rmtree(inp)
+            except OSError as e:
+                return jsonify({"removed_config": True, "data_deleted": False,
+                                 "error": str(e)})
+        return jsonify({"removed_config": True, "data_deleted": delete_data})
+
+    @app.post("/api/admin/switch")
+    def admin_switch():
+        """Switch view del admin a otro user (read-only).
+
+        Body: {"user_id": "amigo"}  o {"user_id": null} para volver.
+        """
+        _require_admin()
+        body = request.get_json(silent=True) or {}
+        target = body.get("user_id")
+        token = g.user_token
+        if target is None or target == "" or target == g.auth_user.user_id:
+            admin_switch_clear(token)
+            return jsonify({"switched": False, "active_user_id": g.auth_user.user_id})
+        try:
+            admin_switch_to(token, target)
+        except (PermissionError, ValueError) as e:
+            abort(400, str(e))
+        return jsonify({"switched": True, "active_user_id": target,
+                         "warning": "Modo read-only. POST/PUT/DELETE están bloqueados."})
+
+    def _build_wsgi_snippet():
+        """Devuelve un fragmento de código para el WSGI file con el JSON
+        actual de users."""
+        import os, json
+        return (
+            "# Reemplazar tu WM_API_TOKEN viejo por esto:\n"
+            f"os.environ['WM_USERS_JSON'] = '''{os.environ.get('WM_USERS_JSON', '{}')}'''\n"
+            f"os.environ['WM_ADMIN_USER'] = '{os.environ.get('WM_ADMIN_USER', '')}'\n"
+        )
+
+    # =========================================================================
     # Reports
     # =========================================================================
 
     @app.get("/api/report/html")
     def report_html():
-        _require_auth()
+        _require_auth(); _block_if_switched_mutation()
         anchor = _parse_query_anchor()
         fecha = _parse_query_fecha()
         s = get_settings()
@@ -821,7 +1047,7 @@ def create_app() -> Flask:
 
     @app.get("/api/report/excel")
     def report_excel():
-        _require_auth()
+        _require_auth(); _block_if_switched_mutation()
         anchor = _parse_query_anchor()
         fecha = _parse_query_fecha()
         s = get_settings()

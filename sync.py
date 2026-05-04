@@ -43,14 +43,6 @@ except ImportError:
 
 HERE = Path(__file__).resolve().parent
 
-LOADERS = [
-    ("fx",       ["python", "fx_loader.py"]),
-    ("byma",     ["python", "byma_loader.py", "--tickers-file", "mis_tickers.txt"]),
-    ("cafci",    ["python", "cafci_loader.py"]),
-    ("cripto",   ["python", "cripto_loader.py"]),
-    ("yfinance", ["python", "yfinance_loader.py"]),
-]
-
 PRICE_CSVS = [
     HERE / "data" / "fx_historico.csv",
     HERE / "data" / "precios_historico.csv",
@@ -59,8 +51,72 @@ PRICE_CSVS = [
     HERE / "data" / "precios_us.csv",
 ]
 
-DEFAULT_XLSX = HERE / "inputs" / "wealth_management_rodricor.xlsx"
 DEFAULT_API_URL = "https://rodricor.pythonanywhere.com"
+
+
+def find_user_xlsxs() -> list[tuple[str, Path]]:
+    """Devuelve lista de (user_id, xlsx_path) de todos los users en disk.
+
+    Layout multi-tenant: inputs/<user_id>/wealth_management.xlsx
+    Back-compat: inputs/wealth_management_rodricor.xlsx → user 'default'
+    """
+    out = []
+    inputs = HERE / "inputs"
+    if not inputs.is_dir():
+        return []
+    # Multi-tenant
+    for d in sorted(inputs.iterdir()):
+        if not d.is_dir():
+            continue
+        for fname in ("wealth_management.xlsx", "wealth_management_rodricor.xlsx"):
+            f = d / fname
+            if f.is_file():
+                out.append((d.name, f))
+                break
+    # Back-compat: legacy single-master
+    if not out:
+        for fname in ("wealth_management.xlsx", "wealth_management_rodricor.xlsx"):
+            f = inputs / fname
+            if f.is_file():
+                out.append(("default", f))
+                break
+    return out
+
+
+def regenerate_tickers_union():
+    """Corre tickers_union.py para generar data/tickers_union.txt."""
+    step("Generating data/tickers_union.txt (union de tickers de todos los users)")
+    try:
+        r = subprocess.run(["python", "tickers_union.py"],
+                           cwd=HERE, capture_output=True, text=True, timeout=30)
+        if r.returncode == 0:
+            print(f"   ✓ {r.stdout.strip().splitlines()[-1] if r.stdout else 'ok'}")
+            return True
+        print(f"   ✗ Falló: {r.stderr[-300:] if r.stderr else 'sin output'}")
+        return False
+    except Exception as e:
+        print(f"   ✗ Error: {e}")
+        return False
+
+
+def get_loaders():
+    """Devuelve los comandos de loaders, usando tickers_union.txt si existe."""
+    union_file = HERE / "data" / "tickers_union.txt"
+    legacy_tickers_file = HERE / "mis_tickers.txt"
+    # Priorizar tickers_union.txt; back-compat con mis_tickers.txt
+    if union_file.is_file():
+        byma_tickers = ["--tickers-file", str(union_file)]
+    elif legacy_tickers_file.is_file():
+        byma_tickers = ["--tickers-file", str(legacy_tickers_file)]
+    else:
+        byma_tickers = []
+    return [
+        ("fx",       ["python", "fx_loader.py"]),
+        ("byma",     ["python", "byma_loader.py", *byma_tickers]),
+        ("cafci",    ["python", "cafci_loader.py"]),
+        ("cripto",   ["python", "cripto_loader.py"]),
+        ("yfinance", ["python", "yfinance_loader.py"]),
+    ]
 
 
 def load_secrets():
@@ -105,9 +161,13 @@ def step(text):
 
 def run_loaders():
     """Corre los loaders. Continúa aunque alguno falle individualmente."""
-    banner("PASO 1/4 — Loaders de precios")
+    banner("PASO 1/4 — Loaders de precios (con tickers_union)")
+
+    # Primero generar tickers_union.txt para que byma fetchee union de todos
+    regenerate_tickers_union()
+
     results = {}
-    for name, cmd in LOADERS:
+    for name, cmd in get_loaders():
         step(f"Running {name}: {' '.join(cmd)}")
         t0 = time.time()
         try:
@@ -272,9 +332,36 @@ def main():
                    help="Bajar reporte HTML al final y abrirlo")
     p.add_argument("--fecha", type=str, default=None,
                    help="Fecha del reporte (default: hoy)")
-    p.add_argument("--xlsx", type=Path, default=DEFAULT_XLSX,
-                   help=f"Path al Excel master (default: {DEFAULT_XLSX})")
+    p.add_argument("--xlsx", type=Path, default=None,
+                   help="Path al Excel master (default: auto-detecta de "
+                        "inputs/<user>/wealth_management.xlsx para el user "
+                        "del token, o legacy inputs/wealth_management_rodricor.xlsx)")
     args = p.parse_args()
+
+    # Auto-detect xlsx path si no se pasó
+    if args.xlsx is None:
+        candidates = []
+        # Multi-tenant: inputs/<user>/wealth_management.xlsx
+        for u_dir in (HERE / "inputs").iterdir() if (HERE / "inputs").is_dir() else []:
+            if u_dir.is_dir():
+                for fname in ("wealth_management.xlsx",
+                              "wealth_management_rodricor.xlsx"):
+                    f = u_dir / fname
+                    if f.is_file():
+                        candidates.append(f)
+                        break
+        # Legacy
+        for fname in ("wealth_management.xlsx",
+                       "wealth_management_rodricor.xlsx"):
+            f = HERE / "inputs" / fname
+            if f.is_file():
+                candidates.append(f)
+                break
+        if candidates:
+            args.xlsx = candidates[0]
+            print(f"[sync] Auto-detect xlsx: {args.xlsx}")
+        else:
+            args.xlsx = HERE / "inputs" / "wealth_management.xlsx"
 
     cfg = get_config()
     print(f"[sync] Server: {cfg['url']}")

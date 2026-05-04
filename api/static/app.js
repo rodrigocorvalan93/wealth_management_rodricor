@@ -121,6 +121,15 @@
     cash: (anchor) => API.req(`/api/cash?anchor=${anchor || API.anchor()}`),
     config: () => API.req("/api/config"),
     reportHtml: (anchor) => API.req(`/api/report/html?anchor=${anchor || API.anchor()}`),
+
+    // Admin endpoints
+    listUsers: () => API.req("/api/admin/users"),
+    createUser: (data) => API.req("/api/admin/users", { method: "POST", json: data }),
+    deleteUser: (id, deleteData) =>
+      API.req(`/api/admin/users/${encodeURIComponent(id)}${deleteData ? '?delete_data=true' : ''}`,
+              { method: "DELETE" }),
+    switchUser: (target) =>
+      API.req("/api/admin/switch", { method: "POST", json: { user_id: target } }),
   };
 
   // -------- Toast --------
@@ -503,6 +512,57 @@
       render();
     },
 
+    // Admin actions
+    async createUserSubmit(data, form) {
+      const userId = (data.user_id || "").trim().toLowerCase();
+      if (!userId) { toast("user_id requerido", "error"); return; }
+      try {
+        const result = await API.createUser({
+          user_id: userId,
+          display_name: data.display_name || userId,
+          is_admin: data.is_admin === "on" || data.is_admin === "1" || data.is_admin === true,
+          token: "auto",
+        });
+        // Mostrar el token al admin (única vez)
+        const url = result.url || window.location.origin;
+        const msg = `User '${result.user_id}' creado!\n\nURL: ${url}\nToken:\n${result.token}\n\n` +
+                    `📋 Compartilo con el amigo por un canal seguro.\n\n` +
+                    `⚠ IMPORTANTE: copiá este snippet al WSGI file de PA:\n${result.wsgi_snippet}`;
+        alert(msg);
+        invalidateMeta();
+        navigate("/admin");
+      } catch (e) {
+        toast(e.message, "error");
+      }
+    },
+    async deleteUserAction(userId) {
+      if (!confirm(`¿Borrar config del user '${userId}'?\n\n` +
+                    `Los archivos del disk NO se borran (seguridad). El user dejará ` +
+                    `de poder loguearse pero su data queda en inputs/${userId}/ y data/${userId}/.`)) return;
+      try {
+        await API.deleteUser(userId, false);
+        toast(`User '${userId}' eliminado del config`, "success");
+        render();
+      } catch (e) {
+        toast(e.message, "error");
+      }
+    },
+    async switchToUser(userId) {
+      try {
+        await API.switchUser(userId);
+        if (userId) {
+          toast(`Switch a '${userId}' (read-only)`, "info");
+        } else {
+          toast(`Volviste a tu user`, "success");
+        }
+        API._bustCache();
+        invalidateMeta();
+        navigate("/");
+      } catch (e) {
+        toast(e.message, "error");
+      }
+    },
+
     async refreshAll() {
       try {
         toast("Refrescando...", "info");
@@ -535,9 +595,31 @@
   // /  Dashboard
   route("/", async () => {
     const view = API.view();  // 'all' | 'investible'
-    const [s, fills] = await Promise.all([
-      API.summary(), API.realizedPnl(),
-    ]);
+    let s, fills;
+    try {
+      [s, fills] = await Promise.all([
+        API.summary(), API.realizedPnl(),
+      ]);
+    } catch (e) {
+      // Si la DB está vacía o falla el summary, ofrecer setup wizard
+      const cfg = await API.config().catch(() => null);
+      if (cfg && !cfg.xlsx_present) {
+        // Sin Excel — redirigir al wizard
+        setTimeout(() => navigate("/setup"), 100);
+        return `${headerWithBack("Setup", "/")}<main><div class="loading"><div class="spinner"></div>Redirigiendo al wizard...</div></main>`;
+      }
+      throw e;
+    }
+    // Si el summary devuelve 0 holdings y el Excel está vacío, sugerir wizard
+    if (s.n_positions === 0 && (s.patrimonio_total || 0) === 0) {
+      const cfg = await API.config().catch(() => null);
+      if (cfg && cfg.xlsx_present) {
+        // Tiene Excel pero está vacío — mostrar tip al wizard
+      } else {
+        setTimeout(() => navigate("/setup"), 100);
+        return `${headerWithBack("Setup", "/")}<main><div class="loading"><div class="spinner"></div>Redirigiendo al wizard...</div></main>`;
+      }
+    }
 
     const pn = view === "investible" ? s.patrimonio_invertible : s.patrimonio_total;
     const totalNet = pn;
@@ -2104,6 +2186,239 @@
   };
 
   // ====================================================================
+  // /admin — gestión de users (solo admin)
+  // ====================================================================
+  route("/admin", async () => {
+    let cfg, list;
+    try {
+      [cfg, list] = await Promise.all([API.config(), API.listUsers()]);
+    } catch (e) {
+      return `${headerWithBack("⚠️ Admin", "/")}<main><div class="card danger">${escapeHtml(e.message)}</div></main>`;
+    }
+    if (!cfg.is_admin) {
+      return `
+        ${headerWithBack("Admin", "/")}
+        <main>
+          <div class="card">
+            <p>Esta página es solo para el admin.</p>
+          </div>
+        </main>
+      `;
+    }
+    const users = list.users || [];
+    const orphans = list.orphan_folders || [];
+    return `
+      ${headerWithBack("👥 Admin · Usuarios", "/")}
+      <main>
+        <div class="card compact muted" style="font-size: 13px;">
+          Cada user tiene su Excel master, su DB y sus backups separados.
+          Como admin podés <b>switch user</b> (read-only) para ver datos de otros,
+          o crear/borrar usuarios.
+        </div>
+
+        ${cfg.is_switched ? `
+          <div class="card warn" style="background:#FFF8E1; border-left: 4px solid var(--yellow); margin-top:12px;">
+            <b>⚠ Modo Switch User</b>
+            <div style="font-size: 13px; margin-top: 4px;">
+              Estás viendo los datos de <b>${escapeHtml(cfg.user_id)}</b> (read-only).
+              POST/PUT/DELETE están bloqueados.
+            </div>
+            <button class="btn primary full" style="margin-top: 8px;"
+                    data-onclick="switchToUser" data-arg="">
+              ← Volver a mis datos (${escapeHtml(cfg.auth_user_id)})
+            </button>
+          </div>
+        ` : ""}
+
+        <section style="margin-top: 14px;">
+          <h2>Usuarios (${users.length})</h2>
+          <div class="list">
+            ${users.map(u => `
+              <div class="list-item" style="align-items: flex-start;">
+                <div class="meta">
+                  <div class="meta-line1">
+                    ${escapeHtml(u.display_name)}
+                    ${u.is_admin ? '<span class="tag">admin</span>' : ''}
+                    ${u.user_id === cfg.auth_user_id ? '<span class="tag">vos</span>' : ''}
+                  </div>
+                  <div class="meta-line2">
+                    <span class="muted">id:</span> ${escapeHtml(u.user_id)} ·
+                    <span class="muted">tok:</span> <code style="font-size:10px;">${escapeHtml(u.token_preview)}</code>
+                  </div>
+                  <div class="meta-line2 muted" style="font-size: 11px;">
+                    xlsx: ${u.has_xlsx ? '✓' : '✗'} · db: ${u.has_db ? '✓' : '✗'}
+                  </div>
+                </div>
+                <div class="right">
+                  ${u.user_id !== cfg.auth_user_id ? `
+                    <button class="btn ghost" style="padding: 4px 10px; font-size: 11px;"
+                            data-onclick="switchToUser" data-arg="${escapeHtml(u.user_id)}">
+                      👁 ver
+                    </button>
+                    <button class="btn" style="padding: 4px 10px; font-size: 11px; background: var(--red); color: white; margin-top: 4px;"
+                            data-onclick="deleteUserAction" data-arg="${escapeHtml(u.user_id)}">
+                      🗑
+                    </button>
+                  ` : `<span class="muted" style="font-size:11px;">tú</span>`}
+                </div>
+              </div>
+            `).join("")}
+          </div>
+        </section>
+
+        <section style="margin-top: 14px;">
+          <a href="#/admin/new" class="btn primary full">+ Crear usuario</a>
+        </section>
+
+        ${orphans.length > 0 ? `
+          <section style="margin-top: 14px;">
+            <h2>Folders huérfanos (${orphans.length})</h2>
+            <div class="card compact muted" style="font-size: 12px;">
+              Estos folders existen en disk pero no en config (probablemente
+              users borrados con --delete_data=false). Editá WM_USERS_JSON
+              para re-agregarlos o borralos manualmente.
+            </div>
+            <div class="list">
+              ${orphans.map(o => `<div class="list-item">${escapeHtml(o)}</div>`).join("")}
+            </div>
+          </section>
+        ` : ""}
+
+        <section style="margin-top: 14px;">
+          <a href="#/help" class="btn ghost full">❓ ¿Cómo persistir users a través de reloads?</a>
+        </section>
+      </main>
+    `;
+  });
+
+  route("/admin/new", async () => {
+    return `
+      ${headerWithBack("Crear usuario", "/admin")}
+      <main>
+        <div class="card compact muted" style="font-size: 13px;">
+          Se creará el folder <code>inputs/{user_id}/</code> y un Excel master
+          completo (16 hojas) listo para que el amigo lo descargue, complete con
+          sus saldos iniciales (en la hoja <code>_carga_inicial</code>) y suba
+          de vuelta.
+        </div>
+
+        <form data-action="createUserSubmit" style="margin-top: 12px;">
+          ${inputField("user_id (handle)", "user_id", "", "text",
+                        { required: true, placeholder: "ej: amigo, marcos, juan_p" })}
+          ${inputField("Nombre display", "display_name", "", "text",
+                        { placeholder: "ej: Marcos Pérez (opcional)" })}
+          <div class="field">
+            <label>¿Es admin?</label>
+            <select name="is_admin">
+              <option value="0">No (default)</option>
+              <option value="1">Sí (puede crear users + switch)</option>
+            </select>
+          </div>
+          <button type="submit" class="btn primary full">Crear usuario</button>
+        </form>
+
+        <div class="card compact" style="background:#FFF8E1; margin-top: 14px; font-size: 12px;">
+          ⚠ Después de crear el user, vas a recibir el token UNA SOLA VEZ.
+          Compartilo con el amigo por un canal seguro (WhatsApp directo, no
+          grupo). Y copiá el snippet del WSGI file que te muestra el alert.
+        </div>
+      </main>
+    `;
+  });
+
+  // ====================================================================
+  // /setup — wizard primera vez (user con DB vacía)
+  // ====================================================================
+  route("/setup", async () => {
+    return `
+      ${headerWithBack("🎉 Bienvenido", "/")}
+      <main>
+        <div class="card" style="border-left: 4px solid var(--green);">
+          <h2 style="margin-bottom: 8px;">Setup inicial — 3 pasos</h2>
+          <p>Para arrancar, necesitás cargar tus saldos iniciales (cuántos
+          activos tenés hoy en cada cuenta). Tenés 2 caminos:</p>
+
+          <h3 style="margin-top: 14px; font-size: 14px;">Opción A — Via Excel (recomendado para muchos saldos)</h3>
+          <ol style="margin-left: 20px; font-size: 13px;">
+            <li><b>Bajá tu Excel master</b> — abajo hay botón. Tiene 16 hojas
+                ya preparadas (cuentas, especies, blotter, etc).</li>
+            <li><b>Completalo en tu PC</b> — al menos las hojas:
+                <ul style="margin-top: 4px;">
+                  <li><code>cuentas</code>: tus cuentas (cocos, galicia, etc)</li>
+                  <li><code>especies</code>: cada ticker que tradees</li>
+                  <li><code>_carga_inicial</code>: tus holdings al día de hoy
+                      (Cuenta | Activo | Qty | Precio | Moneda)</li>
+                </ul>
+            </li>
+            <li><b>Subilo de vuelta</b> — botón abajo. La app procesa
+                <code>_carga_inicial</code> automáticamente y te bootstrappea
+                el portfolio.</li>
+          </ol>
+
+          <h3 style="margin-top: 14px; font-size: 14px;">Opción B — Cargar a mano desde la PWA</h3>
+          <p>Andá a <b>Settings → Maestros → Cuentas</b> y agregá cuentas y
+          especies a mano. Después usás <b>+ Nuevo trade / gasto / ingreso</b>
+          en cada tab. Más lento pero no requiere PC.</p>
+        </div>
+
+        <section style="margin-top: 14px;">
+          <a class="btn primary full" href="#" onclick="event.preventDefault(); downloadExcel();" style="margin-bottom: 8px;">
+            ⬇ Bajar Excel master (template)
+          </a>
+          <button class="btn ghost full" onclick="document.getElementById('xlsxUpload').click();">
+            ⬆ Subir Excel completado
+          </button>
+          <input type="file" id="xlsxUpload" accept=".xlsx,.xls"
+                 style="display: none;" onchange="window.uploadInitialExcel(event);">
+        </section>
+
+        <div class="card compact muted" style="margin-top: 14px; font-size: 12px;">
+          💡 Si más adelante querés agregar trades históricos (no solo el
+          saldo actual), usá el tab <b>Trades</b> después del setup.
+        </div>
+      </main>
+    `;
+  });
+
+  window.uploadInitialExcel = async function(event) {
+    const file = event.target.files[0];
+    if (!file) return;
+    toast("Subiendo " + file.name + "...", "info");
+    const formData = new FormData();
+    formData.append("file", file);
+    try {
+      const res = await fetch(`${API.base}/api/upload/excel`, {
+        method: "POST",
+        headers: { "Authorization": `Bearer ${API.token()}` },
+        body: formData,
+      });
+      if (!res.ok) {
+        let msg = `HTTP ${res.status}`;
+        try { msg = (await res.json()).message || msg; } catch (_) {}
+        throw new Error(msg);
+      }
+      const data = await res.json();
+      const stats = data.import_stats || {};
+      const summary = Object.entries(stats).filter(([_, v]) => v > 0)
+                              .map(([k, v]) => `${k}: ${v}`).join(", ");
+      toast(`✓ Excel subido. ${summary}`, "success");
+      API._bustCache();
+      invalidateMeta();
+      // Si hay _carga_inicial, ofrecer procesarlo
+      if (confirm("Excel subido. ¿Procesar la hoja _carga_inicial ahora? (genera asientos de apertura con tus saldos iniciales)")) {
+        // Llamar refresh que re-importa
+        await API.refresh();
+        toast("Refresh completado. ¡Vamos al dashboard!", "success");
+        navigate("/");
+      } else {
+        navigate("/");
+      }
+    } catch (e) {
+      toast("Error: " + e.message, "error");
+    }
+  };
+
+  // ====================================================================
   // /help — manualcitos
   // ====================================================================
   route("/help", async () => {
@@ -2238,7 +2553,9 @@ python yfinance_loader.py</pre>
   // /settings
   route("/settings", async () => {
     let health = null;
+    let cfg = null;
     try { health = await API.health(); } catch (_) {}
+    try { cfg = await API.config(); } catch (_) {}
     let backups = [];
     try {
       const b = await API.backups();
@@ -2295,12 +2612,25 @@ python yfinance_loader.py</pre>
           <a href="#/calendar" class="btn ghost full" style="margin-bottom:6px">📅 Calendario (próximos 60 días)</a>
         </section>
 
+        ${cfg && cfg.is_admin ? `
+          <section>
+            <h2>Admin</h2>
+            <a href="#/admin" class="btn primary full" style="margin-bottom:6px">👥 Gestión de usuarios</a>
+            ${cfg.is_switched ? `
+              <button class="btn ghost full" data-onclick="switchToUser" data-arg="" style="margin-bottom:6px">
+                ← Volver a tu user (${escapeHtml(cfg.auth_user_id)})
+              </button>
+            ` : ""}
+          </section>
+        ` : ""}
+
         <section>
           <h2>Acciones</h2>
           <button class="btn primary full" data-onclick="refreshAll" style="margin-bottom:8px">⟳ Refrescar DB desde Excel</button>
           <a class="btn ghost full" href="${API.base}/api/download/excel"
              style="margin-bottom:8px"
              onclick="event.preventDefault(); downloadExcel();">⬇ Descargar Excel</a>
+          <a class="btn ghost full" href="#/setup" style="margin-bottom:8px">🎉 Wizard inicial</a>
           <a class="btn ghost full" href="#/help" style="margin-bottom:8px">❓ Ayuda y manualcitos</a>
           <button class="btn danger full" data-onclick="logout">🔓 Cerrar sesión</button>
         </section>
