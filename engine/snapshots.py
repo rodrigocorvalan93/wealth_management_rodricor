@@ -169,23 +169,78 @@ def get_equity_curves_by_account(conn, anchor_currency="USD",
     return dict(out)
 
 
-def calculate_returns(curve):
-    """Calcula retorno simple acumulado y variaciones.
+def _period_returns(curve):
+    """Calcula retornos % entre puntos consecutivos. Skip puntos con valor 0."""
+    rets = []
+    for i in range(1, len(curve)):
+        prev = curve[i - 1]["mv_anchor"]
+        curr = curve[i]["mv_anchor"]
+        if prev in (0, None) or curr is None:
+            continue
+        rets.append((curr - prev) / prev)
+    return rets
+
+
+def _avg(xs):
+    return sum(xs) / len(xs) if xs else 0.0
+
+
+def _stdev(xs):
+    if len(xs) < 2:
+        return 0.0
+    m = _avg(xs)
+    var = sum((x - m) ** 2 for x in xs) / (len(xs) - 1)
+    return var ** 0.5
+
+
+def _periods_per_year(curve):
+    """Estima cuántos snapshots equivalen a un año, según el espaciado real
+    entre fechas. Si solo hay 1 punto, asumimos 252 (días bursátiles)."""
+    from datetime import date as _date
+    if len(curve) < 2:
+        return 252.0
+    try:
+        d0 = _date.fromisoformat(curve[0]["fecha"][:10])
+        d1 = _date.fromisoformat(curve[-1]["fecha"][:10])
+        days = (d1 - d0).days
+        if days <= 0:
+            return 252.0
+        n_intervals = len(curve) - 1
+        avg_days_between = days / n_intervals
+        return 365.0 / max(avg_days_between, 1.0)
+    except (ValueError, TypeError):
+        return 252.0
+
+
+def calculate_returns(curve, risk_free_rate=0.0):
+    """Calcula métricas de performance del equity curve.
 
     curve: lista [{fecha, mv_anchor}, ...] ordenada asc.
-    Devuelve dict {
-        first_value, last_value,
-        total_return_abs, total_return_pct,
-        n_periods,
-        max_drawdown_pct, max_drawdown_abs,
-    }
+
+    Métricas devueltas:
+      first_value, last_value, total_return_abs, total_return_pct, n_periods
+      max_drawdown_abs, max_drawdown_pct
+      volatility_period, volatility_annual
+      sharpe_ratio (annualized, usando risk_free_rate)
+      sortino_ratio (penaliza solo downside)
+      calmar_ratio (return / |max_drawdown|)
+      avg_return_period (retorno promedio por período)
+      best_period_return, worst_period_return
+
+    risk_free_rate: tasa libre de riesgo anual (decimal). Default 0.
     """
-    if not curve or len(curve) < 1:
+    if not curve:
         return {
             "first_value": 0.0, "last_value": 0.0,
             "total_return_abs": 0.0, "total_return_pct": 0.0,
             "n_periods": 0,
             "max_drawdown_pct": 0.0, "max_drawdown_abs": 0.0,
+            "volatility_period": 0.0, "volatility_annual": 0.0,
+            "sharpe_ratio": None, "sortino_ratio": None,
+            "calmar_ratio": None,
+            "avg_return_period": 0.0,
+            "best_period_return": 0.0, "worst_period_return": 0.0,
+            "periods_per_year": 252.0,
         }
 
     first = curve[0]["mv_anchor"]
@@ -193,8 +248,8 @@ def calculate_returns(curve):
     abs_ret = last - first
     pct_ret = (abs_ret / first) if first not in (0, None) else 0.0
 
-    # Drawdown: peak-to-trough
-    peak = curve[0]["mv_anchor"]
+    # Drawdown
+    peak = first
     max_dd_abs = 0.0
     max_dd_pct = 0.0
     for p in curve:
@@ -208,6 +263,57 @@ def calculate_returns(curve):
         if dd_pct < max_dd_pct:
             max_dd_pct = dd_pct
 
+    # Period returns
+    rets = _period_returns(curve)
+    if len(rets) < 2:
+        return {
+            "first_value": first, "last_value": last,
+            "total_return_abs": abs_ret, "total_return_pct": pct_ret,
+            "n_periods": len(curve),
+            "max_drawdown_abs": max_dd_abs, "max_drawdown_pct": max_dd_pct,
+            "volatility_period": 0.0, "volatility_annual": 0.0,
+            "sharpe_ratio": None, "sortino_ratio": None,
+            "calmar_ratio": None,
+            "avg_return_period": _avg(rets),
+            "best_period_return": max(rets) if rets else 0.0,
+            "worst_period_return": min(rets) if rets else 0.0,
+            "periods_per_year": _periods_per_year(curve),
+        }
+
+    avg_r = _avg(rets)
+    vol_p = _stdev(rets)
+    ppy = _periods_per_year(curve)
+    vol_a = vol_p * (ppy ** 0.5)
+
+    # Sharpe (annualized)
+    rf_period = risk_free_rate / ppy if ppy > 0 else 0.0
+    excess = [r - rf_period for r in rets]
+    excess_avg = _avg(excess)
+    excess_std = _stdev(excess)
+    sharpe = (excess_avg / excess_std * (ppy ** 0.5)) if excess_std > 1e-12 else None
+
+    # Sortino (downside deviation)
+    downside = [r - rf_period for r in rets if r < rf_period]
+    if len(downside) >= 2:
+        downside_std = (sum(r * r for r in downside) / len(downside)) ** 0.5
+        sortino = (excess_avg / downside_std * (ppy ** 0.5)) if downside_std > 1e-12 else None
+    elif not downside:
+        sortino = float("inf") if excess_avg > 0 else None
+    else:
+        sortino = None
+
+    # Calmar = retorno anualizado / |max DD|
+    if max_dd_pct < -1e-9:
+        # CAGR aproximado: (last/first) ^ (ppy / n_periods) - 1
+        years = max(len(curve) / ppy, 1e-9)
+        try:
+            cagr = (last / first) ** (1 / years) - 1 if first > 0 else 0.0
+        except (ZeroDivisionError, ValueError):
+            cagr = 0.0
+        calmar = cagr / abs(max_dd_pct)
+    else:
+        calmar = None
+
     return {
         "first_value": first,
         "last_value": last,
@@ -216,4 +322,13 @@ def calculate_returns(curve):
         "n_periods": len(curve),
         "max_drawdown_abs": max_dd_abs,
         "max_drawdown_pct": max_dd_pct,
+        "volatility_period": vol_p,
+        "volatility_annual": vol_a,
+        "sharpe_ratio": sharpe,
+        "sortino_ratio": sortino if sortino != float("inf") else None,
+        "calmar_ratio": calmar,
+        "avg_return_period": avg_r,
+        "best_period_return": max(rets),
+        "worst_period_return": min(rets),
+        "periods_per_year": ppy,
     }

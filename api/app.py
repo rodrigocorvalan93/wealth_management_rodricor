@@ -45,7 +45,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from flask import (
-    Flask, request, jsonify, send_file, abort, Response,
+    Flask, request, jsonify, send_file, send_from_directory,
+    abort, Response, render_template,
 )
 
 from engine.holdings import (
@@ -73,7 +74,24 @@ from .excel_io import (
 
 
 def create_app() -> Flask:
-    app = Flask(__name__)
+    app = Flask(__name__,
+                static_folder="static",
+                template_folder="templates",
+                static_url_path="/static")
+
+    # --- PWA: shell HTML ---
+    @app.route("/")
+    def root():
+        return render_template("pwa.html")
+
+    # Service worker debe servirse desde la raíz (no /static/) para tener
+    # scope completo. Lo redirigimos.
+    @app.route("/sw.js")
+    def service_worker():
+        resp = send_from_directory(app.static_folder, "sw.js")
+        resp.headers["Service-Worker-Allowed"] = "/"
+        resp.headers["Cache-Control"] = "no-cache"
+        return resp
 
     # --- CORS abierto (single user, token-protected) ---
     @app.after_request
