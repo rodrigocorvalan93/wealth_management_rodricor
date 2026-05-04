@@ -117,22 +117,27 @@ def regenerate_tickers_union():
 
 
 def get_loaders():
-    """Devuelve los comandos de loaders, usando tickers_union.txt si existe."""
+    """Devuelve los comandos de loaders, usando tickers_union.txt si existe.
+
+    Cada loader filtra internamente los tickers que le interesan por sufijo:
+      - byma:     tickers sin sufijo, _AR, .BA → CEDEARs / equities AR / bonos
+      - yfinance: tickers _US / _ADR → mercado US (Yahoo)
+      - cripto / cafci: tienen sus propias listas / detección por nombre
+    """
     union_file = HERE / "data" / "tickers_union.txt"
     legacy_tickers_file = HERE / "mis_tickers.txt"
-    # Priorizar tickers_union.txt; back-compat con mis_tickers.txt
     if union_file.is_file():
-        byma_tickers = ["--tickers-file", str(union_file)]
+        tickers_arg = ["--tickers-file", str(union_file)]
     elif legacy_tickers_file.is_file():
-        byma_tickers = ["--tickers-file", str(legacy_tickers_file)]
+        tickers_arg = ["--tickers-file", str(legacy_tickers_file)]
     else:
-        byma_tickers = []
+        tickers_arg = []
     return [
         ("fx",       [PYTHON_BIN, "fx_loader.py"]),
-        ("byma",     [PYTHON_BIN, "byma_loader.py", *byma_tickers]),
+        ("byma",     [PYTHON_BIN, "byma_loader.py", *tickers_arg]),
         ("cafci",    [PYTHON_BIN, "cafci_loader.py"]),
         ("cripto",   [PYTHON_BIN, "cripto_loader.py"]),
-        ("yfinance", [PYTHON_BIN, "yfinance_loader.py"]),
+        ("yfinance", [PYTHON_BIN, "yfinance_loader.py", *tickers_arg]),
     ]
 
 

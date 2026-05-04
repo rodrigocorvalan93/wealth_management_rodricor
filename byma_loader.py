@@ -296,9 +296,30 @@ def parse_snapshot(
 # Símbolos BYMA
 # =============================================================================
 
+def _to_byma_ticker(ticker: str) -> str:
+    """Strippea sufijos de mercado del ticker para llamar a BYMA.
+
+    Convención: en `especies` los CEDEARs (mercado AR) llevan sufijo _AR
+    para diferenciarlos del ticker US (que va con _US a yfinance). BYMA's
+    API usa el ticker base sin sufijo (AAPL, no AAPL_AR).
+
+    Ejemplos:
+        AAPL_AR  → AAPL
+        AL30D    → AL30D    (bono, no tiene sufijo)
+        GGAL.BA  → GGAL     (formato Yahoo, BYMA usa GGAL)
+        GGAL     → GGAL
+    """
+    t = ticker.upper()
+    if t.endswith("_AR"):
+        return t[:-3]
+    if t.endswith(".BA"):
+        return t[:-3]
+    return t
+
+
 def _symbol(ticker: str) -> str:
     """Construye el símbolo BYMA en plazo 24hs."""
-    return f"MERV - XMEV - {ticker} - {PLAZO}"
+    return f"MERV - XMEV - {_to_byma_ticker(ticker)} - {PLAZO}"
 
 
 def fetch_snapshots(
