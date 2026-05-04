@@ -70,10 +70,16 @@
     backups: () => API.req("/api/backups"),
 
     listSheet: (sheet) => API.req(`/api/sheets/${sheet}`),
-    getSheetRow: (sheet, id) => API.req(`/api/sheets/${sheet}/${id}`),
+    getSheetRow: (sheet, id) => API.req(`/api/sheets/${sheet}/${encodeURIComponent(id)}`),
     createRow: (sheet, data) => API.req(`/api/sheets/${sheet}`, { method: "POST", json: data }),
-    updateRow: (sheet, id, data) => API.req(`/api/sheets/${sheet}/${id}`, { method: "PUT", json: data }),
-    deleteRow: (sheet, id) => API.req(`/api/sheets/${sheet}/${id}`, { method: "DELETE" }),
+    updateRow: (sheet, id, data) => API.req(`/api/sheets/${sheet}/${encodeURIComponent(id)}`, { method: "PUT", json: data }),
+    deleteRow: (sheet, id) => API.req(`/api/sheets/${sheet}/${encodeURIComponent(id)}`, { method: "DELETE" }),
+
+    prices: () => API.req("/api/prices"),
+    fxRates: () => API.req("/api/fx-rates"),
+    cash: (anchor) => API.req(`/api/cash?anchor=${anchor || API.anchor()}`),
+    config: () => API.req("/api/config"),
+    reportHtml: (anchor) => API.req(`/api/report/html?anchor=${anchor || API.anchor()}`),
   };
 
   // -------- Toast --------
@@ -314,6 +320,90 @@
       toast("Transferencia borrada", "success");
       render();
     },
+    // Maestros: especies (tickers)
+    async createEspecie(data) {
+      await API.createRow("especies", data);
+      invalidateMeta();
+      toast(`Especie ${data.Ticker} agregada ✓`, "success");
+      navigate("/especies");
+    },
+    async updateEspecie(data, form) {
+      const id = form.dataset.rowId;
+      await API.updateRow("especies", id, data);
+      invalidateMeta();
+      toast("Especie actualizada ✓", "success");
+      navigate("/especies");
+    },
+    async deleteEspecie(id) {
+      if (!confirm(`¿Borrar especie ${id}? Movimientos previos quedarán huérfanos.`)) return;
+      await API.deleteRow("especies", id);
+      invalidateMeta();
+      toast("Especie borrada", "success");
+      render();
+    },
+    // Maestros: monedas
+    async createMoneda(data) {
+      ["Is Stable", "Is Base"].forEach(k => {
+        if (data[k] !== null && data[k] !== undefined) {
+          data[k] = data[k] === "1" || data[k] === 1 || data[k] === true ? 1 : 0;
+        }
+      });
+      await API.createRow("monedas", data);
+      invalidateMeta();
+      toast(`Moneda ${data.Code} agregada ✓`, "success");
+      navigate("/monedas");
+    },
+    async updateMoneda(data, form) {
+      ["Is Stable", "Is Base"].forEach(k => {
+        if (data[k] !== null && data[k] !== undefined) {
+          data[k] = data[k] === "1" || data[k] === 1 || data[k] === true ? 1 : 0;
+        }
+      });
+      const id = form.dataset.rowId;
+      await API.updateRow("monedas", id, data);
+      invalidateMeta();
+      toast("Moneda actualizada ✓", "success");
+      navigate("/monedas");
+    },
+    async deleteMoneda(id) {
+      if (!confirm(`¿Borrar moneda ${id}? Solo si NO se usa en ningún movement.`)) return;
+      await API.deleteRow("monedas", id);
+      invalidateMeta();
+      toast("Moneda borrada", "success");
+      render();
+    },
+    // Maestros: cuentas
+    async createCuenta(data) {
+      ["Close Day", "Due Day"].forEach(k => {
+        if (data[k] !== null && data[k] !== undefined && data[k] !== "") {
+          data[k] = parseInt(data[k]);
+        }
+      });
+      await API.createRow("cuentas", data);
+      invalidateMeta();
+      toast(`Cuenta ${data.Code} agregada ✓`, "success");
+      navigate("/cuentas");
+    },
+    async updateCuenta(data, form) {
+      ["Close Day", "Due Day"].forEach(k => {
+        if (data[k] !== null && data[k] !== undefined && data[k] !== "") {
+          data[k] = parseInt(data[k]);
+        }
+      });
+      const id = form.dataset.rowId;
+      await API.updateRow("cuentas", id, data);
+      invalidateMeta();
+      toast("Cuenta actualizada ✓", "success");
+      navigate("/cuentas");
+    },
+    async deleteCuenta(id) {
+      if (!confirm(`¿Borrar cuenta ${id}? Solo si NO tiene movements.`)) return;
+      await API.deleteRow("cuentas", id);
+      invalidateMeta();
+      toast("Cuenta borrada", "success");
+      render();
+    },
+
     async refreshAll() {
       try {
         toast("Refrescando...", "info");
@@ -451,27 +541,15 @@
         </section>
 
         <section>
-          <a href="${API.base}/api/report/html?anchor=${API.anchor()}"
-             target="_blank" rel="noopener"
-             onclick="event.preventDefault(); openFullReport();"
-             class="btn primary full">📄 Ver reporte completo</a>
+          <a href="#/report" class="btn primary full">📄 Ver reporte completo</a>
+          <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 8px;">
+            <a href="#/cash" class="btn ghost full">💵 Cash por cuenta</a>
+            <a href="#/cotizaciones" class="btn ghost full">💹 Cotizaciones</a>
+          </div>
         </section>
       </main>
     `;
   });
-
-  // Helper: abrir el reporte HTML completo en nueva ventana, con auth
-  window.openFullReport = async function () {
-    try {
-      toast("Cargando reporte...", "info");
-      const html = await API.req(`/api/report/html?anchor=${API.anchor()}`);
-      const blob = new Blob([html], { type: "text/html" });
-      const url = URL.createObjectURL(blob);
-      window.open(url, "_blank");
-    } catch (e) {
-      toast(e.message, "error");
-    }
-  };
 
   // /trades — listar
   route("/trades", async () => {
@@ -795,6 +873,471 @@
     `;
   });
 
+  // ====================================================================
+  // Maestros: especies
+  // ====================================================================
+  route("/especies", async () => {
+    const data = await API.listSheet("especies");
+    const items = (data.items || []).filter(r => r.Ticker);
+    items.sort((a, b) => (a["Asset Class"] || "").localeCompare(b["Asset Class"] || "")
+                       || (a.Ticker || "").localeCompare(b.Ticker || ""));
+    return `
+      ${headerWithBack("📦 Especies", "/settings")}
+      <main>
+        <div class="card compact muted" style="font-size: 13px;">
+          Tickers tradeables. Cualquier especie que uses en blotter debe estar acá.
+          También editable desde el Excel master.
+        </div>
+        <a href="#/especies/new" class="btn primary full" style="margin: 12px 0;">+ Nueva especie</a>
+        ${items.length === 0 ? emptyState("Sin especies", "Tocá + para agregar") :
+          `<div class="list">${items.map(r => `
+            <a class="list-item" href="#/especies/${encodeURIComponent(r.Ticker)}/edit">
+              <div class="meta">
+                <div class="meta-line1">${escapeHtml(r.Ticker)} · <span class="muted">${escapeHtml(r["Asset Class"] || "?")}</span></div>
+                <div class="meta-line2">${escapeHtml(r.Name || "")}</div>
+              </div>
+              <div class="right">
+                <div class="sub"><span class="tag">${escapeHtml(r.Currency || "")}</span></div>
+                ${r.Issuer ? `<div class="sub muted">${escapeHtml(r.Issuer)}</div>` : ""}
+              </div>
+            </a>
+          `).join("")}</div>`
+        }
+      </main>
+    `;
+  });
+
+  route("/especies/new", async () => {
+    return `
+      ${headerWithBack("Nueva especie", "/especies")}
+      <main>
+        <form data-action="createEspecie">
+          ${especieFormFields({}, false)}
+          <button type="submit" class="btn primary full">Guardar</button>
+        </form>
+      </main>
+    `;
+  });
+
+  route("/especies/:id/edit", async ({ id }) => {
+    const row = await API.getSheetRow("especies", id);
+    return `
+      ${headerWithBack("Editar especie", "/especies")}
+      <main>
+        <form data-action="updateEspecie" data-row-id="${escapeHtml(id)}">
+          ${especieFormFields(row, true)}
+          <button type="submit" class="btn primary full">Guardar cambios</button>
+        </form>
+        <button class="btn danger full" style="margin-top:12px"
+                data-onclick="deleteEspecie" data-arg="${escapeHtml(id)}">🗑 Borrar</button>
+      </main>
+    `;
+  });
+
+  // ====================================================================
+  // Maestros: monedas
+  // ====================================================================
+  route("/monedas", async () => {
+    const data = await API.listSheet("monedas");
+    const items = (data.items || []).filter(r => r.Code);
+    return `
+      ${headerWithBack("💱 Monedas", "/settings")}
+      <main>
+        <div class="card compact muted" style="font-size: 13px;">
+          Monedas y stablecoins del sistema. También editable desde Excel.
+        </div>
+        <a href="#/monedas/new" class="btn primary full" style="margin: 12px 0;">+ Nueva moneda</a>
+        <div class="list">${items.map(r => `
+          <a class="list-item" href="#/monedas/${encodeURIComponent(r.Code)}/edit">
+            <div class="meta">
+              <div class="meta-line1">${escapeHtml(r.Code)} ${r["Is Base"] ? '<span class="tag">base</span>' : ""} ${r["Is Stable"] ? '<span class="tag">stable</span>' : ""}</div>
+              <div class="meta-line2">${escapeHtml(r.Name || "")} ${r["Quote vs"] ? `· quote vs ${escapeHtml(r["Quote vs"])}` : ""}</div>
+            </div>
+          </a>
+        `).join("")}</div>
+      </main>
+    `;
+  });
+
+  route("/monedas/new", async () => {
+    return `
+      ${headerWithBack("Nueva moneda", "/monedas")}
+      <main>
+        <form data-action="createMoneda">
+          ${monedaFormFields({}, false)}
+          <button type="submit" class="btn primary full">Guardar</button>
+        </form>
+      </main>
+    `;
+  });
+
+  route("/monedas/:id/edit", async ({ id }) => {
+    const row = await API.getSheetRow("monedas", id);
+    return `
+      ${headerWithBack("Editar moneda", "/monedas")}
+      <main>
+        <form data-action="updateMoneda" data-row-id="${escapeHtml(id)}">
+          ${monedaFormFields(row, true)}
+          <button type="submit" class="btn primary full">Guardar cambios</button>
+        </form>
+        <button class="btn danger full" style="margin-top:12px"
+                data-onclick="deleteMoneda" data-arg="${escapeHtml(id)}">🗑 Borrar</button>
+      </main>
+    `;
+  });
+
+  // ====================================================================
+  // Maestros: cuentas
+  // ====================================================================
+  route("/cuentas", async () => {
+    const data = await API.listSheet("cuentas");
+    const items = (data.items || []).filter(r => r.Code);
+    return `
+      ${headerWithBack("🏦 Cuentas", "/settings")}
+      <main>
+        <div class="card compact muted" style="font-size: 13px;">
+          Brokers, bancos, wallets, tarjetas. Marcá <b>Investible=NO</b>
+          para excluir del PN invertible (ej cash de reserva).
+        </div>
+        <a href="#/cuentas/new" class="btn primary full" style="margin: 12px 0;">+ Nueva cuenta</a>
+        <div class="list">${items.map(r => `
+          <a class="list-item" href="#/cuentas/${encodeURIComponent(r.Code)}/edit">
+            <div class="meta">
+              <div class="meta-line1">${escapeHtml(r.Code)}
+                ${r.Investible === "NO" ? '<span class="tag warn">no-inv</span>' : ""}
+              </div>
+              <div class="meta-line2">${escapeHtml(r.Name || "")} · <span class="muted">${escapeHtml(r.Kind || "")}</span></div>
+            </div>
+            <div class="right">
+              ${r.Currency ? `<div class="sub"><span class="tag">${escapeHtml(r.Currency)}</span></div>` : ""}
+            </div>
+          </a>
+        `).join("")}</div>
+      </main>
+    `;
+  });
+
+  route("/cuentas/new", async () => {
+    const meta = await loadMeta();
+    return `
+      ${headerWithBack("Nueva cuenta", "/cuentas")}
+      <main>
+        <form data-action="createCuenta">
+          ${cuentaFormFields({}, meta, false)}
+          <button type="submit" class="btn primary full">Guardar</button>
+        </form>
+      </main>
+    `;
+  });
+
+  route("/cuentas/:id/edit", async ({ id }) => {
+    const meta = await loadMeta();
+    const row = await API.getSheetRow("cuentas", id);
+    return `
+      ${headerWithBack("Editar cuenta", "/cuentas")}
+      <main>
+        <form data-action="updateCuenta" data-row-id="${escapeHtml(id)}">
+          ${cuentaFormFields(row, meta, true)}
+          <button type="submit" class="btn primary full">Guardar cambios</button>
+        </form>
+        <button class="btn danger full" style="margin-top:12px"
+                data-onclick="deleteCuenta" data-arg="${escapeHtml(id)}">🗑 Borrar</button>
+      </main>
+    `;
+  });
+
+  // ====================================================================
+  // Cotizaciones (precios + FX)
+  // ====================================================================
+  route("/cotizaciones", async () => {
+    const [pr, fx] = await Promise.all([API.prices(), API.fxRates()]);
+    const prices = pr.items || [];
+    const fxRates = fx.items || [];
+    // Agrupar precios por asset_class
+    const byClass = {};
+    prices.forEach(p => {
+      const cls = p.asset_class || "?";
+      if (!byClass[cls]) byClass[cls] = [];
+      byClass[cls].push(p);
+    });
+    return `
+      ${headerWithBack("💹 Cotizaciones", "/")}
+      <main>
+        <section>
+          <h2>FX rates (${fxRates.length})</h2>
+          <div class="card">
+            ${fxRates.length === 0 ? '<div class="muted">Sin FX cargado. Subí fx_historico.csv vía sync.py.</div>' :
+              `<table style="width:100%; font-size: 14px;">
+                <thead>
+                  <tr style="border-bottom: 1px solid var(--border);">
+                    <th style="text-align:left; padding: 4px;">Moneda</th>
+                    <th style="text-align:right; padding: 4px;">Rate</th>
+                    <th style="text-align:left; padding: 4px;">Base</th>
+                    <th style="text-align:left; padding: 4px; font-size:11px;">Fecha</th>
+                  </tr>
+                </thead>
+                <tbody>${fxRates.map(r => `
+                  <tr style="border-bottom: 1px solid var(--border);">
+                    <td style="padding: 4px;"><b>${escapeHtml(r.moneda)}</b></td>
+                    <td style="padding: 4px; text-align:right;" class="tabular">${fmt.money(r.rate, 4)}</td>
+                    <td style="padding: 4px;">${escapeHtml(r.base)}</td>
+                    <td style="padding: 4px; font-size:11px;" class="muted">${escapeHtml(r.fecha)}</td>
+                  </tr>
+                `).join("")}</tbody>
+              </table>`
+            }
+          </div>
+        </section>
+
+        <section>
+          <h2>Precios por activo (${prices.length})</h2>
+          ${prices.length === 0 ? '<div class="card muted">Sin precios cargados. Corré loaders y subí los CSVs (ver Settings → Ayuda).</div>' :
+            Object.keys(byClass).sort().map(cls => `
+              <div class="card" style="margin-bottom: 8px;">
+                <div style="font-weight: 600; color: var(--navy); margin-bottom: 6px;">${escapeHtml(cls)} (${byClass[cls].length})</div>
+                <table style="width:100%; font-size: 13px;">
+                  <tbody>${byClass[cls].map(p => `
+                    <tr style="border-bottom: 1px solid var(--border);">
+                      <td style="padding: 4px;"><b>${escapeHtml(p.ticker)}</b><br><span class="muted" style="font-size:11px;">${escapeHtml(p.name || "")}</span></td>
+                      <td style="padding: 4px; text-align:right;" class="tabular">${fmt.money(p.price, 4)} <span class="muted" style="font-size:11px;">${escapeHtml(p.currency)}</span></td>
+                      <td style="padding: 4px; text-align:right; font-size:11px;" class="muted">${escapeHtml(p.fecha)}<br>${escapeHtml(p.source)}</td>
+                    </tr>
+                  `).join("")}</tbody>
+                </table>
+              </div>
+            `).join("")
+          }
+        </section>
+      </main>
+    `;
+  });
+
+  // ====================================================================
+  // Cash por cuenta
+  // ====================================================================
+  route("/cash", async () => {
+    const data = await API.cash();
+    const items = data.items || [];
+    const byCcy = data.by_currency || {};
+    return `
+      ${headerWithBack("💵 Cash por cuenta", "/")}
+      <main>
+        <div class="kpi primary">
+          <div class="kpi-label">Cash total</div>
+          <div class="kpi-value">${fmt.money(data.total_anchor)}</div>
+          <div class="kpi-currency">${escapeHtml(data.anchor)}</div>
+        </div>
+
+        <section>
+          <h2>Por moneda</h2>
+          <div class="card">
+            ${Object.keys(byCcy).length === 0 ? '<div class="muted">Sin cash</div>' :
+              Object.entries(byCcy).sort((a, b) => b[1].mv_anchor - a[1].mv_anchor).map(([ccy, sub]) => `
+                <div style="display:flex; justify-content: space-between; padding: 6px 0; border-bottom: 1px solid var(--border);">
+                  <div>
+                    <b>${escapeHtml(ccy)}</b>
+                    <span class="muted" style="font-size: 12px;">(${sub.n} cuentas)</span>
+                  </div>
+                  <div class="right">
+                    <div class="tabular">${fmt.money(sub.qty, 2)} ${escapeHtml(ccy)}</div>
+                    <div class="muted tabular" style="font-size: 12px;">${fmt.money(sub.mv_anchor)} ${escapeHtml(data.anchor)}</div>
+                  </div>
+                </div>
+              `).join("")
+            }
+          </div>
+        </section>
+
+        <section>
+          <h2>Por cuenta (${items.length})</h2>
+          ${items.length === 0 ? '<div class="card muted">Sin cash en ninguna cuenta</div>' :
+            `<div class="list">${items.map(h => `
+              <div class="list-item">
+                <div class="meta">
+                  <div class="meta-line1">
+                    ${escapeHtml(h.account)}
+                    ${!h.investible ? '<span class="tag warn">no-inv</span>' : ""}
+                  </div>
+                  <div class="meta-line2">
+                    ${escapeHtml(h.account_kind)} · ${escapeHtml(h.cash_purpose || "—")}
+                  </div>
+                </div>
+                <div class="right">
+                  <div class="amount tabular">${fmt.money(h.qty, 2)} ${escapeHtml(h.currency)}</div>
+                  <div class="sub muted">${fmt.money(h.mv_anchor)} ${escapeHtml(data.anchor)}</div>
+                </div>
+              </div>
+            `).join("")}</div>`
+          }
+        </section>
+      </main>
+    `;
+  });
+
+  // ====================================================================
+  // /report — reporte HTML inline
+  // ====================================================================
+  route("/report", async () => {
+    const html = await API.reportHtml();
+    // Escape para srcdoc
+    const escaped = html.replace(/&/g, "&amp;").replace(/"/g, "&quot;");
+    return `
+      <div class="topbar">
+        <button onclick="window.history.back()">‹ Atrás</button>
+        <h1>📄 Reporte</h1>
+        <button onclick="openReportInBrowser()" title="Abrir externo">↗</button>
+      </div>
+      <iframe srcdoc="${escaped}"
+              style="width:100%; height: calc(100vh - 60px - var(--safe-top)); border: none; display: block;"
+              sandbox="allow-scripts allow-same-origin allow-popups"></iframe>
+    `;
+  });
+
+  // Helper: abrir el reporte en el browser externo (Safari/Chrome) saliendo del PWA standalone
+  window.openReportInBrowser = async function () {
+    try {
+      const html = await API.reportHtml();
+      const blob = new Blob([html], { type: "text/html" });
+      const url = URL.createObjectURL(blob);
+      // En iOS standalone, esto abre en Safari (sale de la PWA pero permite imprimir/compartir)
+      window.open(url, "_blank") || (window.location.href = url);
+    } catch (e) {
+      toast(e.message, "error");
+    }
+  };
+
+  // ====================================================================
+  // /help — manualcitos
+  // ====================================================================
+  route("/help", async () => {
+    return `
+      ${headerWithBack("❓ Ayuda", "/settings")}
+      <main>
+        <section>
+          <h2>📥 ¿Dónde se descarga el "Reporte completo" en iOS PWA?</h2>
+          <div class="card">
+            <p style="margin-bottom: 8px;">Cuando la app está instalada en el iPhone, los archivos
+            descargados van a la app <b>"Archivos"</b> (Files), carpeta <b>"En mi iPhone" → "WM"</b>
+            o "Descargas".</p>
+            <p style="margin-bottom: 8px;">Para evitar el problema, ahora <b>Ver reporte completo</b>
+            abre el reporte <b>inline</b> dentro de la app (no descarga). Si querés
+            compartirlo o imprimirlo, tocá la flecha ↗ arriba a la derecha — abre
+            en Safari y desde ahí podés "Compartir" o "Guardar PDF".</p>
+          </div>
+        </section>
+
+        <section>
+          <h2>🔄 Sincronización entre PC ↔ Cloud</h2>
+          <div class="card">
+            <p><b>Source of truth</b>: el Excel master vive en el server.</p>
+            <p style="margin-top: 8px;"><b>Si cargás algo desde la PWA</b>: se actualiza automáticamente en el server.
+            Tu Excel local queda <i>desactualizado</i> hasta que lo bajes.</p>
+            <p style="margin-top: 8px;"><b>Si editás el Excel local</b>: tenés que subirlo al server.</p>
+
+            <h3 style="margin-top: 14px;">Comandos en tu PC (PowerShell)</h3>
+            <p style="margin-top: 4px;">Asegurate de tener este token en <code>secrets.txt</code>:</p>
+            <pre style="background: #f5f5f5; padding: 8px; border-radius: 4px; font-size: 11px; overflow-x: auto;">WM_API_TOKEN=tu_token_aqui</pre>
+
+            <p style="margin-top: 12px;">Después corré:</p>
+            <pre style="background: #f5f5f5; padding: 8px; border-radius: 4px; font-size: 12px; overflow-x: auto;"># Ciclo completo (loaders + uploads + refresh)
+python sync.py
+
+# Solo subir el Excel local (si lo editaste)
+python sync.py --only-excel
+
+# Solo subir CSVs (si solo refrescaste precios)
+python sync.py --only-prices
+
+# Sin correr loaders (usar CSVs ya generados)
+python sync.py --skip-loaders
+
+# Bajar el reporte HTML al final
+python sync.py --download</pre>
+          </div>
+        </section>
+
+        <section>
+          <h2>📈 Cómo correr loaders y subir cotizaciones</h2>
+          <div class="card">
+            <p>Los loaders corren <b>en tu PC</b> (no en PA por la whitelist).
+            Generan CSVs en <code>data/</code>, después se suben al server.</p>
+
+            <h3 style="margin-top: 14px;">Loaders disponibles</h3>
+            <pre style="background: #f5f5f5; padding: 8px; border-radius: 4px; font-size: 11px; overflow-x: auto;"># FX rates (MEP, CCL, mayorista)
+python fx_loader.py
+
+# BYMA: bonos, acciones, CEDEAR
+python byma_loader.py --tickers-file mis_tickers.txt
+
+# CAFCI: FCIs argentinos
+python cafci_loader.py
+
+# Cripto (CoinGecko)
+python cripto_loader.py
+
+# US (yfinance — ADRs)
+python yfinance_loader.py</pre>
+
+            <h3 style="margin-top: 14px;">Subir CSVs al server</h3>
+            <p>El comando más fácil:</p>
+            <pre style="background: #f5f5f5; padding: 8px; border-radius: 4px; font-size: 12px; overflow-x: auto;">python sync.py --skip-loaders --skip-excel</pre>
+            <p style="margin-top: 8px;">O todo de una sin pensar:</p>
+            <pre style="background: #f5f5f5; padding: 8px; border-radius: 4px; font-size: 12px; overflow-x: auto;">python sync.py</pre>
+
+            <p style="margin-top: 8px;" class="muted">Después de subir, el server re-importa la DB y los precios
+            quedan actualizados al instante en el reporte.</p>
+          </div>
+        </section>
+
+        <section>
+          <h2>🔄 ¿Cuándo refrescar la DB manualmente?</h2>
+          <div class="card">
+            <p>Generalmente <b>no hace falta</b> — cada vez que la PWA hace
+            POST/PUT/DELETE, el server re-importa solo. Pero si subiste algo
+            por SFTP o tocaste el Excel directamente en el server, andá a
+            Settings y tocá <b>"⟳ Refrescar DB"</b>.</p>
+          </div>
+        </section>
+
+        <section>
+          <h2>📦 Editar maestros (especies / monedas / cuentas)</h2>
+          <div class="card">
+            <p>Desde Settings tenés acceso a <b>Especies</b>, <b>Monedas</b> y
+            <b>Cuentas</b>. Cualquier cambio se appendea al Excel master del server
+            y se re-importa al toque. <b>Excel local</b> sigue funcionando: si
+            preferís cargar grandes batches, hacelo en Excel y subilo con
+            <code>python sync.py --only-excel</code>.</p>
+            <p style="margin-top: 8px;"><b>Borrar especies/monedas/cuentas</b>: hard-delete
+            (remueve la fila físicamente). Solo borrá si NO tienen movements asociados,
+            sino vas a romper cargas viejas.</p>
+          </div>
+        </section>
+
+        <section>
+          <h2>🔐 Privacidad de tu token</h2>
+          <div class="card">
+            <p>Tu API token vive solo en el localStorage de este device. No lo
+            mandés por chat ni lo subas al repo. Si lo perdés, regeneralo desde
+            tu PC con:</p>
+            <pre style="background: #f5f5f5; padding: 8px; border-radius: 4px; font-size: 12px; overflow-x: auto;">python -c "import secrets; print(secrets.token_hex(32))"</pre>
+            <p style="margin-top: 8px;">Y actualizá el WSGI file en PythonAnywhere.</p>
+          </div>
+        </section>
+
+        <section>
+          <h2>📅 ¿Por qué se "desactiva" cada 30 días?</h2>
+          <div class="card">
+            <p>PythonAnywhere free tier desactiva el sitio si no entrás
+            al menos 1 vez por mes. Te llega email 7 días antes. Para
+            extender: PA → Web → click "Run until 1 month from today".</p>
+            <p style="margin-top: 8px;" class="muted">Los datos NO se borran si se
+            desactiva — solo se apaga. Re-activás haciendo login + reload.</p>
+          </div>
+        </section>
+      </main>
+    `;
+  });
+
   // /settings
   route("/settings", async () => {
     let health = null;
@@ -831,11 +1374,26 @@
         </section>
 
         <section>
+          <h2>Maestros</h2>
+          <a href="#/especies" class="btn ghost full" style="margin-bottom:6px">📦 Especies</a>
+          <a href="#/monedas" class="btn ghost full" style="margin-bottom:6px">💱 Monedas</a>
+          <a href="#/cuentas" class="btn ghost full" style="margin-bottom:6px">🏦 Cuentas</a>
+        </section>
+
+        <section>
+          <h2>Cotizaciones y cash</h2>
+          <a href="#/cotizaciones" class="btn ghost full" style="margin-bottom:6px">💹 Cotizaciones (precios + FX)</a>
+          <a href="#/cash" class="btn ghost full" style="margin-bottom:6px">💵 Cash por cuenta</a>
+          <a href="#/pasivos" class="btn ghost full" style="margin-bottom:6px">📉 Pasivos</a>
+        </section>
+
+        <section>
           <h2>Acciones</h2>
           <button class="btn primary full" data-onclick="refreshAll" style="margin-bottom:8px">⟳ Refrescar DB desde Excel</button>
           <a class="btn ghost full" href="${API.base}/api/download/excel"
              style="margin-bottom:8px"
              onclick="event.preventDefault(); downloadExcel();">⬇ Descargar Excel</a>
+          <a class="btn ghost full" href="#/help" style="margin-bottom:8px">❓ Ayuda y manualcitos</a>
           <button class="btn danger full" data-onclick="logout">🔓 Cerrar sesión</button>
         </section>
 
@@ -920,12 +1478,14 @@
   function inputField(label, name, value, type = "text", opts = {}) {
     const required = opts.required ? "required" : "";
     const step = type === "number" ? `step="any"` : "";
+    const readonly = opts.readonly ? "readonly style='background:#F0F0F0;'" : "";
     return `
       <div class="field">
-        <label>${escapeHtml(label)}${opts.required ? " *" : ""}</label>
+        <label>${escapeHtml(label)}${opts.required ? " *" : ""}${opts.readonly ? " (no editable)" : ""}</label>
         <input type="${type}" name="${escapeHtml(name)}"
                value="${value !== null && value !== undefined ? escapeHtml(value) : ""}"
-               ${step} ${required} placeholder="${escapeHtml(opts.placeholder || "")}">
+               ${step} ${required} ${readonly}
+               placeholder="${escapeHtml(opts.placeholder || "")}">
       </div>
     `;
   }
@@ -1001,6 +1561,86 @@
         ${selectField("Moneda", "Moneda", row.Moneda, meta.currencies, { required: true })}
       </div>
       ${inputField("Description", "Description", row.Description)}
+    `;
+  }
+
+  // -------- Form helpers para maestros --------
+  const ASSET_CLASSES = ["CASH", "BOND_AR", "EQUITY_AR", "EQUITY_US", "FCI",
+                          "CRYPTO", "STABLECOIN", "DERIVATIVE", "OTHER"];
+  const ACCOUNT_KINDS = ["CASH_BANK", "CASH_BROKER", "CASH_WALLET", "CASH_PHYSICAL",
+                          "CARD_CREDIT", "LIABILITY", "EXTERNAL", "OPENING_BALANCE",
+                          "INTEREST_EXPENSE", "INTEREST_INCOME"];
+
+  function especieFormFields(row, isEdit) {
+    return `
+      ${inputField("Ticker (key)", "Ticker", row.Ticker, "text",
+                    { required: true, placeholder: "ej AL30D", readonly: isEdit })}
+      ${inputField("Name", "Name", row.Name, "text", { required: true })}
+      ${selectField("Asset Class", "Asset Class", row["Asset Class"], ASSET_CLASSES, { required: true })}
+      ${inputField("Currency", "Currency", row.Currency, "text",
+                    { required: true, placeholder: "USB / USD / ARS / ..." })}
+      ${inputField("Issuer", "Issuer", row.Issuer)}
+      ${inputField("Sector", "Sector", row.Sector)}
+      ${inputField("Country", "Country", row.Country)}
+      ${inputField("Notes", "Notes", row.Notes)}
+    `;
+  }
+
+  function monedaFormFields(row, isEdit) {
+    const isStable = row["Is Stable"] === 1 || row["Is Stable"] === "1" || row["Is Stable"] === true;
+    const isBase = row["Is Base"] === 1 || row["Is Base"] === "1" || row["Is Base"] === true;
+    return `
+      ${inputField("Code (key)", "Code", row.Code, "text",
+                    { required: true, placeholder: "ej USDC", readonly: isEdit })}
+      ${inputField("Name", "Name", row.Name, "text", { required: true })}
+      ${inputField("Quote vs", "Quote vs", row["Quote vs"], "text",
+                    { placeholder: "ARS / USD / null si es base" })}
+      <div class="field">
+        <label>Is Stable (1=stablecoin)</label>
+        <select name="Is Stable">
+          <option value="0" ${!isStable ? "selected" : ""}>0 (no)</option>
+          <option value="1" ${isStable ? "selected" : ""}>1 (sí)</option>
+        </select>
+      </div>
+      <div class="field">
+        <label>Is Base (1=moneda base de reporte)</label>
+        <select name="Is Base">
+          <option value="0" ${!isBase ? "selected" : ""}>0 (no)</option>
+          <option value="1" ${isBase ? "selected" : ""}>1 (sí)</option>
+        </select>
+      </div>
+      ${inputField("Notas", "Notas", row.Notas)}
+    `;
+  }
+
+  function cuentaFormFields(row, meta, isEdit) {
+    const isInv = (row.Investible === "YES" || row.Investible === 1 || row.Investible === undefined);
+    return `
+      ${inputField("Code (key)", "Code", row.Code, "text",
+                    { required: true, placeholder: "ej cocos / galicia", readonly: isEdit })}
+      ${inputField("Name", "Name", row.Name, "text", { required: true })}
+      ${selectField("Kind", "Kind", row.Kind, ACCOUNT_KINDS, { required: true })}
+      ${inputField("Institution", "Institution", row.Institution)}
+      ${inputField("Currency", "Currency", row.Currency || "ARS", "text",
+                    { placeholder: "ARS / USD / USB / ..." })}
+      <div class="field">
+        <label>Investible</label>
+        <select name="Investible">
+          <option value="YES" ${isInv ? "selected" : ""}>YES (cuenta el PN invertible)</option>
+          <option value="NO" ${!isInv ? "selected" : ""}>NO (excluir del PN invertible)</option>
+        </select>
+      </div>
+      ${inputField("Cash Purpose", "Cash Purpose", row["Cash Purpose"], "text",
+                    { placeholder: "OPERATIVO / RESERVA_NO_DECLARADO / ..." })}
+      <hr style="margin: 8px 0; border: none; border-top: 1px solid var(--border);">
+      <div style="font-size: 11px; color: var(--muted); margin-bottom: 4px;">
+        Solo si es CARD_CREDIT (tarjeta):
+      </div>
+      ${selectField("Card Cycle", "Card Cycle", row["Card Cycle"] || "NONE", ["NONE", "MONTHLY"])}
+      ${inputField("Close Day", "Close Day", row["Close Day"], "number", { placeholder: "1-31" })}
+      ${inputField("Due Day", "Due Day", row["Due Day"], "number", { placeholder: "1-31" })}
+      ${inputField("Card Currency", "Card Currency", row["Card Currency"], "text", { placeholder: "ARS / USD" })}
+      ${inputField("Notes", "Notes", row.Notes)}
     `;
   }
 

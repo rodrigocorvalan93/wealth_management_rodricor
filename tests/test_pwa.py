@@ -212,6 +212,208 @@ def test_9_returns_empty_curve():
 # Equity curve endpoint con métricas
 # =============================================================================
 
+def test_master_especies_crud():
+    """CRUD de especies vía /api/sheets/especies con Ticker como natural key."""
+    print("\n[MASTER 1] CRUD de especies:")
+    with tempfile.TemporaryDirectory() as tmp:
+        client = _client(Path(tmp))
+
+        # LIST: ya hay ejemplos del build_master
+        r = client.get("/api/sheets/especies", headers=_auth())
+        assert r.status_code == 200
+        body = r.get_json()
+        n_initial = body["n"]
+        # Cada item debe tener row_id (natural key = Ticker)
+        for item in body["items"]:
+            assert "row_id" in item
+            assert item["row_id"] == item["Ticker"]
+        print(f"  ✓ LIST: {n_initial} especies, todas con row_id=Ticker")
+
+        # CREATE
+        r = client.post("/api/sheets/especies", headers=_auth(), json={
+            "Ticker": "TEST_API",
+            "Name": "Test ticker creado vía API",
+            "Asset Class": "EQUITY_AR",
+            "Currency": "ARS",
+        })
+        assert r.status_code == 201, r.data
+        assert r.get_json()["row_id"] == "TEST_API"
+        print(f"  ✓ POST: TEST_API creado")
+
+        # GET specific
+        r = client.get("/api/sheets/especies/TEST_API", headers=_auth())
+        assert r.status_code == 200
+        body = r.get_json()
+        assert body["Ticker"] == "TEST_API"
+        assert body["Asset Class"] == "EQUITY_AR"
+        print(f"  ✓ GET: encontrado")
+
+        # CREATE duplicado → 400
+        r = client.post("/api/sheets/especies", headers=_auth(), json={
+            "Ticker": "TEST_API",
+            "Name": "duplicado",
+            "Asset Class": "EQUITY_AR",
+            "Currency": "ARS",
+        })
+        assert r.status_code == 400, f"esperaba 400, got {r.status_code}"
+        print(f"  ✓ POST duplicado → 400")
+
+        # UPDATE
+        r = client.put("/api/sheets/especies/TEST_API", headers=_auth(), json={
+            "Name": "Test ticker EDITADO",
+        })
+        assert r.status_code == 200, r.data
+        body = r.get_json()
+        assert body["row"]["Name"] == "Test ticker EDITADO"
+        # Ticker (natural key) no cambia aunque venga en body
+        assert body["row"]["Ticker"] == "TEST_API"
+        print(f"  ✓ PUT: name actualizado")
+
+        # DELETE (hard delete)
+        r = client.delete("/api/sheets/especies/TEST_API", headers=_auth())
+        assert r.status_code == 200
+        print(f"  ✓ DELETE: borrada")
+
+        # LIST: vuelta a n_initial
+        r = client.get("/api/sheets/especies", headers=_auth())
+        assert r.get_json()["n"] == n_initial
+        print(f"  ✓ LIST después: {r.get_json()['n']} especies (back to {n_initial})")
+
+
+def test_master_cuentas_crud():
+    """CRUD de cuentas con Code como natural key + flag Investible."""
+    print("\n[MASTER 2] CRUD de cuentas:")
+    with tempfile.TemporaryDirectory() as tmp:
+        client = _client(Path(tmp))
+        # CREATE
+        r = client.post("/api/sheets/cuentas", headers=_auth(), json={
+            "Code": "test_account",
+            "Name": "Cuenta de prueba",
+            "Kind": "CASH_BANK",
+            "Currency": "USD",
+            "Investible": "NO",
+            "Cash Purpose": "RESERVA_NO_DECLARADO",
+        })
+        assert r.status_code == 201, r.data
+        body = r.get_json()
+        assert body["row_id"] == "test_account"
+        # El re-import debe haber leído la nueva cuenta (Investible=0)
+        import sqlite3
+        from api.state import db_conn
+        conn = db_conn()
+        cur = conn.execute("SELECT investible, cash_purpose FROM accounts WHERE code='test_account'")
+        row = cur.fetchone()
+        assert row is not None
+        assert row["investible"] == 0
+        assert row["cash_purpose"] == "RESERVA_NO_DECLARADO"
+        conn.close()
+        print(f"  ✓ Cuenta agregada y reimport OK con investible=0")
+
+        # DELETE
+        r = client.delete("/api/sheets/cuentas/test_account", headers=_auth())
+        assert r.status_code == 200
+        # Verificar que ya no existe
+        conn = db_conn()
+        cur = conn.execute("SELECT * FROM accounts WHERE code='test_account'")
+        assert cur.fetchone() is None
+        conn.close()
+        print(f"  ✓ DELETE OK, ya no existe en DB")
+
+
+def test_master_monedas_crud():
+    """CRUD de monedas con Code como key."""
+    print("\n[MASTER 3] CRUD de monedas:")
+    with tempfile.TemporaryDirectory() as tmp:
+        client = _client(Path(tmp))
+        r = client.post("/api/sheets/monedas", headers=_auth(), json={
+            "Code": "TEST_CCY",
+            "Name": "Moneda de prueba",
+            "Quote vs": "USD",
+            "Is Stable": 1,
+            "Is Base": 0,
+        })
+        assert r.status_code == 201
+        # GET
+        r = client.get("/api/sheets/monedas/TEST_CCY", headers=_auth())
+        body = r.get_json()
+        assert body["Code"] == "TEST_CCY"
+        # DELETE
+        r = client.delete("/api/sheets/monedas/TEST_CCY", headers=_auth())
+        assert r.status_code == 200
+        print(f"  ✓ CRUD monedas OK")
+
+
+def test_prices_endpoint():
+    """/api/prices devuelve la última cotización por ticker."""
+    print("\n[QUOTES 1] /api/prices:")
+    with tempfile.TemporaryDirectory() as tmp:
+        client = _client(Path(tmp))
+        # Sin precios cargados (no corrieron loaders en test) → devuelve lista vacía
+        r = client.get("/api/prices", headers=_auth())
+        assert r.status_code == 200
+        body = r.get_json()
+        assert "items" in body
+        print(f"  ✓ /api/prices: {body['n']} tickers")
+
+        # Insertar precios manualmente y verificar
+        from api.state import db_conn
+        conn = db_conn()
+        conn.execute("INSERT INTO prices (fecha, ticker, price, currency, source) VALUES (?, ?, ?, ?, ?)",
+                     ("2026-05-01", "TEST_T", 100.0, "USD", "manual"))
+        conn.execute("INSERT INTO prices (fecha, ticker, price, currency, source) VALUES (?, ?, ?, ?, ?)",
+                     ("2026-05-02", "TEST_T", 105.0, "USD", "manual"))  # más reciente
+        conn.commit()
+        conn.close()
+
+        r = client.get("/api/prices?ticker=TEST_T", headers=_auth())
+        body = r.get_json()
+        assert body["n"] == 1
+        assert body["items"][0]["price"] == 105.0
+        assert body["items"][0]["fecha"] == "2026-05-02"
+        print(f"  ✓ Latest price: 105.0 (no 100.0)")
+
+
+def test_fx_rates_endpoint():
+    """/api/fx-rates devuelve la última FX por (moneda, base)."""
+    print("\n[QUOTES 2] /api/fx-rates:")
+    with tempfile.TemporaryDirectory() as tmp:
+        client = _client(Path(tmp))
+        from api.state import db_conn
+        conn = db_conn()
+        conn.execute("INSERT INTO fx_rates (fecha, moneda, rate, base, source) VALUES (?, ?, ?, ?, ?)",
+                     ("2026-05-01", "USD", 1380.0, "ARS", "test"))
+        conn.execute("INSERT INTO fx_rates (fecha, moneda, rate, base, source) VALUES (?, ?, ?, ?, ?)",
+                     ("2026-05-02", "USD", 1400.0, "ARS", "test"))
+        conn.commit()
+        conn.close()
+
+        r = client.get("/api/fx-rates", headers=_auth())
+        body = r.get_json()
+        usd_rates = [x for x in body["items"] if x["moneda"] == "USD"]
+        assert len(usd_rates) == 1
+        assert usd_rates[0]["rate"] == 1400.0
+        assert usd_rates[0]["fecha"] == "2026-05-02"
+        print(f"  ✓ Latest FX USD/ARS: 1400 (no 1380)")
+
+
+def test_cash_endpoint():
+    """/api/cash devuelve saldos cash por cuenta + subtotales por moneda."""
+    print("\n[CASH] /api/cash:")
+    with tempfile.TemporaryDirectory() as tmp:
+        client = _client(Path(tmp))
+        r = client.get("/api/cash?anchor=ARS", headers=_auth())
+        assert r.status_code == 200
+        body = r.get_json()
+        assert "items" in body
+        assert "by_currency" in body
+        assert "total_anchor" in body
+        # cocos debe estar (tiene cash ARS por las trades)
+        cocos = [c for c in body["items"] if c["account"] == "cocos"]
+        assert cocos
+        print(f"  ✓ {body['n']} cuentas con cash, total: {body['total_anchor']:,.0f} ARS")
+        print(f"  ✓ Por moneda: {list(body['by_currency'].keys())}")
+
+
 def test_10_equity_curve_endpoint_includes_metrics():
     print("\n[PWA 6] /api/equity-curve incluye Sharpe/Calmar/etc:"  )
     with tempfile.TemporaryDirectory() as tmp:
@@ -258,6 +460,12 @@ if __name__ == "__main__":
         test_8_returns_advanced_metrics,
         test_9_returns_empty_curve,
         test_10_equity_curve_endpoint_includes_metrics,
+        test_master_especies_crud,
+        test_master_cuentas_crud,
+        test_master_monedas_crud,
+        test_prices_endpoint,
+        test_fx_rates_endpoint,
+        test_cash_endpoint,
     ]
     failed = []
     for t in tests:
