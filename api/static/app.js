@@ -184,6 +184,10 @@
       "/gastos": "#/gastos/new",
       "/ingresos": "#/ingresos/new",
       "/transferencias": "#/transferencias/new",
+      "/funding": "#/funding/new",
+      "/especies": "#/especies/new",
+      "/monedas": "#/monedas/new",
+      "/cuentas": "#/cuentas/new",
     };
     let fabHref = null;
     for (const [k, v] of Object.entries(fabRoutes)) {
@@ -404,6 +408,48 @@
       render();
     },
 
+    async createFunding(data) {
+      ["Monto", "TNA", "Días"].forEach(k => {
+        if (data[k] !== null && data[k] !== undefined && data[k] !== "") {
+          data[k] = parseFloat(data[k]);
+        }
+      });
+      await API.createRow("funding", data);
+      invalidateMeta();
+      toast(`Funding ${data["Fund ID"] || ""} creado ✓`, "success");
+      navigate("/funding");
+    },
+    async updateFunding(data, form) {
+      ["Monto", "TNA", "Días"].forEach(k => {
+        if (data[k] !== null && data[k] !== undefined && data[k] !== "") {
+          data[k] = parseFloat(data[k]);
+        }
+      });
+      const id = form.dataset.rowId;
+      await API.updateRow("funding", id, data);
+      invalidateMeta();
+      toast("Funding actualizado ✓", "success");
+      navigate("/funding");
+    },
+    async closeFunding(rowId) {
+      const today = fmt.today();
+      if (!confirm(`¿Cerrar este funding hoy (${today})?\nSi querés otra fecha, usá editar.`)) return;
+      await API.updateRow("funding", rowId, {
+        "Status": "CLOSED",
+        "Fecha Fin": today,
+      });
+      invalidateMeta();
+      toast("Funding cerrado ✓", "success");
+      render();
+    },
+    async deleteFunding(id) {
+      if (!confirm(`¿Borrar funding ${id}? Borrar elimina también sus events.`)) return;
+      await API.deleteRow("funding", id);
+      invalidateMeta();
+      toast("Funding borrado", "success");
+      render();
+    },
+
     async refreshAll() {
       try {
         toast("Refrescando...", "info");
@@ -548,7 +594,11 @@
           </div>
           <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 8px;">
             <a href="#/cotizaciones" class="btn ghost full">💹 Cotizaciones</a>
+            <a href="#/funding" class="btn ghost full">💰 Funding</a>
+          </div>
+          <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 8px;">
             <a href="#/pasivos" class="btn ghost full">📉 Pasivos</a>
+            <a href="#/transferencias" class="btn ghost full">🔄 Transferencias</a>
           </div>
         </section>
       </main>
@@ -873,6 +923,121 @@
             `).join("")
           }
         </section>
+      </main>
+    `;
+  });
+
+  // ====================================================================
+  // /funding — cauciones, pases, préstamos
+  // ====================================================================
+  route("/funding", async () => {
+    const data = await API.listSheet("funding");
+    const items = (data.items || []).filter(r => r["Fund ID"] || r.Monto);
+    // Ordenar: OPEN primero, después por fecha inicio desc
+    items.sort((a, b) => {
+      const sa = a.Status === "OPEN" ? 0 : 1;
+      const sb = b.Status === "OPEN" ? 0 : 1;
+      if (sa !== sb) return sa - sb;
+      return (b["Fecha Inicio"] || "").localeCompare(a["Fecha Inicio"] || "");
+    });
+    const opens = items.filter(r => r.Status !== "CLOSED");
+    const closed = items.filter(r => r.Status === "CLOSED");
+    return `
+      ${headerWithBack("💰 Funding (cauciones)", "/")}
+      <main>
+        <div class="card compact muted" style="font-size: 13px;">
+          Cauciones tomadas (TOMA = pedís plata) y colocadas (COLOCA = prestás plata).
+          Las TOMA crean pasivo automáticamente; las COLOCA crean crédito por cobrar.
+        </div>
+
+        <section style="margin-top: 12px;">
+          <h2>Abiertas (${opens.length})</h2>
+          ${opens.length === 0 ? '<div class="card muted">Sin funding abierto</div>' :
+            `<div class="list">${opens.map(r => fundingItemCard(r)).join("")}</div>`
+          }
+        </section>
+
+        ${closed.length > 0 ? `
+          <section style="margin-top: 16px;">
+            <h2>Cerradas recientes (${closed.length})</h2>
+            <div class="list">${closed.slice(0, 10).map(r => fundingItemCard(r)).join("")}</div>
+          </section>
+        ` : ""}
+      </main>
+    `;
+  });
+
+  function fundingItemCard(r) {
+    const isOpen = r.Status !== "CLOSED";
+    const tipo = r.Tipo || "";
+    const subtipo = r.Subtipo || "";
+    const tipoColor = tipo === "TOMA" ? "negative" : "positive";
+    const interes = (Number(r.Monto) || 0) * (Number(r.TNA) || 0) * (Number(r.Días) || 0) / 365.0;
+    return `
+      <a class="list-item" href="#/funding/${encodeURIComponent(r.row_id || "")}/edit"
+         style="align-items: flex-start;">
+        <div class="meta">
+          <div class="meta-line1">
+            <span class="${tipoColor}">${escapeHtml(tipo)}</span>
+            ${escapeHtml(subtipo)}
+            ${isOpen ? '<span class="tag warn">OPEN</span>' : '<span class="tag">cerrada</span>'}
+          </div>
+          <div class="meta-line2">
+            ${escapeHtml(r["Fund ID"] || "(sin id)")} · ${escapeHtml(r.Cuenta || "")}
+            ${r["Linked Trade ID"] ? ' · 🔗 ' + escapeHtml(r["Linked Trade ID"]) : ""}
+          </div>
+          <div class="meta-line2 muted">
+            ${escapeHtml(fmt.date(r["Fecha Inicio"]))}
+            ${r["Fecha Fin"] ? " → " + escapeHtml(fmt.date(r["Fecha Fin"])) : ""}
+            ${r.Días ? " · " + r.Días + "d" : ""}
+            ${r.TNA ? " · TNA " + (Number(r.TNA) * 100).toFixed(2) + "%" : ""}
+          </div>
+        </div>
+        <div class="right">
+          <div class="amount tabular">${fmt.money(r.Monto, 0)}</div>
+          <div class="sub muted">${escapeHtml(r.Moneda || "")}</div>
+          ${interes > 0 ? `<div class="sub muted tabular">int ~${fmt.money(interes, 0)}</div>` : ""}
+          ${isOpen ? `
+            <button class="btn" style="margin-top: 4px; padding: 4px 10px; font-size: 11px; background: var(--green); color: white;"
+                    onclick="event.preventDefault(); event.stopPropagation(); _actions.closeFunding('${escapeHtml(r.row_id)}')">
+              Cerrar hoy
+            </button>
+          ` : ""}
+        </div>
+      </a>
+    `;
+  }
+
+  route("/funding/new", async () => {
+    const meta = await loadMeta();
+    return `
+      ${headerWithBack("Nueva caución/funding", "/funding")}
+      <main>
+        <form data-action="createFunding">
+          ${fundingFormFields({ Status: "OPEN", Tipo: "TOMA", Subtipo: "CAUCION" }, meta, false)}
+          <button type="submit" class="btn primary full">Guardar</button>
+        </form>
+        <div class="card compact muted" style="margin-top: 12px; font-size: 12px;">
+          💡 <b>Tip</b>: si esta caución cubre un trade del blotter, ponele
+          su Trade ID en "Linked Trade ID". El TNA podés ponerlo como decimal
+          (0.24) o porcentaje (24); el server normaliza.
+        </div>
+      </main>
+    `;
+  });
+
+  route("/funding/:id/edit", async ({ id }) => {
+    const meta = await loadMeta();
+    const row = await API.getSheetRow("funding", id);
+    return `
+      ${headerWithBack("Editar funding", "/funding")}
+      <main>
+        <form data-action="updateFunding" data-row-id="${escapeHtml(id)}">
+          ${fundingFormFields(row, meta, true)}
+          <button type="submit" class="btn primary full">Guardar cambios</button>
+        </form>
+        <button class="btn danger full" style="margin-top:12px"
+                data-onclick="deleteFunding" data-arg="${escapeHtml(id)}">🗑 Borrar funding</button>
       </main>
     `;
   });
@@ -1513,6 +1678,8 @@ python yfinance_loader.py</pre>
           <a href="#/cotizaciones" class="btn ghost full" style="margin-bottom:6px">💹 Cotizaciones (precios + FX)</a>
           <a href="#/cash" class="btn ghost full" style="margin-bottom:6px">💵 Cash por cuenta</a>
           <a href="#/pasivos" class="btn ghost full" style="margin-bottom:6px">📉 Pasivos</a>
+          <a href="#/funding" class="btn ghost full" style="margin-bottom:6px">💰 Funding (cauciones)</a>
+          <a href="#/transferencias" class="btn ghost full" style="margin-bottom:6px">🔄 Transferencias</a>
         </section>
 
         <section>
@@ -1677,6 +1844,49 @@ python yfinance_loader.py</pre>
       ${inputField("Notes", "Notes", row.Notes)}
     `;
   }
+  function fundingFormFields(row, meta, isEdit) {
+    const FUNDING_TIPOS = ["TOMA", "COLOCA"];
+    const FUNDING_SUBTIPOS = ["CAUCION", "PASE", "PRESTAMO_FRANCES",
+                                "PRESTAMO_BULLET", "PRESTAMO_AMERICANO"];
+    const FUNDING_STATUS = ["OPEN", "CLOSED"];
+    return `
+      ${inputField("Fund ID *", "Fund ID", row["Fund ID"], "text",
+                    { required: true, placeholder: "ej F0042" })}
+      <div class="field-row">
+        ${selectField("Tipo", "Tipo", row.Tipo, FUNDING_TIPOS,
+                       { required: true, allowEmpty: false })}
+        ${selectField("Subtipo", "Subtipo", row.Subtipo, FUNDING_SUBTIPOS,
+                       { required: true, allowEmpty: false })}
+      </div>
+      ${selectField("Cuenta", "Cuenta", row.Cuenta, meta.accounts,
+                     { required: true })}
+      <div class="field-row">
+        ${inputField("Fecha Inicio", "Fecha Inicio",
+                      fmt.date(row["Fecha Inicio"]) || fmt.today(), "date",
+                      { required: true })}
+        ${inputField("Fecha Fin", "Fecha Fin",
+                      fmt.date(row["Fecha Fin"]), "date")}
+      </div>
+      <div class="field-row">
+        ${inputField("Monto", "Monto", row.Monto, "number", { required: true })}
+        ${selectField("Moneda", "Moneda", row.Moneda, meta.currencies,
+                       { required: true })}
+      </div>
+      <div class="field-row">
+        ${inputField("TNA", "TNA", row.TNA, "number",
+                      { placeholder: "0.24 o 24" })}
+        ${inputField("Días", "Días", row.Días, "number",
+                      { placeholder: "auto si dejás vacío" })}
+      </div>
+      ${selectField("Status", "Status", row.Status || "OPEN", FUNDING_STATUS,
+                     { required: true, allowEmpty: false })}
+      ${inputField("Linked Trade ID", "Linked Trade ID", row["Linked Trade ID"],
+                    "text", { placeholder: "ej T0042 (opcional)" })}
+      ${inputField("Description", "Description", row.Description)}
+      ${inputField("Notes", "Notes", row.Notes)}
+    `;
+  }
+
   function transferFormFields(row, meta) {
     return `
       ${inputField("Fecha", "Fecha", fmt.date(row.Fecha) || fmt.today(), "date", { required: true })}
