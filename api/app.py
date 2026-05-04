@@ -773,7 +773,9 @@ def create_app() -> Flask:
                 "items": [
                     {
                         "account": h["account"],
+                        "account_name": h.get("account_name") or h["account"],
                         "account_kind": h.get("account_kind") or "",
+                        "account_institution": h.get("account_institution") or "",
                         "currency": h["native_currency"],
                         "qty": h["qty"],
                         "mv_anchor": h.get("mv_anchor"),

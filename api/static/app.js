@@ -163,6 +163,20 @@
     today: () => new Date().toISOString().slice(0, 10),
   };
 
+  // Label de cuenta (Display Name negrita arriba, code chiquito abajo)
+  // Si name === code, devuelve solo code (sin duplicar).
+  function accountLabel(code, accountsRich) {
+    const meta = accountsRich && accountsRich[code];
+    const name = meta ? meta.name : null;
+    if (!name || name === code) {
+      return `<div style="font-weight: 600;">${escapeHtml(code)}</div>`;
+    }
+    return `
+      <div style="font-weight: 600; line-height: 1.15;">${escapeHtml(name)}</div>
+      <div class="muted" style="font-size: 11px; line-height: 1.15;">${escapeHtml(code)}</div>
+    `;
+  }
+
   function escapeHtml(str) {
     if (str === null || str === undefined) return "";
     return String(str).replace(/[&<>"']/g, (c) => ({
@@ -185,17 +199,27 @@
         API.listSheet("especies"),
         API.listSheet("monedas"),
       ]);
-      const accounts = (cuentas.items || [])
+      const allowed = (cuentas.items || [])
         .filter(c => c.Code &&
                      !["EXTERNAL", "OPENING_BALANCE",
                        "INTEREST_EXPENSE", "INTEREST_INCOME"]
-                       .includes(c.Kind))
-        .map(c => c.Code).sort();
+                       .includes(c.Kind));
+      const accounts = allowed.map(c => c.Code).sort();
+      // accountsRich: {code → {name, kind, currency, institution}} para UI
+      const accountsRich = {};
+      for (const c of allowed) {
+        accountsRich[c.Code] = {
+          name: c.Nombre || c.Name || c.Code,
+          kind: c.Kind || "",
+          currency: c.Currency || c.Moneda || "",
+          institution: c.Institution || c.Institucion || "",
+        };
+      }
       const tickers = (especies.items || [])
         .filter(e => e.Ticker).map(e => e.Ticker).sort();
       const currencies = (monedas.items || [])
         .filter(m => m.Code).map(m => m.Code).sort();
-      _meta = { accounts, tickers, currencies };
+      _meta = { accounts, accountsRich, tickers, currencies };
       return _meta;
     } catch (e) {
       console.warn("loadMeta failed:", e);
@@ -619,12 +643,14 @@
   // /  Dashboard
   route("/", async () => {
     const view = API.view();  // 'all' | 'investible'
-    let s, fills, nearTarget;
+    let s, fills, nearTarget, meta, cashData;
     try {
-      [s, fills, nearTarget] = await Promise.all([
+      [s, fills, nearTarget, meta, cashData] = await Promise.all([
         API.summary(),
         API.realizedPnl(),
         API.holdingsNearTarget().catch(() => ({ alerts: [], n_alerts: 0, alert_distance_bps: 10 })),
+        loadMeta().catch(() => ({ accountsRich: {} })),
+        API.cash().catch(() => ({ items: [], by_currency: {}, total_anchor: 0 })),
       ]);
     } catch (e) {
       // Si la DB está vacía o falla el summary, ofrecer setup wizard
@@ -756,14 +782,48 @@
             ${acc.length === 0 ? '<div class="muted">Sin cuentas</div>' :
               acc.map(([k, v]) => {
                 const pct = (Math.abs(v) / totalAcc) * 100;
-                return `<div style="display:flex; justify-content:space-between; padding: 6px 0; border-bottom: 1px solid var(--border);">
-                  <span>${escapeHtml(k)}</span>
-                  <span class="tabular ${v < 0 ? 'negative' : ''}">${fmt.money(v)} <span class="muted">${pct.toFixed(1)}%</span></span>
+                const ar = meta?.accountsRich?.[k];
+                const ccy = ar?.currency || "";
+                return `<div style="display:flex; justify-content:space-between; align-items: center; padding: 8px 0; border-bottom: 1px solid var(--border); gap: 8px;">
+                  <div style="flex: 1; min-width: 0;">${accountLabel(k, meta?.accountsRich)}</div>
+                  ${ccy ? `<span class="tag" style="font-size:10px;">${escapeHtml(ccy)}</span>` : ""}
+                  <span class="tabular ${v < 0 ? 'negative' : ''}" style="white-space: nowrap;">${fmt.money(v)} <span class="muted" style="font-size: 11px;">${pct.toFixed(1)}%</span></span>
                 </div>`;
               }).join("")
             }
           </div>
         </section>
+
+        ${cashData && cashData.items && cashData.items.length > 0 ? `
+          <section>
+            <details>
+              <summary style="cursor: pointer; padding: 0; list-style: none;">
+                <h2 style="display: inline-flex; align-items: center; gap: 8px;">
+                  💵 Cash total
+                  <span class="tabular" style="font-weight: 600; color: var(--text);">${fmt.money(cashData.total_anchor || 0)} ${escapeHtml(API.anchor())}</span>
+                  <span class="muted" style="font-size: 12px; font-weight: normal;">(toca para ver cuentas)</span>
+                </h2>
+              </summary>
+              <div class="card" style="margin-top: 8px;">
+                ${(() => {
+                  const items = (cashData.items || []).slice().sort((a,b) => (b.mv_anchor||0) - (a.mv_anchor||0));
+                  return items.map(c => `
+                    <div style="display:flex; justify-content:space-between; align-items: center; padding: 8px 0; border-bottom: 1px solid var(--border); gap: 8px;">
+                      <div style="flex: 1; min-width: 0;">${accountLabel(c.account, meta?.accountsRich)}</div>
+                      ${c.account_kind ? `<span class="tag" style="font-size: 10px;">${escapeHtml(c.account_kind.toLowerCase())}</span>` : ""}
+                      <span class="tag" style="font-size: 10px;">${escapeHtml(c.currency)}</span>
+                      <div class="right" style="white-space: nowrap;">
+                        <div class="tabular" style="font-weight: 500;">${fmt.money(c.qty)}</div>
+                        <div class="muted" style="font-size: 11px;">${fmt.money(c.mv_anchor || 0, 2)} ${escapeHtml(API.anchor())}</div>
+                      </div>
+                    </div>
+                  `).join("");
+                })()}
+                <a href="#/cash" class="btn ghost full" style="margin-top: 8px;">Ver detalle completo →</a>
+              </div>
+            </details>
+          </section>
+        ` : ""}
 
         <section>
           <h2>PnL realizado reciente</h2>
@@ -841,11 +901,13 @@
   // /trades/new
   route("/trades/new", async () => {
     const meta = await loadMeta();
+    setTimeout(() => attachTradeCashPreview(meta), 50);
     return `
       ${headerWithBack("Nuevo trade", "/trades")}
       <main>
         <form data-action="createTrade">
           ${tradeFormFields({}, meta)}
+          <div id="trade-cash-preview" class="card compact" style="margin: 8px 0; font-size: 13px; display: none;"></div>
           <button type="submit" class="btn primary full">Guardar</button>
         </form>
       </main>
@@ -856,11 +918,13 @@
   route("/trades/:id/edit", async ({ id }) => {
     const meta = await loadMeta();
     const row = await API.getSheetRow("blotter", id);
+    setTimeout(() => attachTradeCashPreview(meta), 50);
     return `
       ${headerWithBack("Editar trade", "/trades")}
       <main>
         <form data-action="updateTrade" data-row-id="${escapeHtml(id)}">
           ${tradeFormFields(row, meta)}
+          <div id="trade-cash-preview" class="card compact" style="margin: 8px 0; font-size: 13px; display: none;"></div>
           <button type="submit" class="btn primary full">Guardar cambios</button>
         </form>
         <button class="btn danger full" style="margin-top:12px"
@@ -870,6 +934,85 @@
       </main>
     `;
   });
+
+  // Cash preview helper para el form de trade.
+  // Se monta DESPUÉS de que el HTML del form esté en el DOM.
+  // Wire onchange en Cuenta Cash, Side, Qty, Precio, Moneda Trade →
+  // calcula costo y saldo resultante, y los muestra en #trade-cash-preview.
+  async function attachTradeCashPreview(meta) {
+    const div = document.getElementById("trade-cash-preview");
+    if (!div) return;
+    let cashData;
+    try {
+      cashData = await API.cash(API.anchor());
+    } catch (e) {
+      div.innerHTML = `<span class="muted">Sin datos de cash (${escapeHtml(e.message)})</span>`;
+      div.style.display = "block";
+      return;
+    }
+    // Index: {account+currency: qty}
+    const balByKey = {};
+    for (const c of (cashData.items || [])) {
+      balByKey[`${c.account}|${c.currency}`] = c.qty;
+    }
+    function getField(name) {
+      const el = document.querySelector(`[name="${name}"]`);
+      return el ? el.value : "";
+    }
+    function update() {
+      const cuentaCash = getField("Cuenta Cash");
+      const side = getField("Side");
+      const qty = parseFloat(getField("Qty")) || 0;
+      const precio = parseFloat(getField("Precio")) || 0;
+      const moneda = getField("Moneda Trade");
+      if (!cuentaCash || !moneda) {
+        div.style.display = "none";
+        return;
+      }
+      const ar = meta?.accountsRich?.[cuentaCash];
+      const accountName = (ar?.name && ar.name !== cuentaCash) ? ar.name : cuentaCash;
+      const balance = balByKey[`${cuentaCash}|${moneda}`] || 0;
+      const costo = qty * precio;
+      // BUY: cuenta cash pierde costo. SELL: gana.
+      const sign = (side === "BUY") ? -1 : (side === "SELL") ? +1 : 0;
+      const resultado = balance + sign * costo;
+      const apalancado = resultado < 0 && side === "BUY";
+      const colorRes = apalancado ? "var(--orange, #F59E0B)" :
+                        (resultado < 0 ? "var(--red, #DC2626)" : "var(--green, #10A66B)");
+      const arrow = side === "BUY" ? "🔻" : side === "SELL" ? "🔺" : "↔";
+      const opLabel = side === "BUY" ? "Costo" : side === "SELL" ? "Ingreso" : "Movimiento";
+      div.innerHTML = `
+        <div style="display: flex; justify-content: space-between; align-items: baseline; gap: 8px;">
+          <div style="flex: 1; min-width: 0;">
+            <div class="muted" style="font-size: 11px;">Saldo actual de</div>
+            <div style="font-weight: 600;">${escapeHtml(accountName)} <span class="tag" style="font-size: 10px;">${escapeHtml(moneda)}</span></div>
+          </div>
+          <div class="tabular" style="font-weight: 600;">${fmt.money(balance, 2)}</div>
+        </div>
+        ${costo > 0 ? `
+          <div style="display: flex; justify-content: space-between; padding-top: 4px; border-top: 1px dashed var(--border); margin-top: 6px;">
+            <span class="muted">${arrow} ${opLabel} (${fmt.money(qty, 4)} × ${fmt.money(precio, 4)})</span>
+            <span class="tabular">${sign === -1 ? "−" : sign === 1 ? "+" : ""}${fmt.money(costo, 2)} ${escapeHtml(moneda)}</span>
+          </div>
+          <div style="display: flex; justify-content: space-between; padding-top: 4px; margin-top: 4px; align-items: center;">
+            <span style="font-weight: 600;">Saldo resultante</span>
+            <span class="tabular" style="font-weight: 700; color: ${colorRes};">
+              ${fmt.money(resultado, 2)} ${escapeHtml(moneda)}
+              ${apalancado ? '<br><span class="tag" style="background: #FEF3C7; color: #B45309; font-size: 9px;">🔻 apalancado</span>' : ""}
+            </span>
+          </div>
+        ` : ""}
+      `;
+      div.style.display = "block";
+    }
+    // Wire listeners en todos los campos relevantes
+    ["Cuenta Cash", "Side", "Qty", "Precio", "Moneda Trade"].forEach(name => {
+      const el = document.querySelector(`[name="${name}"]`);
+      if (el) el.addEventListener("input", update);
+      if (el) el.addEventListener("change", update);
+    });
+    update();
+  }
 
   // /gastos
   route("/gastos", async () => {
@@ -1785,7 +1928,10 @@
   // /holdings — todas las tenencias desagregadas
   // ====================================================================
   route("/holdings", async () => {
-    const data = await API.holdings(API.anchor());
+    const [data, meta] = await Promise.all([
+      API.holdings(API.anchor()),
+      loadMeta().catch(() => ({ accountsRich: {} })),
+    ]);
     const all = data.items || [];
 
     // Filtros guardados en sessionStorage
@@ -1864,9 +2010,9 @@
                     ${escapeHtml(h.asset)}
                     ${tagBits.join(" ")}
                   </div>
-                  <div class="meta-line2">
-                    ${escapeHtml(h.account)} · ${escapeHtml(h.asset_class || "?")}
-                    ${h.name && h.name !== h.asset ? ' · ' + escapeHtml(h.name) : ""}
+                  <div class="meta-line2" style="display: flex; align-items: center; gap: 6px; flex-wrap: wrap;">
+                    <span style="display: inline-block;">${accountLabel(h.account, meta.accountsRich)}</span>
+                    <span class="muted">· ${escapeHtml(h.asset_class || "?")}${h.name && h.name !== h.asset ? ' · ' + escapeHtml(h.name) : ""}</span>
                   </div>
                   <div class="meta-line2 tabular" style="margin-top: 4px;">
                     ${fmt.money(h.qty, 4)} ${escapeHtml(h.native_currency)}
@@ -2158,7 +2304,10 @@
   // Cash por cuenta
   // ====================================================================
   route("/cash", async () => {
-    const data = await API.cash();
+    const [data, meta] = await Promise.all([
+      API.cash(),
+      loadMeta().catch(() => ({ accountsRich: {} })),
+    ]);
     const items = data.items || [];
     const byCcy = data.by_currency || {};
     return `
@@ -2194,18 +2343,17 @@
           <h2>Por cuenta (${items.length})</h2>
           ${items.length === 0 ? '<div class="card muted">Sin cash en ninguna cuenta</div>' :
             `<div class="list">${items.map(h => `
-              <div class="list-item">
-                <div class="meta">
-                  <div class="meta-line1">
-                    ${escapeHtml(h.account)}
-                    ${!h.investible ? '<span class="tag warn">no-inv</span>' : ""}
-                  </div>
-                  <div class="meta-line2">
-                    ${escapeHtml(h.account_kind)} · ${escapeHtml(h.cash_purpose || "—")}
+              <div class="list-item" style="align-items: center;">
+                <div class="meta" style="flex: 1; min-width: 0;">
+                  ${accountLabel(h.account, meta.accountsRich)}
+                  <div class="meta-line2 muted" style="font-size: 11px; margin-top: 2px;">
+                    ${escapeHtml((h.account_kind || "").toLowerCase())}${h.cash_purpose ? " · " + escapeHtml(h.cash_purpose) : ""}
+                    ${!h.investible ? ' <span class="tag warn" style="font-size: 9px;">no-inv</span>' : ""}
                   </div>
                 </div>
-                <div class="right">
-                  <div class="amount tabular">${fmt.money(h.qty, 2)} ${escapeHtml(h.currency)}</div>
+                <span class="tag" style="font-size: 10px; align-self: center;">${escapeHtml(h.currency)}</span>
+                <div class="right" style="white-space: nowrap;">
+                  <div class="amount tabular">${fmt.money(h.qty, 2)}</div>
                   <div class="sub muted">${fmt.money(h.mv_anchor)} ${escapeHtml(data.anchor)}</div>
                 </div>
               </div>

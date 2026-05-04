@@ -58,26 +58,34 @@ def _load_currencies(conn):
 
 
 def _load_account_meta(conn):
-    """Devuelve dict {code: {investible, cash_purpose, kind}} desde accounts."""
+    """Devuelve dict {code: {name, kind, investible, cash_purpose, currency,
+    institution}} desde accounts. `name` es el display name (para UI)."""
     out = {}
     try:
         cur = conn.execute(
-            "SELECT code, kind, investible, cash_purpose FROM accounts"
+            "SELECT code, name, kind, investible, cash_purpose, currency, institution "
+            "FROM accounts"
         )
         for r in cur.fetchall():
             out[r["code"]] = {
+                "name": r["name"] or r["code"],
                 "kind": r["kind"],
                 "investible": bool(r["investible"]),
                 "cash_purpose": r["cash_purpose"],
+                "currency": r["currency"],
+                "institution": r["institution"],
             }
     except Exception:
         # Schema viejo sin las columnas — degradar a defaults
-        cur = conn.execute("SELECT code, kind FROM accounts")
+        cur = conn.execute("SELECT code, name, kind FROM accounts")
         for r in cur.fetchall():
             out[r["code"]] = {
+                "name": r["name"] or r["code"],
                 "kind": r["kind"],
                 "investible": True,
                 "cash_purpose": None,
+                "currency": None,
+                "institution": None,
             }
     return out
 
@@ -341,7 +349,10 @@ def calculate_holdings(conn, fecha=None, anchor_currency="USD"):
             conn, mv_native, native_ccy, anchor_currency, fecha
         )
 
-        meta = account_meta.get(account, {"investible": True, "cash_purpose": None, "kind": None})
+        meta = account_meta.get(account, {
+            "name": account, "investible": True, "cash_purpose": None,
+            "kind": None, "currency": None, "institution": None,
+        })
         is_liability = meta["kind"] in LIABILITY_KINDS
 
         # Target / Stop-loss (solo activos no-cash)
@@ -422,6 +433,8 @@ def calculate_holdings(conn, fecha=None, anchor_currency="USD"):
             "investible": meta["investible"],
             "cash_purpose": meta["cash_purpose"],
             "account_kind": meta["kind"],
+            "account_name": meta.get("name") or account,
+            "account_institution": meta.get("institution"),
             # Target / Stop (None si no fueron seteados o si es cash)
             "target_price": target_price,
             "stop_loss_price": stop_loss_price,
