@@ -21,7 +21,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from engine.importer import import_all
 from engine.holdings import (
     calculate_holdings, total_pn, by_asset_class, by_account, by_currency,
-    by_cash_purpose,
+    by_cash_purpose, filter_investible,
 )
 from engine.pnl import calculate_realized_pnl
 from engine.trade_stats import calculate_trade_stats
@@ -88,10 +88,13 @@ def print_buying_power(conn, holdings, anchor_ccy):
                   f"{_fmt_money(bp_o.funding_cost_per_day, decimals=4)}")
 
 
-def print_summary(holdings, anchor_ccy):
+def print_summary(holdings, anchor_ccy, view_label=None):
     print()
     print("=" * 90)
-    print(f"  PORTFOLIO SUMMARY  —  ancla: {anchor_ccy}".center(90))
+    title = f"  PORTFOLIO SUMMARY  —  ancla: {anchor_ccy}"
+    if view_label:
+        title += f"  [{view_label}]"
+    print(title.center(90))
     print("=" * 90)
 
     tp = total_pn(holdings, anchor_ccy)
@@ -188,6 +191,11 @@ def main():
     p.add_argument("--db", type=Path, default=Path("data/wealth.db"))
     p.add_argument("--no-import", action="store_true",
                    help="No re-importar el Excel (usa DB tal como está)")
+    p.add_argument("--investible-only", action="store_true",
+                   help="Excluye cuentas marcadas como NO-INVERTIBLE de TODOS los breakdowns "
+                        "(asset class, moneda, cuenta, top posiciones)")
+    p.add_argument("--both", action="store_true",
+                   help="Imprime DOS vistas: completa + invertible only")
     args = p.parse_args()
 
     fecha = date.fromisoformat(args.fecha) if args.fecha else date.today()
@@ -208,12 +216,30 @@ def main():
     conn.row_factory = sqlite3.Row
 
     print(f"[summary] calculando holdings al {fecha} (ancla: {anchor_ccy})...")
-    holdings = calculate_holdings(conn, fecha=fecha, anchor_currency=anchor_ccy)
+    holdings_all = calculate_holdings(conn, fecha=fecha, anchor_currency=anchor_ccy)
     fills = calculate_realized_pnl(conn, fecha_hasta=fecha)
 
-    print_summary(holdings, anchor_ccy)
+    # Construir vistas según flags
+    if args.both:
+        views = [
+            (holdings_all, "VISTA COMPLETA (incluye no-invertibles)"),
+            (filter_investible(holdings_all), "VISTA SOLO INVERTIBLE (excluye reserva no declarada)"),
+        ]
+    elif args.investible_only:
+        views = [
+            (filter_investible(holdings_all),
+             "SOLO INVERTIBLE (excluye reserva no declarada)"),
+        ]
+    else:
+        views = [(holdings_all, None)]
+
+    for holdings, label in views:
+        print_summary(holdings, anchor_ccy, view_label=label)
+
+    # Trade stats y BP no dependen del filtro (los trades cerrados son cerrados,
+    # el BP es por cuenta — siempre se muestran completos)
     print_trade_stats(fills)
-    print_buying_power(conn, holdings, anchor_ccy)
+    print_buying_power(conn, holdings_all, anchor_ccy)
     print()
     return 0
 

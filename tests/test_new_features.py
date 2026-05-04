@@ -511,6 +511,50 @@ def test_exporter_excel_html_smoke():
         conn.close()
 
 
+def test_html_view_toggle():
+    """HTML report incluye toggle JS funcional con ambas vistas embebidas."""
+    print("\n[TOGGLE] HTML toggle entre 'Todo' y 'Solo invertible':")
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        conn, _ = _setup_db(tmp)
+        html_out = tmp / "report.html"
+        export_html(conn, html_out, fecha=date(2026, 5, 2),
+                    anchor_currency="ARS", default_view="all")
+        html = html_out.read_text(encoding="utf-8")
+
+        # UI elements
+        assert 'class="view-toggle"' in html
+        assert 'data-view="all"' in html
+        assert 'data-view="investible"' in html
+        # JS data
+        assert 'const VIEWS = ' in html
+        assert '"all"' in html and '"investible"' in html
+        assert 'DEFAULT_VIEW = "all"' in html
+        # Containers vacíos a llenar por JS
+        assert 'id="topHoldingsBody"' in html
+        assert 'id="byAccountBody"' in html
+        # Función renderView debe estar
+        assert 'function renderView' in html
+        print(f"  ✓ Toggle UI + JS data + render function presentes")
+
+        # Default view = investible
+        export_html(conn, html_out, fecha=date(2026, 5, 2),
+                    anchor_currency="ARS", default_view="investible")
+        html2 = html_out.read_text(encoding="utf-8")
+        assert 'DEFAULT_VIEW = "investible"' in html2
+        print(f"  ✓ default_view='investible' respetado")
+
+        # Excel con --investible-only
+        from engine.exporter import export_excel
+        xlsx_inv = tmp / "rep_inv.xlsx"
+        export_excel(conn, xlsx_inv, fecha=date(2026, 5, 2),
+                     anchor_currency="ARS", investible_only=True,
+                     record_snapshot=False)
+        assert xlsx_inv.is_file()
+        print(f"  ✓ Excel investible_only ({xlsx_inv.stat().st_size:,} bytes)")
+        conn.close()
+
+
 # =============================================================================
 # Main
 # =============================================================================
@@ -532,6 +576,7 @@ if __name__ == "__main__":
         test_d4_buying_power_summary,
         test_e1_funding_imported,
         test_exporter_excel_html_smoke,
+        test_html_view_toggle,
     ]
     failed = []
     for t in tests:

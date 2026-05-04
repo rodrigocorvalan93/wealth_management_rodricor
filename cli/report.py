@@ -48,6 +48,10 @@ def main():
                    help="Carpeta destino (default: reports/)")
     p.add_argument("--no-import", action="store_true",
                    help="No re-importar el Excel (usa DB tal como está)")
+    p.add_argument("--investible-only", action="store_true",
+                   help="Excel: filtra holdings no-invertibles. "
+                        "HTML: el toggle ya está incluido en el HTML, este flag "
+                        "solo cambia la vista DEFAULT al abrir.")
     args = p.parse_args()
 
     if not args.xlsx and not args.html:
@@ -75,17 +79,20 @@ def main():
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
     fecha_str = fecha.isoformat()
+    suffix = "_invertible" if args.investible_only else ""
 
     if args.xlsx:
-        out_path = args.output_dir / f"{fecha_str}_portfolio.xlsx"
+        out_path = args.output_dir / f"{fecha_str}_portfolio{suffix}.xlsx"
         print(f"[report] generando Excel...")
-        result = export_excel(conn, out_path, fecha=fecha, anchor_currency=anchor)
+        result = export_excel(conn, out_path, fecha=fecha, anchor_currency=anchor,
+                              investible_only=args.investible_only)
         print(f"[report] OK Excel → {result}")
 
     if args.html:
         out_path = args.output_dir / f"{fecha_str}_portfolio.html"
         print(f"[report] generando HTML...")
-        result = export_html(conn, out_path, fecha=fecha, anchor_currency=anchor)
+        result = export_html(conn, out_path, fecha=fecha, anchor_currency=anchor,
+                             default_view=("investible" if args.investible_only else "all"))
         print(f"[report] OK HTML  → {result}")
 
     print()
