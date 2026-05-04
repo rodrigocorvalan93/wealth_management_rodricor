@@ -191,8 +191,16 @@ def run_loaders():
                 results[name] = "ok"
             else:
                 print(f"   ✗ {name} FALLÓ (exit {r.returncode}, {dt:.1f}s)")
+                # Mostrar stderr Y stdout para diagnosticar (algunos
+                # loaders printean errores a stdout en lugar de stderr).
                 if r.stderr:
-                    print(f"   stderr: {r.stderr[-500:]}")
+                    print(f"   stderr: {r.stderr[-500:].rstrip()}")
+                else:
+                    print(f"   stderr: (vacío)")
+                if r.stdout:
+                    print(f"   stdout: {r.stdout[-500:].rstrip()}")
+                else:
+                    print(f"   stdout: (vacío)")
                 results[name] = "fail"
         except subprocess.TimeoutExpired:
             print(f"   ⏱ {name} timeout (>3 min) — skipping")
