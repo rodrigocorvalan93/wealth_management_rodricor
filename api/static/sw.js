@@ -1,7 +1,7 @@
 /* Service Worker simple: cache-first para shell, network-first para API.
    IMPORTANTE: bumpear VERSION cada vez que se modifica app.js o style.css
    para forzar a clientes existentes a re-descargar. */
-const VERSION = "wm-v7";
+const VERSION = "wm-v8";
 const SHELL = [
   "/",
   "/static/style.css",

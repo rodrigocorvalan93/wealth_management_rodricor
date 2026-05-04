@@ -2810,11 +2810,11 @@ python yfinance_loader.py</pre>
             </div>
             <div style="display:flex; justify-content:space-between; padding: 4px 0;">
               <span class="muted">Excel cargado</span>
-              <span class="tag ${health?.xlsx_present ? "" : "warn"}">${health?.xlsx_present ? "sí" : "no"}</span>
+              <span class="tag ${cfg?.xlsx_present ? "" : "warn"}">${cfg?.xlsx_present ? "sí" : "no"}</span>
             </div>
             <div style="display:flex; justify-content:space-between; padding: 4px 0;">
               <span class="muted">DB lista</span>
-              <span class="tag ${health?.db_present ? "" : "warn"}">${health?.db_present ? "sí" : "no"}</span>
+              <span class="tag ${cfg?.db_present ? "" : "warn"}">${cfg?.db_present ? "sí" : "no"}</span>
             </div>
             <div style="display:flex; justify-content:space-between; padding: 4px 0;">
               <span class="muted">Server time</span>
