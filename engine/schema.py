@@ -130,6 +130,13 @@ CREATE TABLE IF NOT EXISTS schema_version (
     applied_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
+-- Settings: pares clave/valor para config per-user (ej: alert_distance_bps).
+-- Se popula desde la hoja `config` del Excel master en import_all.
+CREATE TABLE IF NOT EXISTS settings (
+    key   TEXT PRIMARY KEY,
+    value TEXT
+);
+
 -- =============================================================================
 -- Maestros
 -- =============================================================================
@@ -201,6 +208,10 @@ CREATE TABLE IF NOT EXISTS events (
     external_id  TEXT,                        -- ID externo (ej Trade ID del broker)
     parent_event_id INTEGER,                  -- para cuotas: vincula al evento padre
     notes        TEXT,
+    -- Trade thesis (solo TRADE events): take-profit y stop-loss en moneda nativa
+    target_price    REAL,                     -- precio target (TP) opcional
+    stop_loss_price REAL,                     -- precio stop-loss opcional
+    target_currency TEXT,                     -- moneda de target/stop (default = moneda del trade)
     created_at   TEXT NOT NULL DEFAULT (datetime('now')),
     FOREIGN KEY (parent_event_id) REFERENCES events(event_id),
     CHECK (event_type IN ('TRADE','TRANSFER_ASSET','TRANSFER_CASH','INCOME','EXPENSE',
@@ -487,17 +498,55 @@ def insert_asset(conn, ticker, name, asset_class, currency,
 
 def insert_event(conn, event_type, event_date, settle_date=None,
                  description=None, source_row=None, source_sheet=None,
-                 external_id=None, parent_event_id=None, notes=None) -> int:
-    """Inserta un evento. Devuelve el event_id generado."""
+                 external_id=None, parent_event_id=None, notes=None,
+                 target_price=None, stop_loss_price=None,
+                 target_currency=None) -> int:
+    """Inserta un evento. Devuelve el event_id generado.
+
+    target_price / stop_loss_price / target_currency son opcionales y
+    típicamente solo se llenan en TRADE events de tipo BUY (la "tesis"
+    inicial del trade).
+    """
     cur = conn.execute(
         """INSERT INTO events
            (event_type, event_date, settle_date, description,
-            source_row, source_sheet, external_id, parent_event_id, notes)
-           VALUES (?,?,?,?,?,?,?,?,?)""",
+            source_row, source_sheet, external_id, parent_event_id, notes,
+            target_price, stop_loss_price, target_currency)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
         (event_type, event_date, settle_date, description,
-         source_row, source_sheet, external_id, parent_event_id, notes),
+         source_row, source_sheet, external_id, parent_event_id, notes,
+         target_price, stop_loss_price, target_currency),
     )
     return cur.lastrowid
+
+
+# =============================================================================
+# Settings (key/value table)
+# =============================================================================
+
+def set_setting(conn, key: str, value):
+    """Set un setting key=value. value se serializa a string."""
+    conn.execute(
+        "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
+        (key, str(value) if value is not None else None),
+    )
+
+
+def get_setting(conn, key: str, default=None, cast=None):
+    """Lee un setting. Si cast es int/float/bool, convierte. Si no existe,
+    devuelve default."""
+    row = conn.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+    if row is None or row[0] is None:
+        return default
+    val = row[0]
+    if cast is None:
+        return val
+    if cast is bool:
+        return str(val).lower() in ("1", "true", "yes", "y")
+    try:
+        return cast(val)
+    except (ValueError, TypeError):
+        return default
 
 
 def insert_movement(conn, event_id, account, asset, qty,

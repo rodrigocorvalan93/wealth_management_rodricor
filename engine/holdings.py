@@ -97,6 +97,39 @@ def _load_asset_map(conn):
     return out
 
 
+def _get_active_target(conn, account, asset):
+    """Devuelve {target_price, stop_loss_price, target_currency, set_at} para
+    el holding, leyendo el BUY más reciente con target o stop no-null.
+
+    Si nunca se setearon target/stop para este (account, asset), devuelve None.
+    Esta es la "tesis viva" del trade: el último target/stop que el user
+    ingresó al comprar este activo en esta cuenta.
+    """
+    cur = conn.execute(
+        """
+        SELECT e.target_price, e.stop_loss_price, e.target_currency, e.event_date
+        FROM events e
+        JOIN movements m ON m.event_id = e.event_id
+        WHERE e.event_type = 'TRADE'
+          AND m.account = ? AND m.asset = ?
+          AND m.qty > 0
+          AND (e.target_price IS NOT NULL OR e.stop_loss_price IS NOT NULL)
+        ORDER BY e.event_date DESC, e.event_id DESC
+        LIMIT 1
+        """,
+        (account, asset),
+    )
+    row = cur.fetchone()
+    if not row:
+        return None
+    return {
+        "target_price": row["target_price"],
+        "stop_loss_price": row["stop_loss_price"],
+        "target_currency": row["target_currency"],
+        "set_at": row["event_date"],
+    }
+
+
 def _calc_position(conn, account, asset, fecha_iso):
     """Calcula posición agregada para (account, asset) hasta fecha_iso.
 
@@ -311,6 +344,47 @@ def calculate_holdings(conn, fecha=None, anchor_currency="USD"):
         meta = account_meta.get(account, {"investible": True, "cash_purpose": None, "kind": None})
         is_liability = meta["kind"] in LIABILITY_KINDS
 
+        # Target / Stop-loss (solo activos no-cash)
+        target_info = None
+        target_price = None
+        stop_loss_price = None
+        target_currency = None
+        dist_to_target_bps = None
+        dist_to_stop_bps = None
+        if not is_cash:
+            target_info = _get_active_target(conn, account, asset)
+            if target_info:
+                target_currency = target_info["target_currency"] or native_ccy
+                # Si target está en otra moneda, convertir a moneda nativa para
+                # comparar contra market_price (que está en moneda nativa).
+                tp_native = target_info["target_price"]
+                sl_native = target_info["stop_loss_price"]
+                if target_currency != native_ccy:
+                    if tp_native is not None:
+                        try:
+                            tp_native = fx_convert(conn, tp_native, target_currency,
+                                                    native_ccy, fecha, fallback_days=14)
+                        except FxError:
+                            tp_native = None
+                    if sl_native is not None:
+                        try:
+                            sl_native = fx_convert(conn, sl_native, target_currency,
+                                                    native_ccy, fecha, fallback_days=14)
+                        except FxError:
+                            sl_native = None
+                target_price = tp_native
+                stop_loss_price = sl_native
+                # Distancia en bps (basis points = 1/100 de %).
+                # dist_to_target_bps > 0  → market PASÓ el target (alerta TP).
+                # dist_to_target_bps = 0  → exactamente en target.
+                # dist_to_target_bps < 0  → falta para llegar.
+                if target_price and target_price > 0:
+                    dist_to_target_bps = ((market_price - target_price) / target_price) * 10000
+                # dist_to_stop_bps > 0  → market está por ENCIMA del stop (safe).
+                # dist_to_stop_bps < 0  → market PERFORÓ el stop (alerta SL).
+                if stop_loss_price and stop_loss_price > 0:
+                    dist_to_stop_bps = ((market_price - stop_loss_price) / stop_loss_price) * 10000
+
         # PN-signed: pasivos restan al PN. Activos suman.
         # mv_anchor sigue siendo el "balance" (siempre positivo si tenés saldo).
         # mv_pn_anchor es el aporte SIGNADO al PN (negativo para pasivos).
@@ -348,6 +422,12 @@ def calculate_holdings(conn, fecha=None, anchor_currency="USD"):
             "investible": meta["investible"],
             "cash_purpose": meta["cash_purpose"],
             "account_kind": meta["kind"],
+            # Target / Stop (None si no fueron seteados o si es cash)
+            "target_price": target_price,
+            "stop_loss_price": stop_loss_price,
+            "target_currency": target_currency,
+            "dist_to_target_bps": dist_to_target_bps,
+            "dist_to_stop_bps": dist_to_stop_bps,
         })
 
     # Ordenar por mv_anchor desc (los más grandes primero)
@@ -470,6 +550,37 @@ def filter_investible(holdings):
 def filter_non_investible(holdings):
     """Devuelve solo holdings NO invertibles (lo opuesto a filter_investible)."""
     return [h for h in holdings if not h.get("investible", True)]
+
+
+def filter_near_target(holdings, alert_distance_bps: float = 10.0):
+    """Devuelve holdings con target/stop alert activo.
+
+    alert_distance_bps: distancia en bps (1 bp = 0.01%) que define "cerca".
+                       Default 10 bps = 0.10%.
+
+    Para CADA holding evalúa:
+      - TP: dist_to_target_bps >= -alert_distance_bps  → cerca o pasó target
+      - SL: dist_to_stop_bps   <=  +alert_distance_bps → cerca o perforó stop
+
+    Devuelve la lista con un campo adicional `alert` ∈ {'TP', 'SL'}.
+    Holdings sin target/stop o lejos del trigger no se incluyen.
+    """
+    out = []
+    for h in holdings:
+        alert = None
+        d_tp = h.get("dist_to_target_bps")
+        d_sl = h.get("dist_to_stop_bps")
+        if d_tp is not None and d_tp >= -alert_distance_bps:
+            alert = "TP"
+        elif d_sl is not None and d_sl <= alert_distance_bps:
+            # Cuidado: puede coexistir con TP si target < stop (raro), pero
+            # priorizamos TP arriba.
+            alert = "SL"
+        if alert:
+            h2 = dict(h)
+            h2["alert"] = alert
+            out.append(h2)
+    return out
 
 
 def by_cash_purpose(holdings):

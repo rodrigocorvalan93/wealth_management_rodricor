@@ -326,6 +326,82 @@ def create_app() -> Flask:
         finally:
             conn.close()
 
+    @app.get("/api/holdings-near-target")
+    def holdings_near_target_endpoint():
+        """Holdings cuya distancia al target o stop-loss está dentro del
+        umbral configurado en `alert_distance_bps`. Query param `bps`
+        opcional para override on-the-fly."""
+        _require_auth(); _block_if_switched_mutation()
+        from engine.holdings import filter_near_target
+        from engine.schema import get_setting
+        anchor = _parse_query_anchor()
+        fecha = _parse_query_fecha()
+        holdings, conn = _holdings(fecha, anchor)
+        try:
+            override = request.args.get("bps")
+            if override is not None:
+                try:
+                    bps = float(override)
+                except ValueError:
+                    abort(400, "bps debe ser numérico")
+            else:
+                bps = get_setting(conn, "alert_distance_bps",
+                                   default=10.0, cast=float)
+            alerts = filter_near_target(holdings, alert_distance_bps=bps)
+            return jsonify({
+                "alert_distance_bps": bps,
+                "fecha": fecha.isoformat(),
+                "anchor": anchor,
+                "n_alerts": len(alerts),
+                "alerts": alerts,
+            })
+        finally:
+            conn.close()
+
+    @app.get("/api/settings")
+    def get_settings_endpoint():
+        """Devuelve los settings persistidos en DB (key/value)."""
+        _require_auth()
+        from engine.schema import get_setting
+        conn = db_conn()
+        try:
+            return jsonify({
+                "alert_distance_bps": get_setting(conn, "alert_distance_bps",
+                                                    default=10.0, cast=float),
+                "anchor_currency": get_setting(conn, "anchor_currency",
+                                                default=get_settings().anchor),
+                "pnl_method": get_setting(conn, "pnl_method", default="FIFO"),
+            })
+        finally:
+            conn.close()
+
+    @app.put("/api/settings")
+    def update_settings_endpoint():
+        """Actualiza un setting. Body: {"key": "alert_distance_bps", "value": 50}.
+
+        IMPORTANTE: el valor se persiste a la DB pero NO al Excel master,
+        así que se va a perder en el próximo refresh. Para hacerlo permanente
+        editá la hoja `config` del master.
+        """
+        _require_auth(); _block_if_switched_mutation()
+        from engine.schema import set_setting
+        body = request.get_json(silent=True) or {}
+        key = body.get("key")
+        value = body.get("value")
+        if not key:
+            abort(400, "key requerido")
+        # Whitelist de keys editables
+        allowed = {"alert_distance_bps"}
+        if key not in allowed:
+            abort(400, f"key '{key}' no editable. Permitidos: {sorted(allowed)}")
+        conn = db_conn()
+        try:
+            set_setting(conn, key, value)
+            conn.commit()
+            return jsonify({"ok": True, "key": key, "value": value})
+        finally:
+            conn.close()
+
     @app.get("/api/buying-power")
     def buying_power_endpoint():
         _require_auth(); _block_if_switched_mutation()

@@ -122,6 +122,16 @@
     config: () => API.req("/api/config"),
     reportHtml: (anchor) => API.req(`/api/report/html?anchor=${anchor || API.anchor()}`),
 
+    // Target / settings
+    holdingsNearTarget: (anchor, bpsOverride) => {
+      const a = anchor || API.anchor();
+      const q = bpsOverride != null ? `&bps=${bpsOverride}` : "";
+      return API.req(`/api/holdings-near-target?anchor=${a}${q}`);
+    },
+    getSettings: () => API.req("/api/settings"),
+    setSetting: (key, value) =>
+      API.req("/api/settings", { method: "PUT", json: { key, value } }),
+
     // Admin endpoints
     listUsers: () => API.req("/api/admin/users"),
     createUser: (data) => API.req("/api/admin/users", { method: "POST", json: data }),
@@ -563,6 +573,20 @@
       }
     },
 
+    async setAlertDistance(form) {
+      const fd = new FormData(form);
+      const bps = parseFloat(fd.get("alert_distance_bps"));
+      if (!isFinite(bps) || bps < 0 || bps > 10000) {
+        toast("Valor inválido (0-10000 bps)", "error"); return;
+      }
+      try {
+        await API.setSetting("alert_distance_bps", bps);
+        toast(`Alert distance → ${bps} bps`, "success");
+        API._bustCache();
+        render();
+      } catch (e) { toast(e.message, "error"); }
+    },
+
     async refreshAll() {
       try {
         toast("Refrescando...", "info");
@@ -595,10 +619,12 @@
   // /  Dashboard
   route("/", async () => {
     const view = API.view();  // 'all' | 'investible'
-    let s, fills;
+    let s, fills, nearTarget;
     try {
-      [s, fills] = await Promise.all([
-        API.summary(), API.realizedPnl(),
+      [s, fills, nearTarget] = await Promise.all([
+        API.summary(),
+        API.realizedPnl(),
+        API.holdingsNearTarget().catch(() => ({ alerts: [], n_alerts: 0, alert_distance_bps: 10 })),
       ]);
     } catch (e) {
       // Si la DB está vacía o falla el summary, ofrecer setup wizard
@@ -681,6 +707,32 @@
           <div class="card compact muted" style="margin-bottom: 16px; font-size: 12px;">
             ℹ Cash no-invertible (reserva no declarada): ${fmt.money(s.patrimonio_no_invertible)} ${API.anchor()}
           </div>
+        ` : ""}
+
+        ${nearTarget && nearTarget.n_alerts > 0 ? `
+          <section>
+            <h2>🎯 Cerca del target / stop <span class="muted" style="font-weight: normal; font-size: 12px;">(${nearTarget.alert_distance_bps} bps)</span></h2>
+            <div class="card" style="border-left: 4px solid var(--yellow);">
+              ${nearTarget.alerts.map(a => {
+                const isTP = a.alert === "TP";
+                const ref = isTP ? a.target_price : a.stop_loss_price;
+                const dist = isTP ? a.dist_to_target_bps : a.dist_to_stop_bps;
+                const sign = isTP ? (dist >= 0 ? "✅" : "→") : (dist <= 0 ? "🛑" : "→");
+                const distStr = (dist != null) ? `${dist >= 0 ? "+" : ""}${dist.toFixed(0)} bps` : "?";
+                return `<a href="#/holdings" style="display:flex; justify-content:space-between; padding: 8px 0; border-bottom: 1px solid var(--border); text-decoration: none; color: inherit;">
+                  <div>
+                    <div style="font-weight: 600;">${sign} ${escapeHtml(a.asset)}
+                      <span class="tag" style="background: ${isTP ? '#E0F2E9' : '#FEE2E2'}; color: ${isTP ? '#10A66B' : '#DC2626'};">${a.alert}</span>
+                    </div>
+                    <div class="muted" style="font-size: 12px;">
+                      ${escapeHtml(a.account)} · MP ${fmt.money(a.market_price, 4)} → ${isTP ? 'TP' : 'SL'} ${fmt.money(ref, 4)} ${escapeHtml(a.target_currency || a.native_currency)}
+                    </div>
+                  </div>
+                  <div class="tabular ${dist >= 0 ? (isTP ? 'positive' : 'negative') : (isTP ? '' : 'positive')}" style="align-self: center;">${distStr}</div>
+                </a>`;
+              }).join("")}
+            </div>
+          </section>
         ` : ""}
 
         <section>
@@ -1794,6 +1846,16 @@
             if (isLiab) tagBits.push('<span class="tag danger">deuda</span>');
             if (!h.investible) tagBits.push('<span class="tag warn">no-inv</span>');
             if (h.price_fallback) tagBits.push('<span class="tag warn">px*</span>');
+            // Target / Stop info (solo no-cash)
+            const dTP = h.dist_to_target_bps;
+            const dSL = h.dist_to_stop_bps;
+            const targetLine = (h.target_price || h.stop_loss_price) ? `
+              <div class="meta-line2 tabular" style="margin-top: 2px; font-size: 11px;">
+                ${h.target_price != null ? `🎯 ${fmt.money(h.target_price, 4)}${dTP != null ? ` <span class="${dTP >= 0 ? 'positive' : 'muted'}">(${dTP >= 0 ? '+' : ''}${dTP.toFixed(0)}bp)</span>` : ''}` : ""}
+                ${h.target_price && h.stop_loss_price ? " · " : ""}
+                ${h.stop_loss_price != null ? `🛑 ${fmt.money(h.stop_loss_price, 4)}${dSL != null ? ` <span class="${dSL <= 0 ? 'negative' : 'muted'}">(${dSL >= 0 ? '+' : ''}${dSL.toFixed(0)}bp)</span>` : ''}` : ""}
+              </div>
+            ` : "";
             return `
               <div class="list-item" style="align-items: flex-start;">
                 <div class="meta">
@@ -1810,6 +1872,7 @@
                     ${fmt.money(h.qty, 4)} ${escapeHtml(h.native_currency)}
                     ${!isCash ? `@ ${fmt.money(h.market_price, 4)}` : ""}
                   </div>
+                  ${targetLine}
                 </div>
                 <div class="right">
                   <div class="amount tabular ${(h.mv_anchor || 0) < 0 ? 'negative' : ''}">${fmt.money(h.mv_anchor)}</div>
@@ -2554,8 +2617,10 @@ python yfinance_loader.py</pre>
   route("/settings", async () => {
     let health = null;
     let cfg = null;
+    let appSettings = null;
     try { health = await API.health(); } catch (_) {}
     try { cfg = await API.config(); } catch (_) {}
+    try { appSettings = await API.getSettings(); } catch (_) {}
     let backups = [];
     try {
       const b = await API.backups();
@@ -2610,6 +2675,28 @@ python yfinance_loader.py</pre>
           <a href="#/calculator" class="btn ghost full" style="margin-bottom:6px">🧮 What-if calculator</a>
           <a href="#/journal" class="btn ghost full" style="margin-bottom:6px">📔 Trading journal (por strategy)</a>
           <a href="#/calendar" class="btn ghost full" style="margin-bottom:6px">📅 Calendario (próximos 60 días)</a>
+        </section>
+
+        <section>
+          <h2>🎯 Alertas de target / stop</h2>
+          <form data-action="setAlertDistance">
+            <div class="card compact">
+              <label style="font-size: 13px; display: block; margin-bottom: 6px;">
+                Distancia para alertar (en bps, 1 bp = 0.01%):
+              </label>
+              <div style="display: flex; gap: 8px; align-items: center;">
+                <input type="number" name="alert_distance_bps"
+                       min="0" max="10000" step="1"
+                       value="${appSettings?.alert_distance_bps ?? 10}"
+                       style="flex: 1; padding: 8px; border: 1px solid var(--border); border-radius: 6px; font-size: 14px;">
+                <button type="submit" class="btn primary" style="padding: 8px 14px;">Guardar</button>
+              </div>
+              <div class="muted" style="font-size: 11px; margin-top: 6px;">
+                10 bps = 0.10% (target casi tocado). 100 bps = 1%.
+                Cambios persistidos en DB (no en Excel).
+              </div>
+            </div>
+          </form>
         </section>
 
         ${cfg && cfg.is_admin ? `
@@ -2750,6 +2837,20 @@ python yfinance_loader.py</pre>
       </div>
       ${inputField("Comisión", "Comisión", row["Comisión"], "number")}
       ${inputField("Strategy", "Strategy", row.Strategy, "text", { placeholder: "TRADING / BH / etc" })}
+      <div class="card compact" style="background:#F8FAFC; padding: 8px; margin: 8px 0; font-size: 12px;">
+        <div class="muted" style="margin-bottom: 4px;">🎯 Tesis del trade (opcional, solo BUY)</div>
+        <div class="field-row">
+          ${inputField("Precio Target (TP)", "Precio Target",
+                        row["Precio Target"], "number",
+                        { placeholder: "ej 0.85" })}
+          ${inputField("Stop Loss (SL)", "Stop Loss",
+                        row["Stop Loss"], "number",
+                        { placeholder: "ej 0.78" })}
+        </div>
+        ${selectField("Moneda Target", "Moneda Target",
+                       row["Moneda Target"], meta.currencies,
+                       { allowEmpty: true })}
+      </div>
       ${inputField("Description", "Description", row.Description)}
       ${inputField("Notes", "Notes", row.Notes)}
     `;
