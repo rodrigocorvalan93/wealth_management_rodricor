@@ -543,8 +543,12 @@
         <section>
           <a href="#/report" class="btn primary full">📄 Ver reporte completo</a>
           <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 8px;">
-            <a href="#/cash" class="btn ghost full">💵 Cash por cuenta</a>
+            <a href="#/holdings" class="btn ghost full">📋 Holdings</a>
+            <a href="#/cash" class="btn ghost full">💵 Cash</a>
+          </div>
+          <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 8px;">
             <a href="#/cotizaciones" class="btn ghost full">💹 Cotizaciones</a>
+            <a href="#/pasivos" class="btn ghost full">📉 Pasivos</a>
           </div>
         </section>
       </main>
@@ -874,8 +878,131 @@
   });
 
   // ====================================================================
-  // Maestros: especies
+  // /holdings — todas las tenencias desagregadas
   // ====================================================================
+  route("/holdings", async () => {
+    const data = await API.holdings(API.anchor());
+    const all = data.items || [];
+
+    // Filtros guardados en sessionStorage
+    const showCash = sessionStorage.getItem("hold_cash") !== "0";
+    const showLiab = sessionStorage.getItem("hold_liab") === "1";
+    const search = (sessionStorage.getItem("hold_search") || "").toLowerCase();
+
+    let items = all.slice();
+    if (!showCash) items = items.filter(h => !h.is_cash);
+    if (!showLiab) items = items.filter(h => !h.is_liability);
+    if (search) {
+      items = items.filter(h =>
+        (h.asset || "").toLowerCase().includes(search) ||
+        (h.account || "").toLowerCase().includes(search) ||
+        (h.asset_class || "").toLowerCase().includes(search) ||
+        (h.name || "").toLowerCase().includes(search)
+      );
+    }
+
+    // Sort desc por |mv_anchor|
+    items.sort((a, b) => Math.abs(b.mv_anchor || 0) - Math.abs(a.mv_anchor || 0));
+
+    const totalAbs = items.reduce(
+      (acc, h) => acc + Math.abs(h.mv_anchor || 0), 0
+    ) || 1;
+
+    return `
+      ${headerWithBack("📋 Holdings", "/")}
+      <main>
+        <div class="card compact" style="margin-bottom: 12px;">
+          <input type="search" id="holdSearch" placeholder="🔍 Buscar (ticker, cuenta, clase)..."
+                 value="${escapeHtml(search)}"
+                 style="width: 100%; padding: 10px; border: 1px solid var(--border); border-radius: 8px; font-size: 14px;">
+          <div style="display: flex; gap: 8px; margin-top: 8px; flex-wrap: wrap;">
+            <button class="btn ghost" style="padding: 6px 12px; font-size: 12px;"
+                    onclick="toggleHoldFilter('hold_cash', this)">
+              ${showCash ? "✓" : "✗"} Cash
+            </button>
+            <button class="btn ghost" style="padding: 6px 12px; font-size: 12px;"
+                    onclick="toggleHoldFilter('hold_liab', this)">
+              ${showLiab ? "✓" : "✗"} Pasivos
+            </button>
+            <span class="muted" style="font-size: 12px; align-self: center; margin-left: auto;">
+              ${items.length} de ${all.length}
+            </span>
+          </div>
+        </div>
+
+        ${items.length === 0 ? emptyState("Sin posiciones que matcheen", "Cambiá los filtros") :
+          `<div class="list">${items.map((h, idx) => {
+            const pct = (Math.abs(h.mv_anchor || 0) / totalAbs) * 100;
+            const isLiab = h.is_liability;
+            const isCash = h.is_cash;
+            const unr = h.unrealized_pnl_native;
+            const unrPct = h.unrealized_pct;
+            const tagBits = [];
+            if (isCash) tagBits.push('<span class="tag">cash</span>');
+            if (isLiab) tagBits.push('<span class="tag danger">deuda</span>');
+            if (!h.investible) tagBits.push('<span class="tag warn">no-inv</span>');
+            if (h.price_fallback) tagBits.push('<span class="tag warn">px*</span>');
+            return `
+              <div class="list-item" style="align-items: flex-start;">
+                <div class="meta">
+                  <div class="meta-line1">
+                    <span style="font-weight: 700;">#${idx + 1}</span>
+                    ${escapeHtml(h.asset)}
+                    ${tagBits.join(" ")}
+                  </div>
+                  <div class="meta-line2">
+                    ${escapeHtml(h.account)} · ${escapeHtml(h.asset_class || "?")}
+                    ${h.name && h.name !== h.asset ? ' · ' + escapeHtml(h.name) : ""}
+                  </div>
+                  <div class="meta-line2 tabular" style="margin-top: 4px;">
+                    ${fmt.money(h.qty, 4)} ${escapeHtml(h.native_currency)}
+                    ${!isCash ? `@ ${fmt.money(h.market_price, 4)}` : ""}
+                  </div>
+                </div>
+                <div class="right">
+                  <div class="amount tabular ${(h.mv_anchor || 0) < 0 ? 'negative' : ''}">${fmt.money(h.mv_anchor)}</div>
+                  <div class="sub muted">${escapeHtml(API.anchor())} · ${pct.toFixed(1)}%</div>
+                  ${(unr !== null && unr !== undefined && !isCash) ? `
+                    <div class="sub tabular ${unr > 0 ? 'positive' : unr < 0 ? 'negative' : ''}" style="margin-top:2px">
+                      ${unr > 0 ? '+' : ''}${fmt.money(unr, 0)} ${escapeHtml(h.native_currency)}
+                      ${unrPct !== null ? ` (${(unrPct * 100).toFixed(1)}%)` : ""}
+                    </div>
+                  ` : ""}
+                </div>
+              </div>
+            `;
+          }).join("")}</div>`
+        }
+
+        <div class="card compact muted" style="margin-top: 16px; font-size: 12px;">
+          Suma de |MV|: ${fmt.money(totalAbs)} ${escapeHtml(API.anchor())}.
+          Posiciones con <b>px*</b> tienen precio fallback (sin cotización
+          fresca). Subí precios con <code>python sync.py --skip-loaders</code>.
+        </div>
+      </main>
+    `;
+  });
+
+  window.toggleHoldFilter = function (key, btn) {
+    const cur = sessionStorage.getItem(key);
+    if (key === "hold_cash") {
+      // Default: SHOW. Toggle hides (set "0"); restore shows (set "1").
+      sessionStorage.setItem(key, cur === "0" ? "1" : "0");
+    } else {
+      // Default: HIDE. Toggle shows (set "1"); restore hides.
+      sessionStorage.setItem(key, cur === "1" ? "0" : "1");
+    }
+    render();
+  };
+
+  // Search debounced
+  document.addEventListener("input", (e) => {
+    if (e.target && e.target.id === "holdSearch") {
+      sessionStorage.setItem("hold_search", e.target.value);
+      clearTimeout(window._searchTimer);
+      window._searchTimer = setTimeout(() => render(), 300);
+    }
+  });
   route("/especies", async () => {
     const data = await API.listSheet("especies");
     const items = (data.items || []).filter(r => r.Ticker);
@@ -1381,7 +1508,8 @@ python yfinance_loader.py</pre>
         </section>
 
         <section>
-          <h2>Cotizaciones y cash</h2>
+          <h2>Tenencias y cotizaciones</h2>
+          <a href="#/holdings" class="btn ghost full" style="margin-bottom:6px">📋 Holdings (todas las posiciones)</a>
           <a href="#/cotizaciones" class="btn ghost full" style="margin-bottom:6px">💹 Cotizaciones (precios + FX)</a>
           <a href="#/cash" class="btn ghost full" style="margin-bottom:6px">💵 Cash por cuenta</a>
           <a href="#/pasivos" class="btn ghost full" style="margin-bottom:6px">📉 Pasivos</a>
