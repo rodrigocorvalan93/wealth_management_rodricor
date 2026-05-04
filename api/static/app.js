@@ -560,11 +560,14 @@
           is_admin: data.is_admin === "on" || data.is_admin === "1" || data.is_admin === true,
           token: "auto",
         });
-        // Mostrar el token al admin (única vez)
         const url = result.url || window.location.origin;
-        const msg = `User '${result.user_id}' creado!\n\nURL: ${url}\nToken:\n${result.token}\n\n` +
-                    `📋 Compartilo con el amigo por un canal seguro.\n\n` +
-                    `⚠ IMPORTANTE: copiá este snippet al WSGI file de PA:\n${result.wsgi_snippet}`;
+        let msg = `User '${result.user_id}' creado!\n\nURL: ${url}\nToken:\n${result.token}\n\n` +
+                  `📋 Compartilo con el amigo por un canal seguro.\n\n`;
+        if (result.persistent) {
+          msg += `✓ ${result.info}`;
+        } else {
+          msg += `⚠ ${result.warning}\n\n${result.wsgi_snippet || ""}`;
+        }
         alert(msg);
         invalidateMeta();
         navigate("/admin");
@@ -2444,6 +2447,19 @@
           Como admin podés <b>switch user</b> (read-only) para ver datos de otros,
           o crear/borrar usuarios.
         </div>
+
+        ${!list.persistent ? `
+          <div class="card warn" style="background:#FFF8E1; border-left: 4px solid var(--yellow); margin-top:12px; font-size: 13px;">
+            <b>⚠ WM_USERS_FILE no configurado</b>
+            <div style="margin-top: 4px;">
+              Los users que crees ahora <b>se pierden al próximo reload</b> del web app.
+              Para que se persistan automáticamente, agregá al WSGI file:
+              <pre style="background:#fff; padding:6px; margin-top: 6px; font-size: 11px; overflow-x: auto;">os.environ['WM_USERS_FILE'] = '/home/rodricor/wealth_management_rodricor/users.json'</pre>
+              Después reload del web app. La primera request crea el archivo
+              con los users actuales y a partir de ahí todo se persiste solo.
+            </div>
+          </div>
+        ` : ""}
 
         ${cfg.is_switched ? `
           <div class="card warn" style="background:#FFF8E1; border-left: 4px solid var(--yellow); margin-top:12px;">

@@ -1,8 +1,8 @@
-cat > .gitignore << 'EOF'
 # Secrets — NUNCA commitear
 secrets.txt
 .env
 .env.local
+users.json
 
 # Datos generados (privados)
 data/
@@ -47,4 +47,3 @@ logs/
 # Excepciones: SÍ subir los ejemplos
 !secrets.example.txt
 !tickers_ejemplo.txt
-EOF

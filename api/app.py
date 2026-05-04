@@ -74,7 +74,7 @@ from .users import (
     load_users, resolve_user_by_token, get_active_user,
     admin_switch_to, admin_switch_clear, is_switched,
     add_user_to_config, remove_user_from_config, export_users_json,
-    UserConfig,
+    is_persistent, UserConfig,
 )
 from .excel_io import (
     SHEET_PREFIX, MASTER_SHEETS, ALLOWED_SHEETS, is_master_sheet,
@@ -949,7 +949,6 @@ def create_app() -> Flask:
         """Lista todos los users (sin tokens completos, solo preview)."""
         _require_admin()
         users = load_users()
-        # Si hay folders sin user en config, también listamos
         config_ids = set(u.user_id for u in users)
         disk_ids = set(list_user_ids())
         orphans = disk_ids - config_ids
@@ -967,6 +966,7 @@ def create_app() -> Flask:
             ],
             "orphan_folders": sorted(orphans),
             "n_users": len(users),
+            "persistent": is_persistent(),
         })
 
     @app.post("/api/admin/users")
@@ -1044,20 +1044,29 @@ def create_app() -> Flask:
         add_user_to_config(user_id, token, display_name=display_name,
                             is_admin=is_admin)
 
-        return jsonify({
+        persistent = is_persistent()
+        response = {
             "created": True,
             "user_id": user_id,
             "display_name": display_name,
             "is_admin": is_admin,
             "token": token,
             "url": request.host_url.rstrip("/"),
-            "wsgi_snippet": _build_wsgi_snippet(),
             "import_stats": import_stats,
-            "warning": ("Para que el user persista a través de reloads del web "
-                        "app, copiá el snippet de wsgi_snippet al WSGI file de "
-                        "PythonAnywhere. Mientras tanto, el user funciona en "
-                        "memoria del server."),
-        }), 201
+            "persistent": persistent,
+        }
+        if persistent:
+            response["info"] = ("✓ User guardado en disk (WM_USERS_FILE). "
+                                 "Sobrevive reloads sin tocar el WSGI.")
+        else:
+            response["wsgi_snippet"] = _build_wsgi_snippet()
+            response["warning"] = (
+                "⚠ Para que el user persista a reloads, agregá WM_USERS_FILE "
+                "al WSGI (ver MULTITENANT.md). Mientras tanto, el user vive "
+                "solo en memoria del server. Como workaround inmediato, copiá "
+                "el snippet de wsgi_snippet al WSGI file."
+            )
+        return jsonify(response), 201
 
     def _blank_event_sheets(xlsx_path):
         """Borra las filas de DATOS (no headers) de las hojas de eventos del
