@@ -11,3 +11,6 @@ openpyxl>=3.1
 
 # Loader US (Yahoo Finance)
 yfinance>=0.2.40
+
+# API backend (Fase 2: Flask wrapper para PythonAnywhere)
+flask>=3.0

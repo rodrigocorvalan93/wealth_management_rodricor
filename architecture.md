@@ -26,9 +26,12 @@ event (un trade, un gasto, una transferencia)
 ### Maestros
 
 ```sql
-currencies   (code, name, is_stable, quote_vs, is_base)
-accounts     (code, name, kind, currency, card_close_day, card_due_day, ...)
-assets       (ticker, name, asset_class, currency, issuer, ...)
+currencies     (code, name, is_stable, quote_vs, is_base)
+accounts       (code, name, kind, currency, card_close_day, card_due_day,
+                investible, cash_purpose, ...)
+assets         (ticker, name, asset_class, currency, issuer, ...)
+aforos         (scope_type, scope_value, aforo_pct, source)        -- BYMA
+margin_config  (account, mult_overnight, mult_intraday, funding_rate_annual)
 ```
 
 ### Ledger
@@ -42,9 +45,13 @@ movements  (movement_id, event_id, account, asset, qty,
 ### Series temporales
 
 ```sql
-fx_rates   (fecha, moneda, rate, base, source)
-prices     (fecha, ticker, price, currency, source)
+fx_rates      (fecha, moneda, rate, base, source)
+prices        (fecha, ticker, price, currency, source)
+pn_snapshots  (fecha, account, anchor_currency, mv_anchor, investible_only)
 ```
+
+`pn_snapshots`: foto del PN por cuenta + total + total invertible. Append-only,
+una entrada por cada corrida del reporte. Genera la equity curve.
 
 ## Tipos de eventos
 
@@ -185,6 +192,29 @@ SELECT * FROM v_movements_full;
 -- Solo movimientos de tarjetas
 SELECT * FROM v_card_ledger;
 ```
+
+## Módulos extra
+
+- `engine/trade_stats.py` — métricas de trading (winrate, profit factor,
+  expectancy, drawdowns por moneda) sobre los fills de PnL realizado.
+- `engine/snapshots.py` — record/query de snapshots históricos para construir
+  la equity curve por cuenta y total.
+- `engine/buying_power.py` — poder de compra:
+  - **BYMA / Cocos / Eco**: aforo por instrumento × MV → garantía.
+    Tabla `aforos`, override por ticker > class > defaults hardcodeados.
+  - **IBKR / margin**: multiplier × equity (RegT estándar x2 ON / x4 ID).
+    Tabla `margin_config`, parámetros configurables por cuenta.
+    Verificá los valores reales con tu broker.
+
+## Filtros invertible (Sprint B)
+
+Las cuentas tienen flag `investible` (0/1) y `cash_purpose` (texto libre).
+- Cuentas técnicas (`external_*`, `opening_balance`, `interest_*`) se fuerzan
+  a `investible=0`.
+- El usuario puede marcar `cash_reserva` como no-invertible si tiene cash
+  pendiente de blanqueo.
+- `total_pn()` expone `total_anchor`, `total_investible` y `total_non_investible`.
+- Reportes muestran 3 KPIs y un panel de "Cash por propósito".
 
 ## Decisiones de diseño
 

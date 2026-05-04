@@ -199,69 +199,85 @@ def hoja_cuentas(wb):
     style_banner(
         ws, "CUENTAS",
         ("Cuentas en bancos, brokers, wallets cripto, y tarjetas de crédito. "
-         "Para tarjetas, completá los días de cierre y vencimiento."),
-        10,
+         "Para tarjetas, completá los días de cierre y vencimiento. "
+         "'Investible' = NO excluye la cuenta del 'PN invertible' (ej cash de reserva no declarado)."),
+        12,
     )
 
     headers = [
         "Code", "Name", "Kind", "Institution", "Currency",
-        "Card Cycle", "Close Day", "Due Day", "Card Currency", "Notes"
+        "Card Cycle", "Close Day", "Due Day", "Card Currency",
+        "Investible", "Cash Purpose", "Notes"
     ]
     style_headers(ws, headers, header_row=4)
-    set_widths(ws, [22, 26, 14, 18, 10, 12, 10, 10, 12, 30])
+    set_widths(ws, [22, 26, 14, 18, 10, 12, 10, 10, 12, 11, 22, 30])
 
+    # Cada fila: (code, name, kind, institution, currency, cycle, close, due,
+    #             card_ccy, investible, cash_purpose, notes)
     examples = [
         ("cocos",            "Cocos Capital",          "CASH_BROKER",
-         "Cocos Capital",    "ARS", "NONE", None, None, None, "Broker principal"),
+         "Cocos Capital",    "ARS", "NONE", None, None, None,
+         "YES", "OPERATIVO", "Broker principal"),
         ("eco",              "Eco Valores",            "CASH_BROKER",
-         "Eco Valores",      "ARS", "NONE", None, None, None, "Trading"),
+         "Eco Valores",      "ARS", "NONE", None, None, None,
+         "YES", "OPERATIVO", "Trading"),
         ("delta_fci",        "Delta FCI",              "CASH_BROKER",
-         "Delta AM",         "ARS", "NONE", None, None, None, "FCIs Delta"),
+         "Delta AM",         "ARS", "NONE", None, None, None,
+         "YES", "OPERATIVO", "FCIs Delta"),
+        ("ibkr",             "Interactive Brokers",    "CASH_BROKER",
+         "Interactive Brokers","USD","NONE", None, None, None,
+         "YES", "OPERATIVO", "Cuenta margen RegT (verificar parámetros reales)"),
         ("galicia_caja_ars", "Banco Galicia ARS",      "CASH_BANK",
-         "Banco Galicia",    "ARS", "NONE", None, None, None, "Caja ahorro ARS"),
+         "Banco Galicia",    "ARS", "NONE", None, None, None,
+         "YES", "OPERATIVO", "Caja ahorro ARS"),
         ("galicia_caja_usd", "Banco Galicia USD",      "CASH_BANK",
-         "Banco Galicia",    "USD", "NONE", None, None, None, "Caja ahorro USD"),
+         "Banco Galicia",    "USD", "NONE", None, None, None,
+         "YES", "OPERATIVO", "Caja ahorro USD"),
         ("santander_ars",    "Banco Santander ARS",    "CASH_BANK",
-         "Santander",        "ARS", "NONE", None, None, None, ""),
+         "Santander",        "ARS", "NONE", None, None, None,
+         "YES", "OPERATIVO", ""),
         ("binance",          "Binance Wallet",         "CASH_WALLET",
-         "Binance",          None,  "NONE", None, None, None, "Wallet cripto"),
+         "Binance",          None,  "NONE", None, None, None,
+         "YES", "OPERATIVO", "Wallet cripto"),
         ("cash_transac",     "Cash transaccional",     "CASH_PHYSICAL",
-         "Personal",         "ARS", "NONE", None, None, None, "Efectivo del día a día"),
-        ("cash_reserva",     "Cash reserva",           "CASH_PHYSICAL",
-         "Personal",         "ARS", "NONE", None, None, None, "Caja fuerte / ahorro"),
+         "Personal",         "ARS", "NONE", None, None, None,
+         "YES", "OPERATIVO", "Efectivo del día a día"),
+        ("cash_reserva",     "Cash reserva (no decl.)","CASH_PHYSICAL",
+         "Personal",         "ARS", "NONE", None, None, None,
+         "NO",  "RESERVA_NO_DECLARADO",
+         "Cash NO declarado: excluido del PN invertible"),
         ("galicia_visa_ars", "Galicia Visa ARS",       "CARD_CREDIT",
-         "Banco Galicia",    None,  "MONTHLY", 28, 10, "ARS", "Cierra día 28"),
+         "Banco Galicia",    None,  "MONTHLY", 28, 10, "ARS",
+         "YES", None, "Cierra día 28"),
         ("galicia_visa_usd", "Galicia Visa USD",       "CARD_CREDIT",
-         "Banco Galicia",    None,  "MONTHLY", 28, 10, "USD", "Compras en USD"),
-        # Cuentas técnicas (auto-generadas pero las dejamos visibles para claridad)
+         "Banco Galicia",    None,  "MONTHLY", 28, 10, "USD",
+         "YES", None, "Compras en USD"),
+        # Cuentas técnicas (no-invertibles)
         ("external_income",  "[Ext] Ingresos externos","EXTERNAL",
          None,               None,  "NONE", None, None, None,
-         "Contracuenta de ingresos (sueldos, etc)"),
+         "NO",  None, "Contracuenta de ingresos (sueldos, etc)"),
         ("external_expense", "[Ext] Gastos externos",  "EXTERNAL",
          None,               None,  "NONE", None, None, None,
-         "Contracuenta de gastos"),
+         "NO",  None, "Contracuenta de gastos"),
         ("opening_balance",  "[Sys] Saldo inicial",    "OPENING_BALANCE",
          None,               None,  "NONE", None, None, None,
-         "Contracuenta del asiento de apertura"),
+         "NO",  None, "Contracuenta del asiento de apertura"),
         ("interest_expense", "[Rdo] Intereses pagados","INTEREST_EXPENSE",
          None,               None,  "NONE", None, None, None,
-         "Cuenta de resultado por intereses"),
+         "NO",  None, "Cuenta de resultado por intereses"),
         ("interest_income",  "[Rdo] Intereses cobrados","INTEREST_INCOME",
          None,               None,  "NONE", None, None, None,
-         "Cuenta de resultado por intereses cobrados"),
+         "NO",  None, "Cuenta de resultado por intereses cobrados"),
     ]
     for i, row in enumerate(examples, start=5):
         for j, val in enumerate(row, start=1):
             cell = ws.cell(row=i, column=j, value=val)
-            if j in (1, 2, 3, 4, 5, 6, 7, 8, 9):
-                if val is not None:
-                    style_input_cell(cell)
-                else:
-                    cell.font = FONT_NORMAL
+            if j <= 11 and val is not None:
+                style_input_cell(cell)
             else:
                 cell.font = FONT_NORMAL
 
-    # Validaciones: Kind y Card Cycle
+    # Validaciones: Kind, Card Cycle, Investible
     kinds = ("CASH_BANK,CASH_BROKER,CASH_WALLET,CASH_PHYSICAL,CARD_CREDIT,"
              "LIABILITY,EXTERNAL,OPENING_BALANCE,INTEREST_EXPENSE,INTEREST_INCOME")
     dv_kind = DataValidation(type="list", formula1=f'"{kinds}"', allow_blank=False)
@@ -272,8 +288,96 @@ def hoja_cuentas(wb):
     dv_cycle.add(f"F5:F200")
     ws.add_data_validation(dv_cycle)
 
+    dv_inv = DataValidation(type="list", formula1='"YES,NO"', allow_blank=True)
+    dv_inv.add(f"J5:J200")
+    ws.add_data_validation(dv_inv)
+
     add_freeze(ws, 4)
-    add_filter(ws, 4, 10, last_row=200)
+    add_filter(ws, 4, 12, last_row=200)
+    return ws
+
+
+def hoja_aforos(wb):
+    """Hoja de aforos BYMA para garantías de caución."""
+    ws = wb.create_sheet("aforos")
+    style_banner(
+        ws, "AFOROS BYMA — Garantías de caución",
+        ("Aforo = % del valor de mercado aceptado como GARANTÍA por BYMA. "
+         "Define cuánto poder de compra ganás dejando el activo como margen. "
+         "Scope Type='CLASS' aplica a todo el asset_class; 'TICKER' override por instrumento."),
+        5,
+    )
+    headers = ["Scope Type", "Scope Value", "Aforo %", "Source", "Notes"]
+    style_headers(ws, headers, header_row=4)
+    set_widths(ws, [12, 22, 12, 14, 50])
+
+    # Defaults aproximados — usuario debe verificar con tabla BYMA vigente.
+    examples = [
+        ("CLASS", "BOND_AR",    0.85, "BYMA approx", "Bonos soberanos AR (AL30, GD30, BPC...)"),
+        ("CLASS", "EQUITY_AR",  0.70, "BYMA approx", "Acciones líderes Merval"),
+        ("CLASS", "EQUITY_US",  0.70, "BYMA approx", "CEDEARs"),
+        ("CLASS", "FCI",        0.90, "BYMA approx", "FCIs Money Market"),
+        ("CLASS", "STABLECOIN", 0.50, "manual",      "USDT/USDC — no típicamente aceptado"),
+        ("CLASS", "CRYPTO",     0.00, "manual",      "Cripto NO aceptado"),
+        ("CLASS", "DERIVATIVE", 0.00, "BYMA",        "Derivados no garantizan"),
+        # Overrides por ticker (ejemplo)
+        ("TICKER", "AL30D",     0.90, "BYMA",        "Bono soberano USD-MEP, alto aforo"),
+        ("TICKER", "GD30D",     0.90, "BYMA",        "Bono soberano USD-MEP"),
+    ]
+    for i, row in enumerate(examples, start=5):
+        for j, val in enumerate(row, start=1):
+            cell = ws.cell(row=i, column=j, value=val)
+            if val is not None:
+                style_input_cell(cell)
+            else:
+                cell.font = FONT_NORMAL
+            if j == 3:
+                cell.number_format = "0.00%"
+
+    dv_scope = DataValidation(type="list", formula1='"CLASS,TICKER"', allow_blank=False)
+    dv_scope.add("A5:A500")
+    ws.add_data_validation(dv_scope)
+
+    add_freeze(ws, 4)
+    add_filter(ws, 4, 5, last_row=500)
+    return ws
+
+
+def hoja_margin_config(wb):
+    """Hoja de configuración de margin/leverage por cuenta (IBKR, etc)."""
+    ws = wb.create_sheet("margin_config")
+    style_banner(
+        ws, "MARGIN CONFIG (IBKR, etc)",
+        ("Configuración de leverage por cuenta para cuentas con margin estilo "
+         "RegT (Reg-T en IBKR: x2 overnight, x4 intraday day-trade). "
+         "VERIFICÁ los multiplicadores y la tasa de fondeo reales con tu broker. "
+         "Cocos/Eco usan la hoja 'aforos' (BYMA), no esta."),
+        6,
+    )
+
+    headers = ["Account", "Mult. Overnight", "Mult. Intraday",
+               "Funding Rate Annual", "Funding Currency", "Notes"]
+    style_headers(ws, headers, header_row=4)
+    set_widths(ws, [22, 16, 16, 18, 14, 40])
+
+    examples = [
+        ("ibkr", 2.0, 4.0, 0.06, "USD",
+         "RegT estándar: 50% margin overnight, 25% intraday. Funding ~6% anual USD aprox — verificar."),
+    ]
+    for i, row in enumerate(examples, start=5):
+        for j, val in enumerate(row, start=1):
+            cell = ws.cell(row=i, column=j, value=val)
+            if val is not None:
+                style_input_cell(cell)
+            else:
+                cell.font = FONT_NORMAL
+            if j in (2, 3):
+                cell.number_format = "0.00"
+            elif j == 4:
+                cell.number_format = "0.00%"
+
+    add_freeze(ws, 4)
+    add_filter(ws, 4, 6, last_row=200)
     return ws
 
 
@@ -461,14 +565,14 @@ def hoja_funding(wb):
 
     headers = ["Fund ID", "Tipo", "Subtipo", "Cuenta", "Fecha Inicio",
                "Fecha Fin", "Moneda", "Monto", "TNA", "Días",
-               "Status", "Description", "Notes"]
+               "Status", "Linked Trade ID", "Description", "Notes"]
     style_headers(ws, headers, header_row=4)
-    set_widths(ws, [12, 10, 12, 18, 12, 12, 10, 16, 10, 8, 12, 25, 25])
+    set_widths(ws, [12, 10, 12, 18, 12, 12, 10, 16, 10, 8, 12, 16, 25, 25])
 
     examples = [
         ("F0001", "TOMA", "CAUCION", "cocos", date(2026, 4, 30),
          date(2026, 5, 4), "ARS", 200000000, 0.24,
-         "=IF(F5=\"\",\"\",F5-E5)", "OPEN",
+         "=IF(F5=\"\",\"\",F5-E5)", "OPEN", "T0001-A",
          "Caución TOMA cubre TXMJ9", "4 días"),
     ]
     for i, row in enumerate(examples, start=5):
@@ -501,7 +605,7 @@ def hoja_funding(wb):
     ws.add_data_validation(dv_status)
 
     add_freeze(ws, 4)
-    add_filter(ws, 4, 13, last_row=2000)
+    add_filter(ws, 4, 14, last_row=2000)
     return ws
 
 
@@ -762,25 +866,30 @@ def hoja_index(wb):
         (1, "config",          "Parámetros generales", "Una vez al inicio"),
         (2, "monedas",         "Monedas y stablecoins (ARS, USD, USB, USDT, BTC...)",
          "Una vez al inicio"),
-        (3, "cuentas",         "Brokers, bancos, wallets, tarjetas", "Una vez al inicio"),
+        (3, "cuentas",         "Brokers, bancos, wallets, tarjetas (incluye flag Investible)",
+         "Una vez al inicio"),
         (4, "especies",        "Master de instrumentos (bonos, acciones, FCI, cripto)",
          "Antes de cada nuevo ticker"),
-        (5, "blotter",         "Trades de activos (BUY/SELL)", "Cada operación"),
-        (6, "transferencias_activos",  "Movimiento de activos entre cuentas (sin PnL)",
+        (5, "aforos",          "Aforos BYMA para cálculo de poder de compra (Cocos/Eco)",
+         "Setup + cuando cambia BYMA"),
+        (6, "margin_config",   "Margin/leverage por cuenta (IBKR x2/x4 + fondeo)",
+         "Setup por cuenta"),
+        (7, "blotter",         "Trades de activos (BUY/SELL)", "Cada operación"),
+        (8, "transferencias_activos",  "Movimiento de activos entre cuentas (sin PnL)",
          "Cuando movés"),
-        (7, "transferencias_cash",     "Movimiento de cash entre cuentas (sin PnL)",
+        (9, "transferencias_cash",     "Movimiento de cash entre cuentas (sin PnL)",
          "Cuando transferís"),
-        (8, "funding",         "Cauciones, pases, préstamos de corto plazo",
+        (10, "funding",         "Cauciones, pases, préstamos de corto plazo (con Linked Trade ID)",
          "Cada operación"),
-        (9, "ingresos",        "Sueldos, dividendos, cupones, premios",
+        (11, "ingresos",        "Sueldos, dividendos, cupones, premios",
          "Cuando cobrás"),
-        (10, "gastos",         "Gastos del mes (cash o tarjeta)", "Cuando ocurre"),
-        (11, "pasivos",        "Préstamos personales, hipoteca", "Una vez por pasivo"),
-        (12, "pagos_pasivos",  "Cuotas de préstamos, cancelación tarjetas",
+        (12, "gastos",         "Gastos del mes (cash o tarjeta)", "Cuando ocurre"),
+        (13, "pasivos",        "Préstamos personales, hipoteca", "Una vez por pasivo"),
+        (14, "pagos_pasivos",  "Cuotas de préstamos, cancelación tarjetas",
          "En cada pago"),
-        (13, "recurrentes",    "Sueldo/alquiler/servicios — auto-repetición",
+        (15, "recurrentes",    "Sueldo/alquiler/servicios — auto-repetición",
          "Una vez por concepto"),
-        (14, "asientos_contables", "Asientos manuales: apertura, previsiones, ajustes",
+        (16, "asientos_contables", "Asientos manuales: apertura, previsiones, ajustes",
          "Cuando aplique"),
     ]
     for i, (n, hoja, qparahace, cuando) in enumerate(rows, start=5):
@@ -817,6 +926,8 @@ def build_master(output_path: Path):
     hoja_monedas(wb)
     hoja_cuentas(wb)
     hoja_especies(wb)
+    hoja_aforos(wb)
+    hoja_margin_config(wb)
     hoja_blotter(wb)
     hoja_transferencias_cash(wb)
     hoja_transferencias_activos(wb)

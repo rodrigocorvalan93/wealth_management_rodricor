@@ -133,25 +133,243 @@ def import_monedas(conn, ws):
 
 
 def import_cuentas(conn, ws):
-    """Hoja 'cuentas': popula tabla accounts."""
+    """Hoja 'cuentas': popula tabla accounts.
+
+    Columnas opcionales (Sprint B):
+      - 'Investible': YES/NO/1/0 (default YES). Si NO, se excluye del
+        "PN invertible" en reportes (ej cash de reserva no declarado).
+      - 'Cash Purpose': texto libre ('OPERATIVO','RESERVA_NO_DECLARADO',...).
+    """
     n = 0
     for r, row in _read_rows(ws):
         code = _to_str(row.get("Code"))
         if not code:
             continue
+
+        # Investible: por default 1 (cuentas reales son invertibles).
+        # Las cuentas técnicas (external_*, opening_balance, interest_*)
+        # se marcan como 0 automáticamente abajo.
+        investible_raw = _to_str(row.get("Investible"))
+        if investible_raw is None:
+            investible = 1
+        else:
+            investible = 1 if investible_raw.upper() in ("YES", "Y", "1", "TRUE", "SI", "SÍ") else 0
+
+        # Cuentas técnicas siempre no-invertibles
+        kind = _to_str(row.get("Kind")) or AccountKind.CASH_BANK
+        if kind in (AccountKind.EXTERNAL, AccountKind.OPENING_BALANCE,
+                    AccountKind.INTEREST_EXPENSE, AccountKind.INTEREST_INCOME):
+            investible = 0
+
         insert_account(
             conn,
             code=code,
             name=_to_str(row.get("Name")) or code,
-            kind=_to_str(row.get("Kind")) or AccountKind.CASH_BANK,
+            kind=kind,
             institution=_to_str(row.get("Institution")),
             currency=_to_str(row.get("Currency")),
             card_cycle_kind=_to_str(row.get("Card Cycle")) or "NONE",
             card_close_day=_to_int(row.get("Close Day")),
             card_due_day=_to_int(row.get("Due Day")),
             card_currency=_to_str(row.get("Card Currency")),
+            investible=investible,
+            cash_purpose=_to_str(row.get("Cash Purpose")),
             notes=_to_str(row.get("Notes")),
         )
+        n += 1
+    return n
+
+
+def import_aforos(conn, ws):
+    """Hoja 'aforos': aforos BYMA por asset_class y/o ticker.
+
+    Columnas: Scope Type ('CLASS'|'TICKER'), Scope Value, Aforo %,
+              Source, Notes.
+
+    Aforo % se acepta como 0..1 (0.85) o 0..100 (85) — se normaliza.
+    """
+    from .schema import insert_aforo
+    n = 0
+    for r, row in _read_rows(ws):
+        scope_type = _to_str(row.get("Scope Type"))
+        scope_value = _to_str(row.get("Scope Value"))
+        aforo_pct = _to_float(row.get("Aforo %"))
+        if not all([scope_type, scope_value]) or aforo_pct is None:
+            continue
+        if scope_type not in ("CLASS", "TICKER"):
+            continue
+        # Normalizar: si es > 1.5, asumimos que vino como porcentaje (ej 85.0)
+        if aforo_pct > 1.5:
+            aforo_pct = aforo_pct / 100.0
+        if aforo_pct < 0 or aforo_pct > 1:
+            continue
+        insert_aforo(
+            conn, scope_type=scope_type, scope_value=scope_value,
+            aforo_pct=aforo_pct,
+            source=_to_str(row.get("Source")),
+            notes=_to_str(row.get("Notes")),
+        )
+        n += 1
+    return n
+
+
+def import_margin_config(conn, ws):
+    """Hoja 'margin_config': configuración de leverage por cuenta (IBKR, etc).
+
+    Columnas: Account, Mult. Overnight, Mult. Intraday,
+              Funding Rate Annual, Funding Currency, Notes.
+    """
+    from .schema import insert_margin_config
+    n = 0
+    for r, row in _read_rows(ws):
+        account = _to_str(row.get("Account"))
+        if not account:
+            continue
+        mult_o = _to_float(row.get("Mult. Overnight")) or 1.0
+        mult_i = _to_float(row.get("Mult. Intraday")) or mult_o
+        funding = _to_float(row.get("Funding Rate Annual")) or 0.0
+        # Aceptar 6.0 como 6% o 0.06 como 6%
+        if funding > 1.5:
+            funding = funding / 100.0
+        insert_margin_config(
+            conn, account=account,
+            multiplier_overnight=mult_o,
+            multiplier_intraday=mult_i,
+            funding_rate_annual=funding,
+            funding_currency=_to_str(row.get("Funding Currency")),
+            notes=_to_str(row.get("Notes")),
+        )
+        n += 1
+    return n
+
+
+def import_funding(conn, ws):
+    """Hoja 'funding': cauciones, pases, préstamos de corto plazo.
+
+    Cada fila genera:
+      - 1 evento FUNDING_OPEN al iniciar (cash + sobre la cuenta)
+      - Si Status='CLOSED': 1 evento FUNDING_CLOSE al cerrar (con interés)
+
+    TOMA: TOMA dinero (recibo cash, debo capital + interés).
+    COLOCA: COLOCO dinero (entrego cash, cobro capital + interés).
+
+    Sprint E: Si tiene 'Linked Trade ID', se usa para vincular costo/ingreso
+    de funding al trade (visible en reportes de leverage).
+    """
+    n = 0
+    for r, row in _read_rows(ws):
+        fund_id = _to_str(row.get("Fund ID"))
+        tipo = _to_str(row.get("Tipo"))            # TOMA | COLOCA
+        subtipo = _to_str(row.get("Subtipo"))      # CAUCION, PASE, PRESTAMO_*
+        cuenta = _to_str(row.get("Cuenta"))
+        f_inicio = _to_date_str(row.get("Fecha Inicio"))
+        f_fin = _to_date_str(row.get("Fecha Fin"))
+        moneda = _to_str(row.get("Moneda"))
+        monto = _to_float(row.get("Monto"))
+        tna = _to_float(row.get("TNA")) or 0.0
+        # 'Días' puede venir como fórmula evaluada por openpyxl con data_only=True
+        dias = _to_int(row.get("Días"))
+        if dias is None and f_inicio and f_fin:
+            try:
+                dias = (date.fromisoformat(f_fin) - date.fromisoformat(f_inicio)).days
+            except (ValueError, TypeError):
+                dias = 0
+        dias = dias or 0
+        status = _to_str(row.get("Status")) or "OPEN"
+        linked_trade_id = _to_str(row.get("Linked Trade ID"))
+        description = _to_str(row.get("Description")) or f"{tipo} {subtipo} {monto} {moneda}"
+
+        if not all([fund_id, tipo, cuenta, f_inicio, moneda, monto]):
+            continue
+        if tipo not in ("TOMA", "COLOCA"):
+            continue
+
+        # Normalizar TNA: si vino como 24 (asumimos %), convertir a 0.24
+        if tna > 1.5:
+            tna = tna / 100.0
+
+        # FUNDING_OPEN
+        sign_cash = 1 if tipo == "TOMA" else -1   # TOMA: gano cash; COLOCA: pierdo cash
+        eid_open = insert_event(
+            conn, EventType.FUNDING_OPEN,
+            event_date=f_inicio,
+            description=f"OPEN {description}",
+            external_id=fund_id,
+            source_row=r, source_sheet="funding",
+            notes=(f"Linked Trade: {linked_trade_id}"
+                   if linked_trade_id else None),
+        )
+        # Cash entra/sale de la cuenta
+        insert_movement(
+            conn, eid_open, account=cuenta, asset=moneda,
+            qty=sign_cash * monto,
+            notes=f"{tipo} {subtipo} {fund_id}",
+        )
+        # Contracuenta: deuda/colocación. Usamos external_income/expense como neutralizador
+        # (modelo simple — la "pata" del pasivo se materializa al cierre con interés).
+        insert_movement(
+            conn, eid_open,
+            account=("external_expense" if tipo == "TOMA" else "external_income"),
+            asset=moneda,
+            qty=-sign_cash * monto,
+            notes=f"Contracuenta {tipo} {fund_id}",
+        )
+
+        # FUNDING_CLOSE: solo si status CLOSED y tenemos fecha fin
+        if status == "CLOSED" and f_fin:
+            interes = monto * tna * (dias / 365.0) if dias > 0 else 0.0
+            # TOMA cierro: pago monto + interés (cash sale)
+            # COLOCA cierro: recibo monto + interés (cash entra)
+            sign_close = -sign_cash
+            eid_close = insert_event(
+                conn, EventType.FUNDING_CLOSE,
+                event_date=f_fin,
+                description=f"CLOSE {description} (int {interes:.2f})",
+                external_id=fund_id,
+                parent_event_id=eid_open,
+                source_row=r, source_sheet="funding",
+                notes=(f"Linked Trade: {linked_trade_id}"
+                       if linked_trade_id else None),
+            )
+            # Capital de vuelta
+            insert_movement(
+                conn, eid_close, account=cuenta, asset=moneda,
+                qty=sign_close * monto,
+                notes=f"Capital {fund_id}",
+            )
+            insert_movement(
+                conn, eid_close,
+                account=("external_income" if tipo == "TOMA" else "external_expense"),
+                asset=moneda,
+                qty=-sign_close * monto,
+                notes=f"Cancelación capital {fund_id}",
+            )
+            # Interés (si hay)
+            if abs(interes) > 1e-9:
+                if tipo == "TOMA":
+                    # TOMA: pago interés → sale cash, va a interest_expense
+                    insert_movement(
+                        conn, eid_close, account=cuenta, asset=moneda,
+                        qty=-interes,
+                        notes=f"Interés pagado {fund_id} ({tna*100:.2f}% × {dias}d)",
+                    )
+                    insert_movement(
+                        conn, eid_close, account="interest_expense", asset=moneda,
+                        qty=interes,
+                        notes=f"Interés caución {fund_id}",
+                    )
+                else:
+                    # COLOCA: cobro interés → entra cash, va a interest_income
+                    insert_movement(
+                        conn, eid_close, account=cuenta, asset=moneda,
+                        qty=interes,
+                        notes=f"Interés cobrado {fund_id} ({tna*100:.2f}% × {dias}d)",
+                    )
+                    insert_movement(
+                        conn, eid_close, account="interest_income", asset=moneda,
+                        qty=-interes,
+                        notes=f"Interés caución {fund_id}",
+                    )
         n += 1
     return n
 
@@ -699,6 +917,10 @@ def import_all(db_path: str | Path, xlsx_path: str | Path,
         stats["cuentas"] = import_cuentas(conn, wb["cuentas"])
     if "especies" in wb.sheetnames:
         stats["especies"] = import_especies(conn, wb["especies"])
+    if "aforos" in wb.sheetnames:
+        stats["aforos"] = import_aforos(conn, wb["aforos"])
+    if "margin_config" in wb.sheetnames:
+        stats["margin_config"] = import_margin_config(conn, wb["margin_config"])
 
     conn.commit()
 
@@ -734,6 +956,8 @@ def import_all(db_path: str | Path, xlsx_path: str | Path,
         stats["pagos_pasivos"] = import_pagos_pasivos(conn, wb["pagos_pasivos"])
     if "asientos_contables" in wb.sheetnames:
         stats["asientos_contables"] = import_asientos(conn, wb["asientos_contables"])
+    if "funding" in wb.sheetnames:
+        stats["funding"] = import_funding(conn, wb["funding"])
 
     conn.commit()
     conn.close()

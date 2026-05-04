@@ -53,6 +53,31 @@ def _load_currencies(conn):
     return set(r["code"] for r in cur.fetchall())
 
 
+def _load_account_meta(conn):
+    """Devuelve dict {code: {investible, cash_purpose, kind}} desde accounts."""
+    out = {}
+    try:
+        cur = conn.execute(
+            "SELECT code, kind, investible, cash_purpose FROM accounts"
+        )
+        for r in cur.fetchall():
+            out[r["code"]] = {
+                "kind": r["kind"],
+                "investible": bool(r["investible"]),
+                "cash_purpose": r["cash_purpose"],
+            }
+    except Exception:
+        # Schema viejo sin las columnas — degradar a defaults
+        cur = conn.execute("SELECT code, kind FROM accounts")
+        for r in cur.fetchall():
+            out[r["code"]] = {
+                "kind": r["kind"],
+                "investible": True,
+                "cash_purpose": None,
+            }
+    return out
+
+
 def _load_asset_map(conn):
     """Devuelve dict {ticker: {currency, asset_class, name}}."""
     out = {}
@@ -189,6 +214,7 @@ def calculate_holdings(conn, fecha=None, anchor_currency="USD"):
     currencies_set = _load_currencies(conn)
     asset_map = _load_asset_map(conn)
     assets_set = set(asset_map.keys())
+    account_meta = _load_account_meta(conn)
 
     # Encontrar todas las (cuenta, activo) que tengan al menos un movement
     cur = conn.execute(
@@ -278,6 +304,7 @@ def calculate_holdings(conn, fecha=None, anchor_currency="USD"):
             conn, mv_native, native_ccy, anchor_currency, fecha
         )
 
+        meta = account_meta.get(account, {"investible": True, "cash_purpose": None, "kind": None})
         holdings.append({
             "account": account,
             "asset": asset,
@@ -299,6 +326,9 @@ def calculate_holdings(conn, fecha=None, anchor_currency="USD"):
             "unrealized_pnl_native": unrealized_pnl_native,
             "unrealized_pct": unrealized_pct,
             "is_cash": is_cash,
+            "investible": meta["investible"],
+            "cash_purpose": meta["cash_purpose"],
+            "account_kind": meta["kind"],
         })
 
     # Ordenar por mv_anchor desc (los más grandes primero)
@@ -313,21 +343,31 @@ def total_pn(holdings, anchor_currency="USD"):
 
     Devuelve dict:
         {
-            total_anchor: float,
-            total_anchor_ok: float,        # solo lo que pudo convertir
-            total_unconverted_count: int,  # posiciones sin FX
+            total_anchor: float,            # PN total (incluye no-invertibles)
+            total_investible: float,        # PN solo cuentas invertibles
+            total_non_investible: float,    # PN cuentas excluidas
+            total_anchor_ok: float,         # alias compat
+            total_unconverted_count: int,   # posiciones sin FX
             unconverted: [(asset, native_ccy, mv_native), ...],
         }
     """
     total = 0.0
+    total_inv = 0.0
+    total_non_inv = 0.0
     unconverted = []
     for h in holdings:
         if h["mv_anchor_ok"] and h["mv_anchor"] is not None:
             total += h["mv_anchor"]
+            if h.get("investible", True):
+                total_inv += h["mv_anchor"]
+            else:
+                total_non_inv += h["mv_anchor"]
         else:
             unconverted.append((h["asset"], h["native_currency"], h["mv_native"]))
     return {
         "total_anchor": total,
+        "total_investible": total_inv,
+        "total_non_investible": total_non_inv,
         "total_anchor_ok": total,
         "anchor_currency": anchor_currency,
         "total_unconverted_count": len(unconverted),
@@ -364,4 +404,41 @@ def by_currency(holdings):
             continue
         ccy = h["native_currency"]
         out[ccy] = out.get(ccy, 0.0) + h["mv_anchor"]
+    return dict(sorted(out.items(), key=lambda kv: -kv[1]))
+
+
+# =============================================================================
+# Filtros invertible (Sprint B)
+# =============================================================================
+
+def filter_investible(holdings):
+    """Devuelve solo holdings de cuentas marcadas como invertibles.
+
+    Excluye típicamente:
+      - cuentas técnicas (external_*, opening_balance, interest_*)
+      - cash de reserva no declarado
+      - cuentas con investible=0
+    """
+    return [h for h in holdings if h.get("investible", True)]
+
+
+def filter_non_investible(holdings):
+    """Devuelve solo holdings NO invertibles (lo opuesto a filter_investible)."""
+    return [h for h in holdings if not h.get("investible", True)]
+
+
+def by_cash_purpose(holdings):
+    """Agrupa cash holdings por su 'cash_purpose'.
+
+    Útil para distinguir 'OPERATIVO' vs 'RESERVA_NO_DECLARADO'.
+    Devuelve {purpose: total_anchor}.
+    """
+    out = {}
+    for h in holdings:
+        if not h.get("is_cash"):
+            continue
+        if h["mv_anchor"] is None:
+            continue
+        key = h.get("cash_purpose") or "(sin clasificar)"
+        out[key] = out.get(key, 0.0) + h["mv_anchor"]
     return dict(sorted(out.items(), key=lambda kv: -kv[1]))
