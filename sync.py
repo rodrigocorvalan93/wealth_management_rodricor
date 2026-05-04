@@ -43,6 +43,12 @@ except ImportError:
 
 HERE = Path(__file__).resolve().parent
 
+# Python interpreter para subprocesos. Usamos sys.executable para que en
+# Windows + venv los loaders se corran con el MISMO Python (con sus
+# packages instalados), no con el `python` del PATH del sistema que
+# probablemente NO tenga los packages.
+PYTHON_BIN = sys.executable
+
 PRICE_CSVS = [
     HERE / "data" / "fx_historico.csv",
     HERE / "data" / "precios_historico.csv",
@@ -96,7 +102,7 @@ def regenerate_tickers_union():
     """Corre tickers_union.py para generar data/tickers_union.txt."""
     step("Generating data/tickers_union.txt (union de tickers de todos los users)")
     try:
-        r = subprocess.run(["python", "tickers_union.py"],
+        r = subprocess.run([PYTHON_BIN, "tickers_union.py"],
                            cwd=HERE, capture_output=True, text=True,
                            encoding="utf-8", errors="replace",
                            env=_subprocess_env(), timeout=30)
@@ -122,11 +128,11 @@ def get_loaders():
     else:
         byma_tickers = []
     return [
-        ("fx",       ["python", "fx_loader.py"]),
-        ("byma",     ["python", "byma_loader.py", *byma_tickers]),
-        ("cafci",    ["python", "cafci_loader.py"]),
-        ("cripto",   ["python", "cripto_loader.py"]),
-        ("yfinance", ["python", "yfinance_loader.py"]),
+        ("fx",       [PYTHON_BIN, "fx_loader.py"]),
+        ("byma",     [PYTHON_BIN, "byma_loader.py", *byma_tickers]),
+        ("cafci",    [PYTHON_BIN, "cafci_loader.py"]),
+        ("cripto",   [PYTHON_BIN, "cripto_loader.py"]),
+        ("yfinance", [PYTHON_BIN, "yfinance_loader.py"]),
     ]
 
 
