@@ -83,12 +83,23 @@ def find_user_xlsxs() -> list[tuple[str, Path]]:
     return out
 
 
+def _subprocess_env():
+    """Env para subprocesos: fuerza UTF-8 en stdio para que loaders puedan
+    printear `→`, `✓`, `✗`, BOMs etc sin crashear en Windows cp1252."""
+    env = os.environ.copy()
+    env["PYTHONIOENCODING"] = "utf-8"
+    env["PYTHONUTF8"] = "1"  # Python 3.7+ UTF-8 mode
+    return env
+
+
 def regenerate_tickers_union():
     """Corre tickers_union.py para generar data/tickers_union.txt."""
     step("Generating data/tickers_union.txt (union de tickers de todos los users)")
     try:
         r = subprocess.run(["python", "tickers_union.py"],
-                           cwd=HERE, capture_output=True, text=True, timeout=30)
+                           cwd=HERE, capture_output=True, text=True,
+                           encoding="utf-8", errors="replace",
+                           env=_subprocess_env(), timeout=30)
         if r.returncode == 0:
             print(f"   ✓ {r.stdout.strip().splitlines()[-1] if r.stdout else 'ok'}")
             return True
@@ -171,7 +182,9 @@ def run_loaders():
         step(f"Running {name}: {' '.join(cmd)}")
         t0 = time.time()
         try:
-            r = subprocess.run(cmd, cwd=HERE, capture_output=True, text=True, timeout=180)
+            r = subprocess.run(cmd, cwd=HERE, capture_output=True, text=True,
+                                encoding="utf-8", errors="replace",
+                                env=_subprocess_env(), timeout=180)
             dt = time.time() - t0
             if r.returncode == 0:
                 print(f"   ✓ {name} OK ({dt:.1f}s)")
