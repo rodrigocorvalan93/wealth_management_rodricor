@@ -324,7 +324,9 @@ def calculate_holdings(conn, fecha=None, anchor_currency="USD"):
             price_date = mp["fecha_efectiva"]
             price_fallback = mp["fallback_used"]
 
-            # Si el precio viene en moneda distinta a la nativa, convertir
+            # Si el precio viene en moneda distinta a la nativa, convertir.
+            # Si la conversión falla, marcamos price_fallback=True para que el
+            # usuario sepa que el precio puede no estar en la moneda esperada.
             if mp["currency"] != native_ccy:
                 try:
                     market_price = fx_convert(
@@ -332,7 +334,12 @@ def calculate_holdings(conn, fecha=None, anchor_currency="USD"):
                         fallback_days=14,
                     )
                 except FxError:
-                    pass  # dejamos market_price tal cual
+                    # No tenemos rate para convertir: market_price queda en
+                    # mp["currency"] (NO en native_ccy). Esto es un bug data —
+                    # el price_source se anota y price_fallback queda True para
+                    # que el frontend pinte el holding como "px*".
+                    price_fallback = True
+                    price_source = (price_source or "?") + f" (sin FX {mp['currency']}→{native_ccy})"
 
             mv_native = pos["qty"] * market_price
             avg_cost = pos["avg_cost"] if pos["avg_cost"] else market_price

@@ -60,26 +60,27 @@ CUENTAS_DEMO = [
      "YES", None, "[DEMO] Tarjeta de crédito"),
 ]
 
+# Schema build_master: Ticker | Name | Asset Class | Currency | Issuer |
+#                      Sector | Country | Notes  (8 cols)
 ESPECIES_DEMO = [
-    # (ticker, name, asset_class, currency, issuer, sector, country, maturity, notes)
     ("AL30D",  "Bonar 2030 USD MEP",  "BOND_AR",   "USB",
-     "Tesoro AR", "GOV",  "AR", "2030-07-09", "[DEMO] Soberano hard-dollar"),
+     "Tesoro AR", "GOV",  "AR", "[DEMO] Soberano hard-dollar 2030"),
     ("GGAL.BA","Grupo Galicia",       "EQUITY_AR", "ARS",
-     "Galicia", "FIN",  "AR", None, "[DEMO] Banco mayor mkt cap"),
+     "Galicia", "FIN",  "AR", "[DEMO] Banco mayor mkt cap"),
     ("AAPL",   "Apple Inc.",          "EQUITY_US", "USD",
-     "Apple",   "TECH", "US", None, "[DEMO]"),
+     "Apple",   "TECH", "US", "[DEMO]"),
     ("SPY",    "SPDR S&P 500 ETF",    "EQUITY_US", "USD",
-     "SSGA",    "ETF",  "US", None, "[DEMO] Index ETF"),
+     "SSGA",    "ETF",  "US", "[DEMO] Index ETF"),
     ("TSLA",   "Tesla Inc.",          "EQUITY_US", "USD",
-     "Tesla",   "AUTO", "US", None, "[DEMO]"),
+     "Tesla",   "AUTO", "US", "[DEMO]"),
     ("BTC",    "Bitcoin",             "CRYPTO",    "USD",
-     None,      None,   None, None, "[DEMO]"),
+     None,      None,   None, "[DEMO]"),
     ("ETH",    "Ethereum",            "CRYPTO",    "USD",
-     None,      None,   None, None, "[DEMO]"),
+     None,      None,   None, "[DEMO]"),
     ("USDT",   "Tether",              "STABLECOIN","USD",
-     None,      None,   None, None, "[DEMO]"),
+     None,      None,   None, "[DEMO]"),
     ("PEDLAR", "Pellegrini Renta Fija","FCI",      "ARS",
-     "Pellegrini", "RENTA_FIJA", "AR", None, "[DEMO] FCI ARS"),
+     "Pellegrini", "RENTA_FIJA", "AR", "[DEMO] FCI ARS"),
 ]
 
 # Saldos iniciales (fechas en 2026-01-01) → asientos_contables.
@@ -162,24 +163,32 @@ TRADES_DEMO = [
      None, None, None, "SELL TSLA parcial", "[DEMO] Toma de ganancia parcial"),
 ]
 
-# Ingresos demo (sueldos)
+# Ingresos demo. Schema build_master:
+#   Fecha | Concepto | Categoría | Monto | Moneda | Cuenta Destino |
+#   Recurrente? | Description | Notes
 INGRESOS_DEMO = [
-    # (fecha, concepto, categoria, monto, moneda, cuenta_destino, descripcion, notes)
-    (date(2026, 3, 5),  "Sueldo Marzo",   "Sueldo", 800_000, "ARS",
-     "galicia_demo_ars", "Liquidación marzo", "[DEMO]"),
-    (date(2026, 4, 5),  "Sueldo Abril",   "Sueldo", 850_000, "ARS",
-     "galicia_demo_ars", "Liquidación abril (aumento)", "[DEMO]"),
+    (date(2026, 3, 5),  "Sueldo Marzo",   "Sueldo",
+     800_000, "ARS", "galicia_demo_ars",
+     "NO", "Liquidación marzo", "[DEMO]"),
+    (date(2026, 4, 5),  "Sueldo Abril",   "Sueldo",
+     850_000, "ARS", "galicia_demo_ars",
+     "NO", "Liquidación abril (aumento)", "[DEMO]"),
 ]
 
-# Gastos demo
+# Gastos demo. Schema build_master:
+#   Fecha | Concepto | Categoría | Tipo | Monto | Moneda | Cuenta Destino |
+#   Cuotas | Recurrente? | Cierre Card | Description | Notes
 GASTOS_DEMO = [
-    # (fecha, concepto, monto, moneda, cuenta, categoria, tipo, cuotas, notes)
-    (date(2026, 4, 2), "Alquiler",          250_000, "ARS",
-     "galicia_demo_ars", "Vivienda", "FIJO", 1, "[DEMO] Mensual"),
-    (date(2026, 4, 10), "Supermercado",      85_000, "ARS",
-     "galicia_demo_visa", "Comida", "VARIABLE", 1, "[DEMO]"),
-    (date(2026, 4, 15), "Suscripción AWS",  50, "USD",
-     "ibkr_demo",       "Servicios", "FIJO", 1, "[DEMO] Hosting"),
+    # Recurrente?=NO porque sino se skipea (recurrentes los expande otra hoja).
+    (date(2026, 4, 2), "Alquiler",          "Vivienda",      "FIJO",
+     250_000, "ARS", "galicia_demo_ars",      1, "NO", None,
+     "Alquiler mensual",       "[DEMO]"),
+    (date(2026, 4, 10), "Supermercado",     "Comida",        "VARIABLE",
+     85_000, "ARS", "galicia_demo_visa",      1, "NO", date(2026, 4, 28),
+     "Compra mensual",         "[DEMO]"),
+    (date(2026, 4, 15), "Suscripción AWS",  "Servicios",     "FIJO",
+     50, "USD", "ibkr_demo",                  1, "NO", None,
+     "Hosting / DNS",          "[DEMO]"),
 ]
 
 
