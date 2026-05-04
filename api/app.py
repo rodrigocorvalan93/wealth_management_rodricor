@@ -641,6 +641,177 @@ def create_app() -> Flask:
             conn.close()
 
     # =========================================================================
+    # Calendar — próximos eventos (cupones, vencimientos, cierres tarjetas, fundings)
+    # =========================================================================
+
+    @app.get("/api/calendar")
+    def calendar_endpoint():
+        """Devuelve eventos calendarizados de los próximos N días.
+
+        Query: ?days=60 (default 60).
+
+        Eventos incluidos:
+          - Maturity de bonos (assets.maturity)
+          - Cierres y vencimientos de tarjetas (próximo + siguiente)
+          - Funding cierres (cauciones que vencen)
+          - Recurrentes próximos (sueldo, alquiler, servicios)
+        """
+        _require_auth()
+        from datetime import timedelta
+        import calendar as _cal
+        days_ahead = int(request.args.get("days", 60))
+        today = date.today()
+        until = today + timedelta(days=days_ahead)
+        events = []
+
+        conn = db_conn()
+        try:
+            # 1. Maturity de bonos
+            cur = conn.execute(
+                """SELECT ticker, name, maturity, currency, asset_class
+                   FROM assets WHERE maturity IS NOT NULL AND maturity != ''"""
+            )
+            for r in cur.fetchall():
+                try:
+                    md = date.fromisoformat(r["maturity"][:10])
+                    if today <= md <= until:
+                        events.append({
+                            "fecha": md.isoformat(),
+                            "tipo": "maturity_bono",
+                            "icon": "📜",
+                            "title": f"Vencimiento {r['ticker']}",
+                            "subtitle": r["name"] or "",
+                            "amount": None,
+                            "currency": r["currency"],
+                            "ref_id": r["ticker"],
+                        })
+                except (ValueError, TypeError):
+                    pass
+
+            # 2. Tarjetas: próximos cierres + vencimientos
+            cur = conn.execute(
+                """SELECT code, name, card_close_day, card_due_day, card_currency
+                   FROM accounts
+                   WHERE kind='CARD_CREDIT' AND card_close_day IS NOT NULL"""
+            )
+            for r in cur.fetchall():
+                close_day = r["card_close_day"]
+                due_day = r["card_due_day"]
+                # Próximos N cierres
+                cur_y, cur_m = today.year, today.month
+                for _ in range(4):  # próximos 4 ciclos = ~4 meses
+                    last = _cal.monthrange(cur_y, cur_m)[1]
+                    close_d = date(cur_y, cur_m, min(close_day, last))
+                    if close_d >= today and close_d <= until:
+                        events.append({
+                            "fecha": close_d.isoformat(),
+                            "tipo": "card_close",
+                            "icon": "💳",
+                            "title": f"Cierre {r['name']}",
+                            "subtitle": r["code"],
+                            "amount": None,
+                            "currency": r["card_currency"] or "ARS",
+                            "ref_id": r["code"],
+                        })
+                    if due_day:
+                        # Due es mes siguiente al cierre
+                        due_y = cur_y + (1 if cur_m == 12 else 0)
+                        due_m = 1 if cur_m == 12 else cur_m + 1
+                        last_due = _cal.monthrange(due_y, due_m)[1]
+                        due_d = date(due_y, due_m, min(due_day, last_due))
+                        if due_d >= today and due_d <= until:
+                            events.append({
+                                "fecha": due_d.isoformat(),
+                                "tipo": "card_due",
+                                "icon": "💸",
+                                "title": f"Vto {r['name']}",
+                                "subtitle": r["code"],
+                                "amount": None,
+                                "currency": r["card_currency"] or "ARS",
+                                "ref_id": r["code"],
+                            })
+                    # Avanzar mes
+                    cur_m += 1
+                    if cur_m > 12:
+                        cur_m = 1; cur_y += 1
+
+            # 3. Cauciones que vencen
+            cur = conn.execute(
+                """SELECT external_id, event_date, description, notes
+                   FROM events
+                   WHERE event_type='FUNDING_OPEN'
+                     AND external_id IS NOT NULL"""
+            )
+            # Para cada FUNDING_OPEN, buscar si tiene FUNDING_CLOSE
+            for r in cur.fetchall():
+                # Si ya tiene close, skip
+                close_check = conn.execute(
+                    "SELECT 1 FROM events WHERE event_type='FUNDING_CLOSE' AND external_id=?",
+                    (r["external_id"],),
+                ).fetchone()
+                if close_check:
+                    continue
+                # No cerrada — leemos del Excel para ver Fecha Fin
+                # (más simple: leer la hoja funding directamente)
+            # Trick: leer del Excel para tener Fecha Fin, monto y status
+            from .excel_io import list_rows as _list_rows
+            from .state import get_settings as _get_settings
+            try:
+                fund_rows = _list_rows(_get_settings().xlsx_path, "funding")
+            except Exception:
+                fund_rows = []
+            for fr in fund_rows:
+                if (fr.get("Status") or "").upper() == "CLOSED":
+                    continue
+                if not fr.get("Fecha Fin"):
+                    continue
+                try:
+                    fin = date.fromisoformat(str(fr["Fecha Fin"])[:10])
+                except (ValueError, TypeError):
+                    continue
+                if today <= fin <= until:
+                    events.append({
+                        "fecha": fin.isoformat(),
+                        "tipo": "funding_close",
+                        "icon": "💰",
+                        "title": f"Vence {fr.get('Tipo', '')} {fr.get('Subtipo', '')}",
+                        "subtitle": f"{fr.get('Fund ID', '')} · {fr.get('Cuenta', '')}",
+                        "amount": float(fr["Monto"]) if fr.get("Monto") else None,
+                        "currency": fr.get("Moneda", ""),
+                        "ref_id": fr.get("Fund ID"),
+                    })
+
+            # 4. Recurrentes activos en los próximos N días
+            cur = conn.execute("SELECT * FROM recurring_rules WHERE active=1")
+            rules = cur.fetchall()
+            for rule in rules:
+                # Generar próximas N ocurrencias dentro de la ventana
+                day_of_month = rule["day_of_month"] or 1
+                cur_y, cur_m = today.year, today.month
+                for _ in range(3):
+                    last = _cal.monthrange(cur_y, cur_m)[1]
+                    occ = date(cur_y, cur_m, min(day_of_month, last))
+                    if occ >= today and occ <= until:
+                        events.append({
+                            "fecha": occ.isoformat(),
+                            "tipo": "recurring_" + rule["event_type"].lower(),
+                            "icon": "🔁" if rule["event_type"] == "INCOME" else "📅",
+                            "title": rule["rule_name"],
+                            "subtitle": rule["description"] or "",
+                            "amount": rule["amount"],
+                            "currency": rule["asset"],
+                            "ref_id": str(rule["rule_id"]),
+                        })
+                    cur_m += 1
+                    if cur_m > 12:
+                        cur_m = 1; cur_y += 1
+
+            events.sort(key=lambda e: e["fecha"])
+            return jsonify({"days": days_ahead, "n": len(events), "events": events})
+        finally:
+            conn.close()
+
+    # =========================================================================
     # Reports
     # =========================================================================
 

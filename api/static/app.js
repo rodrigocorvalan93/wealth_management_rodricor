@@ -21,11 +21,33 @@
       window.location.reload();
     },
 
+    // Cache simple en memoria con TTL.
+    // Solo cachea GETs JSON. POST/PUT/DELETE invalidan caches relacionadas.
+    _cache: new Map(),       // path → { data, ts }
+    _cacheTTL: 30 * 1000,    // 30s default
+
+    _bustCache(pattern) {
+      // Invalida cache para paths que matchean (substring)
+      for (const k of Array.from(this._cache.keys())) {
+        if (!pattern || k.includes(pattern)) this._cache.delete(k);
+      }
+    },
+
     async req(path, opts = {}) {
       const url = `${this.base}${path}`;
-      const headers = {
-        ...(opts.headers || {}),
-      };
+      const method = (opts.method || "GET").toUpperCase();
+      const isCacheable = method === "GET" && !opts.noCache;
+      const cacheKey = isCacheable ? path : null;
+
+      // Cache hit
+      if (cacheKey) {
+        const hit = this._cache.get(cacheKey);
+        if (hit && Date.now() - hit.ts < this._cacheTTL) {
+          return hit.data;
+        }
+      }
+
+      const headers = { ...(opts.headers || {}) };
       if (!opts.skipAuth) {
         headers["Authorization"] = `Bearer ${this.token()}`;
       }
@@ -37,6 +59,14 @@
       try {
         res = await fetch(url, { ...opts, headers });
       } catch (err) {
+        // Si tenemos data stale en cache, devolvemos esa con warning
+        if (cacheKey) {
+          const stale = this._cache.get(cacheKey);
+          if (stale) {
+            console.warn("Sin conexión, sirviendo stale cache:", cacheKey);
+            return stale.data;
+          }
+        }
         throw new Error("Sin conexión");
       }
       if (res.status === 401) {
@@ -53,7 +83,18 @@
         throw new Error(msg);
       }
       const ct = res.headers.get("content-type") || "";
-      return ct.includes("application/json") ? res.json() : res.text();
+      const data = ct.includes("application/json") ? await res.json() : await res.text();
+
+      // Guardar en cache si era GET
+      if (cacheKey) {
+        this._cache.set(cacheKey, { data, ts: Date.now() });
+      }
+      // Mutaciones invalidan caches relacionadas
+      if (method !== "GET") {
+        // Invalidar todo lo que tenga que ver con sheets/holdings/summary/etc
+        this._bustCache();
+      }
+      return data;
     },
 
     // Endpoints específicos
@@ -453,6 +494,7 @@
     async refreshAll() {
       try {
         toast("Refrescando...", "info");
+        API._bustCache();
         await API.refresh();
         invalidateMeta();
         toast("Refresh completado ✓", "success");
@@ -593,11 +635,19 @@
             <a href="#/cash" class="btn ghost full">💵 Cash</a>
           </div>
           <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 8px;">
+            <a href="#/leverage" class="btn ghost full">⚡ Leverage</a>
+            <a href="#/calculator" class="btn ghost full">🧮 Calculator</a>
+          </div>
+          <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 8px;">
             <a href="#/cotizaciones" class="btn ghost full">💹 Cotizaciones</a>
             <a href="#/funding" class="btn ghost full">💰 Funding</a>
           </div>
           <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 8px;">
             <a href="#/pasivos" class="btn ghost full">📉 Pasivos</a>
+            <a href="#/calendar" class="btn ghost full">📅 Calendario</a>
+          </div>
+          <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 8px;">
+            <a href="#/journal" class="btn ghost full">📔 Journal</a>
             <a href="#/transferencias" class="btn ghost full">🔄 Transferencias</a>
           </div>
         </section>
@@ -926,6 +976,540 @@
       </main>
     `;
   });
+
+  // ====================================================================
+  // /calendar — próximos 60 días: cupones, cierres, vencimientos
+  // ====================================================================
+  route("/calendar", async () => {
+    const data = await API.req("/api/calendar?days=60");
+    const events = data.events || [];
+
+    // Agrupar por mes
+    const byMonth = {};
+    events.forEach(e => {
+      const month = e.fecha.slice(0, 7);  // YYYY-MM
+      if (!byMonth[month]) byMonth[month] = [];
+      byMonth[month].push(e);
+    });
+
+    return `
+      ${headerWithBack("📅 Calendario", "/")}
+      <main>
+        <div class="card compact muted" style="font-size: 13px;">
+          Próximos 60 días: vencimientos de bonos, cierres y vencimientos de
+          tarjetas, cauciones que vencen, ingresos/gastos recurrentes.
+        </div>
+
+        ${events.length === 0 ? '<div class="card muted" style="margin-top:12px">Sin eventos próximos</div>' :
+          Object.keys(byMonth).sort().map(m => {
+            const monthName = new Date(m + "-01").toLocaleDateString("es-AR",
+              { year: "numeric", month: "long" });
+            return `
+              <section style="margin-top: 14px;">
+                <h2>${escapeHtml(monthName)} (${byMonth[m].length})</h2>
+                <div class="list">
+                  ${byMonth[m].map(e => `
+                    <div class="list-item" style="align-items: flex-start;">
+                      <div style="font-size: 22px; margin-right: 8px;">${escapeHtml(e.icon)}</div>
+                      <div class="meta">
+                        <div class="meta-line1">${escapeHtml(e.title)}</div>
+                        <div class="meta-line2">${escapeHtml(e.subtitle)}</div>
+                      </div>
+                      <div class="right">
+                        <div class="amount tabular" style="font-size: 12px;">${escapeHtml(e.fecha)}</div>
+                        ${e.amount ? `<div class="sub muted tabular">${fmt.money(e.amount, 0)} ${escapeHtml(e.currency || "")}</div>` : ""}
+                      </div>
+                    </div>
+                  `).join("")}
+                </div>
+              </section>
+            `;
+          }).join("")
+        }
+      </main>
+    `;
+  });
+
+  // ====================================================================
+  // /journal — diario de trading: stats por Strategy/Setup
+  // ====================================================================
+  route("/journal", async () => {
+    const [trades, fillsResp] = await Promise.all([
+      API.listSheet("blotter"),
+      API.realizedPnl(),
+    ]);
+
+    const tradeById = {};
+    (trades.items || []).forEach(t => {
+      if (t["Trade ID"]) tradeById[String(t["Trade ID"]).trim()] = t;
+    });
+
+    // Agrupar fills por estrategia (heurística: matchear con trade del blotter)
+    const fills = fillsResp.fills || [];
+    const byStrat = {};
+    const noStrat = [];
+
+    fills.forEach(fl => {
+      // Buscar trade por ticker+account+precio_compra
+      const matchTrades = (trades.items || []).filter(t =>
+        t.Ticker === fl.asset && t.Cuenta === fl.account &&
+        Math.abs((parseFloat(t.Precio) || 0) - fl.precio_compra) /
+          Math.max(fl.precio_compra, 1) < 0.01
+      );
+      const strat = matchTrades.length > 0 && matchTrades[0].Strategy
+        ? matchTrades[0].Strategy
+        : "(sin clasificar)";
+      if (!byStrat[strat]) {
+        byStrat[strat] = { strat, fills: [], total_pnl: 0, n_winners: 0,
+                            n_losers: 0, currencies: new Set() };
+      }
+      byStrat[strat].fills.push(fl);
+      byStrat[strat].total_pnl += fl.pnl_realizado;
+      byStrat[strat].currencies.add(fl.currency);
+      if (fl.pnl_realizado > 0) byStrat[strat].n_winners++;
+      else if (fl.pnl_realizado < 0) byStrat[strat].n_losers++;
+    });
+
+    const stratList = Object.values(byStrat).map(s => ({
+      ...s,
+      n_trades: s.fills.length,
+      winrate: (s.n_winners + s.n_losers) > 0
+        ? s.n_winners / (s.n_winners + s.n_losers) : 0,
+      avg_pnl: s.fills.length > 0 ? s.total_pnl / s.fills.length : 0,
+      currencies: Array.from(s.currencies).join(", "),
+    })).sort((a, b) => b.total_pnl - a.total_pnl);
+
+    return `
+      ${headerWithBack("📔 Trading journal", "/")}
+      <main>
+        <div class="card compact muted" style="font-size: 13px;">
+          Performance agrupada por <b>Strategy</b> (campo del blotter).
+          Te muestra qué tipos de trade funcionan mejor para vos. Cargá el
+          campo Strategy en cada trade del blotter (BREAKOUT, MEAN_REV,
+          BH, TRADING, EVENT_DRIVEN, etc).
+        </div>
+
+        ${stratList.length === 0 ? emptyState("Sin trades cerrados aún", "Vendé al menos una posición y volvé") :
+          stratList.map(s => `
+            <div class="card" style="margin-top: 12px;
+                 border-left: 4px solid ${s.total_pnl > 0 ? 'var(--green)' : 'var(--red)'};">
+              <div style="display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 8px;">
+                <h3 style="font-size: 16px;">${escapeHtml(s.strat)}</h3>
+                <span class="tabular ${s.total_pnl > 0 ? 'positive' : 'negative'}" style="font-weight: 700; font-size: 16px;">
+                  ${fmt.money(s.total_pnl, 0)} ${escapeHtml(s.currencies)}
+                </span>
+              </div>
+              <div style="display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px; font-size: 12px;">
+                <div><span class="muted">Trades:</span> <b>${s.n_trades}</b></div>
+                <div><span class="muted">Win:</span> <b class="positive">${s.n_winners}</b></div>
+                <div><span class="muted">Loss:</span> <b class="negative">${s.n_losers}</b></div>
+                <div><span class="muted">WR:</span> <b>${(s.winrate * 100).toFixed(0)}%</b></div>
+              </div>
+              <div style="margin-top: 6px; font-size: 12px;">
+                <span class="muted">Avg PnL/trade:</span>
+                <b class="tabular ${s.avg_pnl > 0 ? 'positive' : 'negative'}">${fmt.money(s.avg_pnl, 0)}</b>
+              </div>
+            </div>
+          `).join("")
+        }
+
+        ${stratList.length > 0 ? `
+          <div class="card compact muted" style="margin-top: 16px; font-size: 11px;">
+            💡 Tip: para refinar tu sistema, fijate qué estrategia tiene
+            mejor expectancy = winrate × avg_winner − loss_rate × |avg_loser|.
+            Doblá la apuesta en lo que funciona, evitá lo que no.
+          </div>
+        ` : ""}
+      </main>
+    `;
+  });
+
+  // ====================================================================
+  // /calculator — simulador de trade apalancado (what-if)
+  // ====================================================================
+  route("/calculator", async () => {
+    return `
+      ${headerWithBack("🧮 Calculator", "/")}
+      <main>
+        <div class="card compact muted" style="font-size: 13px;">
+          Simulá una operación apalancada antes de mandarla. Te dice cuánto
+          capital propio necesitás, costo financiero al cierre, breakeven %
+          y P&L objetivo a un precio target.
+        </div>
+
+        <form id="calcForm" style="margin-top: 12px;">
+          <h2 style="font-size: 14px; color: var(--muted); text-transform: uppercase; margin: 12px 0 6px;">Trade</h2>
+          <div class="field-row">
+            ${inputField("Ticker", "ticker", "TXMJ9", "text", { placeholder: "ej AL30D" })}
+            <div class="field">
+              <label>Side</label>
+              <select name="side">
+                <option value="BUY">BUY</option>
+                <option value="SELL">SELL</option>
+              </select>
+            </div>
+          </div>
+          <div class="field-row">
+            ${inputField("Qty", "qty", "250000000", "number", { required: true })}
+            ${inputField("Precio entrada", "entry_price", "0.80", "number", { required: true })}
+          </div>
+          ${inputField("Precio target (salida)", "exit_price", "0.835", "number", { required: true })}
+
+          <h2 style="font-size: 14px; color: var(--muted); text-transform: uppercase; margin: 16px 0 6px;">Aforo (capital propio)</h2>
+          <div class="field-row">
+            ${inputField("% Aforo del activo", "aforo_pct", "0.85", "number",
+                          { placeholder: "0..1 — ej 0.85 = 85%" })}
+            <div class="field">
+              <label>Modo</label>
+              <select name="mode">
+                <option value="cap_propio">% sobre activo</option>
+                <option value="margin">Margin × multiplier</option>
+              </select>
+            </div>
+          </div>
+
+          <h2 style="font-size: 14px; color: var(--muted); text-transform: uppercase; margin: 16px 0 6px;">Caución</h2>
+          <div class="field-row">
+            ${inputField("TNA caución", "tna", "0.24", "number",
+                          { placeholder: "0.24 o 24" })}
+            ${inputField("Días", "days", "4", "number", { required: true })}
+          </div>
+
+          <button type="submit" class="btn primary full" style="margin-top: 12px;">📊 Calcular</button>
+        </form>
+
+        <div id="calcResult" style="margin-top: 16px;"></div>
+      </main>
+    `;
+  });
+
+  // Listener para calc form (delega — re-attached on every render)
+  document.addEventListener("submit", (e) => {
+    if (e.target && e.target.id === "calcForm") {
+      e.preventDefault();
+      computeCalculator(e.target);
+    }
+  });
+
+  function computeCalculator(form) {
+    const data = Object.fromEntries(new FormData(form).entries());
+    const qty = parseFloat(data.qty) || 0;
+    const entry = parseFloat(data.entry_price) || 0;
+    const exit = parseFloat(data.exit_price) || 0;
+    let aforo = parseFloat(data.aforo_pct) || 0;
+    if (aforo > 1) aforo = aforo / 100;
+    let tna = parseFloat(data.tna) || 0;
+    if (tna > 1.5) tna = tna / 100;
+    const days = parseInt(data.days) || 0;
+
+    const notional = qty * entry;
+    // Capital propio: lo que TÚ ponés. Lo que pedís de caución es (1-aforo) del notional
+    // En el modelo BYMA: aforo es lo que el activo cubre como garantía.
+    // Si comprás 100 con aforo 85%, podés pedir prestado 85 (caución) y poner 15 propio
+    let capitalPropio, montoCaucion;
+    if (data.mode === "margin") {
+      // Modo IBKR: multiplier = 1/aforo
+      const multiplier = aforo > 0 ? 1 / aforo : 1;
+      capitalPropio = notional / multiplier;
+      montoCaucion = notional - capitalPropio;
+    } else {
+      // BYMA: capital propio = (1-aforo) * notional
+      montoCaucion = notional * aforo;
+      capitalPropio = notional - montoCaucion;
+    }
+
+    const interestCost = montoCaucion * tna * days / 365;
+    const grossPnl = (exit - entry) * qty * (data.side === "SELL" ? -1 : 1);
+    const netPnl = grossPnl - interestCost;
+    const breakevenMove = capitalPropio > 0
+      ? (interestCost / qty)  // movimiento mínimo en precio para cubrir interés
+      : 0;
+    const breakevenPct = entry > 0 ? breakevenMove / entry : 0;
+    const targetMovePct = entry > 0 ? (exit - entry) / entry : 0;
+    const roi = capitalPropio > 0 ? netPnl / capitalPropio : 0;
+    const roiAnnual = days > 0 ? roi * 365 / days : 0;
+
+    document.getElementById("calcResult").innerHTML = `
+      <div class="card" style="border-left: 4px solid var(--navy);">
+        <h2 style="font-size: 16px; margin-bottom: 12px;">Resultado de la simulación</h2>
+
+        <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 8px 16px; font-size: 14px;">
+          <div><span class="muted">Notional:</span> <b class="tabular">${fmt.money(notional, 0)}</b></div>
+          <div><span class="muted">Capital propio:</span> <b class="tabular">${fmt.money(capitalPropio, 0)}</b></div>
+          <div><span class="muted">Caución (deuda):</span> <b class="tabular">${fmt.money(montoCaucion, 0)}</b></div>
+          <div><span class="muted">Apalancamiento:</span> <b>${capitalPropio > 0 ? (notional / capitalPropio).toFixed(2) + "x" : "—"}</b></div>
+        </div>
+
+        <hr style="border: none; border-top: 1px solid var(--border); margin: 12px 0;">
+
+        <h3 style="font-size: 13px; color: var(--muted); text-transform: uppercase; margin-bottom: 8px;">Costos y PnL</h3>
+        <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 8px 16px; font-size: 14px;">
+          <div><span class="muted">Interés ${days}d (TNA ${(tna * 100).toFixed(2)}%):</span> <b class="tabular negative">−${fmt.money(interestCost, 0)}</b></div>
+          <div><span class="muted">Move target:</span> <b class="${targetMovePct > 0 ? 'positive' : 'negative'}">${(targetMovePct * 100).toFixed(2)}%</b></div>
+          <div><span class="muted">P&L bruto:</span> <b class="tabular ${grossPnl > 0 ? 'positive' : 'negative'}">${fmt.money(grossPnl, 0)}</b></div>
+          <div><span class="muted">P&L neto:</span> <b class="tabular ${netPnl > 0 ? 'positive' : 'negative'}">${fmt.money(netPnl, 0)}</b></div>
+        </div>
+
+        <hr style="border: none; border-top: 1px solid var(--border); margin: 12px 0;">
+
+        <div class="kpi" style="background: ${netPnl >= 0 ? '#E8F5E9' : '#FFEBEE'}; padding: 14px;">
+          <div class="kpi-label">ROI sobre capital propio</div>
+          <div class="kpi-value ${roi > 0 ? 'positive' : 'negative'}">${(roi * 100).toFixed(2)}%</div>
+          <div class="kpi-currency">en ${days} días · anualizado ${(roiAnnual * 100).toFixed(1)}%</div>
+        </div>
+
+        <div class="card compact" style="background: #FFF8E1; padding: 8px; margin-top: 10px; font-size: 12px;">
+          🎯 <b>Break-even:</b> el precio tiene que subir al menos
+          <b>${fmt.money(breakevenMove, 4)}</b> (${(breakevenPct * 100).toFixed(3)}%)
+          para cubrir el costo de la caución.
+        </div>
+
+        <div class="muted" style="font-size: 11px; margin-top: 10px;">
+          ⚠ Simulación. No considera comisiones, slippage, ni movimientos
+          intermedios. El aforo BYMA real de cada activo está en la hoja
+          aforos del Excel.
+        </div>
+      </div>
+    `;
+  }
+
+  // ====================================================================
+  // /leverage — operaciones apalancadas (trade + caución vinculada)
+  // ====================================================================
+  route("/leverage", async () => {
+    const [fundings, trades, fillsResp] = await Promise.all([
+      API.listSheet("funding"),
+      API.listSheet("blotter"),
+      API.realizedPnl(),
+    ]);
+
+    // Index trades by Trade ID
+    const tradeById = {};
+    (trades.items || []).forEach(t => {
+      if (t["Trade ID"]) tradeById[String(t["Trade ID"]).trim()] = t;
+    });
+
+    const fills = fillsResp.fills || [];
+
+    const ops = (fundings.items || [])
+      .filter(f => f["Linked Trade ID"])
+      .map(f => buildLeverageOp(f, tradeById, fills));
+
+    // Sort: OPEN first, then by Fecha Inicio desc
+    ops.sort((a, b) => {
+      if (a.status !== b.status) return a.status === "OPEN" ? -1 : 1;
+      return (b.fecha_inicio || "").localeCompare(a.fecha_inicio || "");
+    });
+
+    const opens = ops.filter(o => o.status !== "CLOSED");
+    const closed = ops.filter(o => o.status === "CLOSED");
+
+    // KPIs agregados de operaciones abiertas
+    const totalMonto = opens.reduce((s, o) => s + o.monto, 0);
+    const totalCapitalPropio = opens.reduce((s, o) => s + o.capital_propio, 0);
+    const totalInterestAccrued = opens.reduce((s, o) => s + o.interest_accrued, 0);
+    const totalNetPnl = opens.reduce((s, o) => s + o.net_pnl, 0);
+
+    return `
+      ${headerWithBack("⚡ Leverage", "/")}
+      <main>
+        <div class="card compact muted" style="font-size: 13px;">
+          Operaciones apalancadas: cauciones (TOMA) vinculadas a un trade
+          del blotter vía <b>Linked Trade ID</b>. Te muestra capital
+          propio expuesto, intereses devengados al día de hoy, P&L del
+          trade y ROI sobre tu margen real.
+        </div>
+
+        ${opens.length > 0 ? `
+          <div class="kpi-grid" style="margin-top: 12px;">
+            <div class="kpi">
+              <div class="kpi-label">Apalancado total</div>
+              <div class="kpi-value">${fmt.money(totalMonto, 0)}</div>
+              <div class="kpi-currency">caución TOMA · ${opens[0]?.moneda || ''}</div>
+            </div>
+            <div class="kpi">
+              <div class="kpi-label">Capital propio</div>
+              <div class="kpi-value">${fmt.money(totalCapitalPropio, 0)}</div>
+              <div class="kpi-currency">tu plata expuesta</div>
+            </div>
+            <div class="kpi">
+              <div class="kpi-label">Costo financiero hoy</div>
+              <div class="kpi-value negative">−${fmt.money(totalInterestAccrued, 0)}</div>
+              <div class="kpi-currency">interés devengado</div>
+            </div>
+            <div class="kpi">
+              <div class="kpi-label">P&L neto (estim)</div>
+              <div class="kpi-value ${totalNetPnl >= 0 ? 'positive' : 'negative'}">${fmt.money(totalNetPnl, 0)}</div>
+              <div class="kpi-currency">trade − interés</div>
+            </div>
+          </div>
+        ` : ""}
+
+        <section style="margin-top: 14px;">
+          <h2>Operaciones abiertas (${opens.length})</h2>
+          ${opens.length === 0 ?
+            '<div class="card muted">Sin operaciones apalancadas en curso. Vinculá una caución a un trade poniéndole su Trade ID en "Linked Trade ID" desde la página /funding.</div>' :
+            opens.map(o => leverageOpCard(o)).join("")
+          }
+        </section>
+
+        ${closed.length > 0 ? `
+          <section style="margin-top: 16px;">
+            <h2>Operaciones cerradas (${closed.length})</h2>
+            ${closed.slice(0, 10).map(o => leverageOpCard(o)).join("")}
+          </section>
+        ` : ""}
+
+        <div class="card compact muted" style="margin-top: 16px; font-size: 11px;">
+          ⚠ Nota: el matching trade↔caución usa el campo "Linked Trade ID"
+          de la hoja funding. Si tu trade tiene legs separadas (T0001-A buy,
+          T0001-B sell), poné el Trade ID de la BUY en Linked Trade ID — el
+          P&L se trae del fill cerrado correspondiente.
+        </div>
+      </main>
+    `;
+  });
+
+  function buildLeverageOp(f, tradeById, fills) {
+    const linkedId = String(f["Linked Trade ID"] || "").trim();
+    const trade = tradeById[linkedId];
+
+    // Parsear datos del funding
+    const monto = parseFloat(f.Monto) || 0;
+    let tna = parseFloat(f.TNA) || 0;
+    if (tna > 1.5) tna = tna / 100;
+
+    // Días corridos (al día de hoy si OPEN; al Fecha Fin si CLOSED)
+    const today = new Date();
+    const start = parseISODate(f["Fecha Inicio"]);
+    let daysElapsed = 0, daysTotal = 0;
+    if (start) {
+      const refEnd = f["Fecha Fin"] ? parseISODate(f["Fecha Fin"]) : today;
+      daysElapsed = Math.max(0, Math.floor((Math.min(refEnd, today) - start) / 86400000));
+      daysTotal = parseInt(f.Días) || daysElapsed;
+    }
+
+    const interestAccrued = monto * tna * daysElapsed / 365;
+    const interestFinal = monto * tna * daysTotal / 365;
+
+    // Trade notional (qty * precio en moneda nativa)
+    const tradeQty = trade ? parseFloat(trade.Qty) || 0 : 0;
+    const tradePrice = trade ? parseFloat(trade.Precio) || 0 : 0;
+    const tradeNotional = tradeQty * tradePrice;
+
+    // Capital propio = lo que pusiste de tu bolsillo = notional - monto cauci
+    const capitalPropio = Math.max(0, tradeNotional - monto);
+
+    // P&L del trade: buscamos fills donde matche ticker+account+precio_compra
+    let tradePnl = 0;
+    let pnlCurrency = trade ? trade["Moneda Trade"] : null;
+    if (trade) {
+      // Buscamos fills cuyos precio_compra ≈ tradePrice y ticker/account match
+      const matched = fills.filter(fl =>
+        fl.account === trade.Cuenta &&
+        fl.asset === trade.Ticker &&
+        Math.abs(fl.precio_compra - tradePrice) / Math.max(tradePrice, 1) < 0.05
+      );
+      tradePnl = matched.reduce((s, fl) => s + fl.pnl_realizado, 0);
+      if (matched.length > 0) pnlCurrency = matched[0].currency;
+    }
+
+    const netPnl = tradePnl - interestAccrued;
+    const roi = capitalPropio > 0 ? netPnl / capitalPropio : null;
+
+    // ROI anualizado simple
+    const roiAnnual = (roi && daysElapsed > 0) ? roi * 365 / daysElapsed : null;
+
+    return {
+      fund_id: f["Fund ID"],
+      row_id: f.row_id,
+      linked_trade_id: linkedId,
+      tipo: f.Tipo,
+      subtipo: f.Subtipo,
+      cuenta: f.Cuenta,
+      moneda: f.Moneda,
+      fecha_inicio: f["Fecha Inicio"],
+      fecha_fin: f["Fecha Fin"],
+      monto, tna, days_elapsed: daysElapsed, days_total: daysTotal,
+      interest_accrued: interestAccrued,
+      interest_final: interestFinal,
+      status: f.Status || "OPEN",
+      trade, trade_notional: tradeNotional, capital_propio: capitalPropio,
+      trade_pnl: tradePnl,
+      net_pnl: netPnl,
+      pnl_currency: pnlCurrency,
+      roi, roi_annual: roiAnnual,
+    };
+  }
+
+  function parseISODate(s) {
+    if (!s) return null;
+    const d = new Date(String(s).slice(0, 10));
+    return isNaN(d) ? null : d;
+  }
+
+  function leverageOpCard(o) {
+    const isOpen = o.status !== "CLOSED";
+    const sideBadge = (o.trade && o.trade.Side === "BUY") ? "🟢 BUY" :
+                       (o.trade && o.trade.Side === "SELL") ? "🔴 SELL" : "?";
+    const pnlClass = o.net_pnl > 0 ? "positive" : o.net_pnl < 0 ? "negative" : "";
+    const roiPct = o.roi !== null ? (o.roi * 100).toFixed(2) + "%" : "—";
+    const roiAnnualPct = o.roi_annual !== null ? (o.roi_annual * 100).toFixed(1) + "%" : "—";
+
+    return `
+      <div class="card" style="margin-bottom: 10px; border-left: 4px solid ${isOpen ? 'var(--yellow)' : 'var(--green)'};">
+        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
+          <div>
+            <b>${escapeHtml(o.tipo)} · ${escapeHtml(o.subtipo)}</b>
+            <span class="muted" style="font-size: 12px;">· ${escapeHtml(o.fund_id || "")}</span>
+            ${isOpen ? '<span class="tag warn" style="margin-left: 6px;">OPEN</span>' : '<span class="tag" style="margin-left: 6px;">cerrada</span>'}
+          </div>
+          ${isOpen ? `
+            <button class="btn" style="padding: 4px 10px; font-size: 11px; background: var(--green); color: white;"
+                    data-onclick="closeFunding" data-arg="${escapeHtml(o.row_id)}">
+              Cerrar caución
+            </button>
+          ` : ""}
+        </div>
+
+        ${o.trade ? `
+          <div style="background: #FAFBFC; padding: 8px; border-radius: 6px; margin-bottom: 8px; font-size: 13px;">
+            <div><b>Trade vinculado:</b> ${sideBadge} ${escapeHtml(o.trade.Ticker)} ·
+                 ${fmt.money(o.trade.Qty, 0)} @ ${fmt.money(o.trade.Precio, 4)} ${escapeHtml(o.trade["Moneda Trade"])}</div>
+            <div class="muted" style="font-size: 11px;">${escapeHtml(o.linked_trade_id)} · ${escapeHtml(o.trade["Trade Date"] || "")} · ${escapeHtml(o.cuenta)}</div>
+          </div>
+        ` : `
+          <div class="card compact danger" style="background: #FFEBEE; padding: 8px; font-size: 12px; margin-bottom: 8px;">
+            ⚠ Trade <code>${escapeHtml(o.linked_trade_id)}</code> no encontrado en blotter.
+          </div>
+        `}
+
+        <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 6px 12px; font-size: 13px;">
+          <div><span class="muted">Caución:</span> <b class="tabular">${fmt.money(o.monto, 0)} ${escapeHtml(o.moneda)}</b></div>
+          <div><span class="muted">TNA:</span> <b>${(o.tna * 100).toFixed(2)}%</b></div>
+          <div><span class="muted">Notional trade:</span> <b class="tabular">${fmt.money(o.trade_notional, 0)}</b></div>
+          <div><span class="muted">Capital propio:</span> <b class="tabular">${fmt.money(o.capital_propio, 0)}</b></div>
+          <div><span class="muted">Días corridos:</span> <b>${o.days_elapsed}d</b> ${o.days_total !== o.days_elapsed ? "/" + o.days_total : ""}</div>
+          <div><span class="muted">Interés acum:</span> <b class="tabular negative">−${fmt.money(o.interest_accrued, 0)}</b></div>
+          <div><span class="muted">P&L trade:</span> <b class="tabular ${o.trade_pnl > 0 ? 'positive' : o.trade_pnl < 0 ? 'negative' : ''}">${fmt.money(o.trade_pnl, 0)} ${escapeHtml(o.pnl_currency || "")}</b></div>
+          <div><span class="muted">P&L neto:</span> <b class="tabular ${pnlClass}">${fmt.money(o.net_pnl, 0)}</b></div>
+        </div>
+
+        <hr style="border: none; border-top: 1px solid var(--border); margin: 8px 0;">
+
+        <div style="display: flex; justify-content: space-between; align-items: center;">
+          <div>
+            <span class="muted" style="font-size: 12px;">ROI sobre capital propio:</span>
+            <b style="font-size: 16px; margin-left: 6px;" class="${o.roi > 0 ? 'positive' : o.roi < 0 ? 'negative' : ''}">${roiPct}</b>
+            ${o.roi_annual !== null ? `<span class="muted" style="font-size: 11px;"> · anualiz. ${roiAnnualPct}</span>` : ""}
+          </div>
+          <div>
+            <a href="#/funding/${encodeURIComponent(o.row_id)}/edit" style="font-size: 12px;">editar →</a>
+          </div>
+        </div>
+      </div>
+    `;
+  }
 
   // ====================================================================
   // /funding — cauciones, pases, préstamos
@@ -1680,6 +2264,14 @@ python yfinance_loader.py</pre>
           <a href="#/pasivos" class="btn ghost full" style="margin-bottom:6px">📉 Pasivos</a>
           <a href="#/funding" class="btn ghost full" style="margin-bottom:6px">💰 Funding (cauciones)</a>
           <a href="#/transferencias" class="btn ghost full" style="margin-bottom:6px">🔄 Transferencias</a>
+        </section>
+
+        <section>
+          <h2>Trading apalancado</h2>
+          <a href="#/leverage" class="btn ghost full" style="margin-bottom:6px">⚡ Leverage view (operaciones apalancadas)</a>
+          <a href="#/calculator" class="btn ghost full" style="margin-bottom:6px">🧮 What-if calculator</a>
+          <a href="#/journal" class="btn ghost full" style="margin-bottom:6px">📔 Trading journal (por strategy)</a>
+          <a href="#/calendar" class="btn ghost full" style="margin-bottom:6px">📅 Calendario (próximos 60 días)</a>
         </section>
 
         <section>

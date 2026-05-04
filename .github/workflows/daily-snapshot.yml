@@ -1,0 +1,36 @@
+name: Daily PN snapshot
+
+# Trigger un /api/refresh cada día a las 23:00 UTC = 20:00 AR.
+# El refresh genera un snapshot del PN en pn_snapshots → equity curve continua.
+
+on:
+  schedule:
+    - cron: "0 23 * * *"
+  workflow_dispatch:
+
+jobs:
+  snapshot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Trigger refresh on PythonAnywhere
+        env:
+          WM_API_TOKEN: ${{ secrets.WM_API_TOKEN }}
+          WM_API_URL: ${{ secrets.WM_API_URL }}
+        run: |
+          if [ -z "$WM_API_TOKEN" ] || [ -z "$WM_API_URL" ]; then
+            echo "::error::Missing WM_API_TOKEN or WM_API_URL secrets"
+            exit 1
+          fi
+          # Pegar refresh
+          echo "Calling refresh on $WM_API_URL/api/refresh ..."
+          curl -fsS -X POST \
+               -H "Authorization: Bearer $WM_API_TOKEN" \
+               "$WM_API_URL/api/refresh" | tee refresh.json
+          echo ""
+          # Pegar /api/report/html para forzar generación del snapshot
+          curl -fsS -H "Authorization: Bearer $WM_API_TOKEN" \
+               "$WM_API_URL/api/report/html?anchor=USD" \
+               -o /dev/null
+          echo "Snapshot triggered OK"
