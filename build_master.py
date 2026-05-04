@@ -131,6 +131,9 @@ def hoja_config(wb):
          "FIFO | WAC | LIFO. Por defecto FIFO."),
         ("Default plazo BYMA", "24hs", "string",
          "Plazo de liquidación por defecto."),
+        ("Distancia alerta target (bps)", 10, "number",
+         "Distancia en bps (1 bp = 0.01%) que define 'cerca del target'. "
+         "Default 10 (≈ precio en target). Subilo a 100 para alertas con margen."),
     ]
     for i, (concepto, valor, tipo, notas) in enumerate(rows, start=5):
         ws.cell(row=i, column=1, value=concepto).font = FONT_NORMAL
@@ -457,19 +460,25 @@ def hoja_blotter(wb):
         "Cuenta", "Strategy", "Ticker",
         "Side", "Qty", "Precio", "Moneda Trade",
         "Cuenta Cash", "Comisión", "Moneda Com",
+        "Precio Target", "Stop Loss", "Moneda Target",
         "Description", "Notes"
     ]
     style_headers(ws, headers, header_row=4)
-    set_widths(ws, [12, 12, 12, 18, 14, 12, 8, 14, 12, 10, 18, 10, 10, 30, 25])
+    set_widths(ws, [12, 12, 12, 18, 14, 12, 8, 14, 12, 10, 18, 10, 10,
+                     12, 12, 12, 30, 25])
 
-    # Ejemplo: tu trade TXMJ9
+    # Ejemplos: trade TXMJ9 con target / stop
     examples = [
         ("T0001-A", date(2026, 4, 28), date(2026, 4, 30),
          "cocos", "TRADING", "TXMJ9", "BUY", 250000000, 0.80, "ARS",
-         "cocos", 0, "ARS", "BUY TXMJ9", "Compra inicial trading"),
+         "cocos", 0, "ARS",
+         0.85, 0.78, "ARS",                    # target / stop / moneda target
+         "BUY TXMJ9", "Compra inicial trading"),
         ("T0001-B", date(2026, 4, 30), date(2026, 5, 4),
          "cocos", "TRADING", "TXMJ9", "SELL", 250000000, 0.835, "ARS",
-         "cocos", 0, "ARS", "SELL TXMJ9", "Cierre con +3.5pp"),
+         "cocos", 0, "ARS",
+         None, None, None,                      # SELL típicamente sin target nuevo
+         "SELL TXMJ9", "Cierre con +3.5pp"),
     ]
     for i, row in enumerate(examples, start=5):
         for j, val in enumerate(row, start=1):
@@ -480,7 +489,7 @@ def hoja_blotter(wb):
                 cell.font = FONT_NORMAL
             if j in (2, 3):  # dates
                 cell.number_format = "yyyy-mm-dd"
-            elif j in (8, 9, 12):  # qty, precio, comisión
+            elif j in (8, 9, 12, 14, 15):  # qty, precio, comisión, target, stop
                 cell.number_format = '#,##0.0000;[Red](#,##0.0000)'
 
     # Validación Side
@@ -489,7 +498,7 @@ def hoja_blotter(wb):
     ws.add_data_validation(dv_side)
 
     add_freeze(ws, 4)
-    add_filter(ws, 4, 15, last_row=2000)
+    add_filter(ws, 4, 18, last_row=2000)
     return ws
 
 

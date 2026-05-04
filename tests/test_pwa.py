@@ -396,6 +396,39 @@ def test_fx_rates_endpoint():
         print(f"  ✓ Latest FX USD/ARS: 1400 (no 1380)")
 
 
+def test_calendar_endpoint():
+    """/api/calendar devuelve eventos de los próximos N días."""
+    print("\n[CALENDAR] /api/calendar:")
+    with tempfile.TemporaryDirectory() as tmp:
+        client = _client(Path(tmp))
+        r = client.get("/api/calendar?days=90", headers=_auth())
+        assert r.status_code == 200
+        body = r.get_json()
+        assert "events" in body
+        assert isinstance(body["events"], list)
+        # En el master ejemplo hay tarjetas + recurrentes → debería haber eventos
+        types = set(e["tipo"] for e in body["events"])
+        print(f"  ✓ {body['n']} eventos en 90 días, tipos: {types}")
+        # Ordenado por fecha
+        fechas = [e["fecha"] for e in body["events"]]
+        assert fechas == sorted(fechas)
+        print(f"  ✓ Eventos ordenados ascendentemente por fecha")
+
+
+def test_pwa_includes_new_pages():
+    """app.js contiene las nuevas rutas: leverage, calculator, journal, calendar."""
+    print("\n[PWA pages] nuevas rutas presentes en app.js:"  )
+    with tempfile.TemporaryDirectory() as tmp:
+        client = _client(Path(tmp))
+        r = client.get("/static/app.js")
+        body = r.data
+        for route in [b'route("/leverage"', b'route("/calculator"',
+                       b'route("/journal"', b'route("/calendar"',
+                       b'_bustCache', b'_cacheTTL']:
+            assert route in body, f"falta {route}"
+            print(f"  ✓ {route.decode()}")
+
+
 def test_cash_endpoint():
     """/api/cash devuelve saldos cash por cuenta + subtotales por moneda."""
     print("\n[CASH] /api/cash:")
@@ -466,6 +499,8 @@ if __name__ == "__main__":
         test_prices_endpoint,
         test_fx_rates_endpoint,
         test_cash_endpoint,
+        test_calendar_endpoint,
+        test_pwa_includes_new_pages,
     ]
     failed = []
     for t in tests:

@@ -46,7 +46,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from flask import (
     Flask, request, jsonify, send_file, send_from_directory,
-    abort, Response, render_template,
+    abort, Response, render_template, g,
 )
 
 from engine.holdings import (
@@ -65,8 +65,16 @@ from engine.buying_power import buying_power_summary
 from engine.exporter import export_excel, export_html
 
 from .state import (
-    get_settings, db_conn, excel_write_lock, backup_excel,
+    get_settings, get_user_settings, list_user_ids,
+    db_conn, excel_write_lock, backup_excel,
     list_backups, prune_backups, reimport_excel,
+    DEFAULT_USER_ID,
+)
+from .users import (
+    load_users, resolve_user_by_token, get_active_user,
+    admin_switch_to, admin_switch_clear, is_switched,
+    add_user_to_config, remove_user_from_config, export_users_json,
+    is_persistent, UserConfig,
 )
 from .excel_io import (
     SHEET_PREFIX, MASTER_SHEETS, ALLOWED_SHEETS, is_master_sheet,
@@ -106,17 +114,66 @@ def create_app() -> Flask:
     def cors_preflight(_):
         return ("", 204)
 
-    # --- Auth ---
-    def _require_auth():
-        s = get_settings()
-        if not s.api_token:
-            abort(500, "WM_API_TOKEN no configurado en el server")
+    # --- Auth + user resolution (multi-tenant) ---
+
+    @app.before_request
+    def _resolve_user():
+        """Resuelve el user activo desde el bearer token y lo setea en g.
+
+        - g.auth_user: el user dueño del token
+        - g.active_user_id: el user_id efectivamente activo (=auth_user, o
+          el target si el admin hizo switch)
+        - g.is_admin: True si el auth_user es admin
+        - g.is_switched: True si el admin está viendo datos de otro
+        """
+        # Endpoints públicos: no resolver user
+        if not request.path.startswith("/api/"):
+            return
+        if request.method == "OPTIONS":
+            return
+        if request.path == "/api/health":
+            return
+
         auth = request.headers.get("Authorization", "")
         if not auth.startswith("Bearer "):
-            abort(401, "Falta header Authorization: Bearer <token>")
+            return  # _require_auth abortará después
         token = auth[len("Bearer "):].strip()
-        if token != s.api_token:
-            abort(401, "Token inválido")
+
+        active = get_active_user(token)
+        if active is None:
+            return  # _require_auth abortará
+
+        auth_user, switched = active
+        # auth_user es el user dueño del token (puede ser admin con switch)
+        # Buscamos el user real al que apunta:
+        actual_token_owner = resolve_user_by_token(token)
+        g.auth_user = actual_token_owner
+        g.active_user_id = auth_user.user_id
+        g.is_admin = bool(actual_token_owner and actual_token_owner.is_admin)
+        g.is_switched = switched
+        g.user_token = token
+
+    def _require_auth():
+        """Verifica que haya user resuelto en g."""
+        if not load_users():
+            abort(500, "Sin users configurados. Setea WM_USERS_JSON o WM_API_TOKEN.")
+        if not getattr(g, "active_user_id", None):
+            abort(401, "Token inválido o ausente")
+
+    def _require_admin():
+        """Verifica que el caller sea admin (independiente de switch state)."""
+        _require_auth()
+        if not getattr(g, "is_admin", False):
+            abort(403, "Acción solo para admin")
+
+    def _block_if_switched_mutation():
+        """En vista 'switched', el admin no puede mutar datos del target user.
+        Aborta 403 si la request es POST/PUT/DELETE y está switched."""
+        if request.method in ("POST", "PUT", "DELETE", "PATCH"):
+            if getattr(g, "is_switched", False):
+                abort(403,
+                      "Estás en modo 'switch user' (read-only). Volvé a tu user "
+                      "para mutar datos.")
 
     # --- Helpers ---
     def _holdings(fecha=None, anchor=None):
@@ -146,29 +203,39 @@ def create_app() -> Flask:
 
     @app.get("/api/health")
     def health():
-        s = get_settings()
-        xlsx_exists = s.xlsx_path.is_file()
-        db_exists = s.db_path.is_file()
-        return jsonify({
+        import os as _os
+        users = load_users()
+        is_multi = bool(_os.environ.get("WM_USERS_JSON"))
+        # Back-compat: si single-tenant, exponer flags del user "default"
+        # para que clientes viejos sigan funcionando.
+        body = {
             "status": "ok",
-            "version": "1.0",
-            "xlsx_present": xlsx_exists,
-            "db_present": db_exists,
-            "anchor_default": s.anchor,
-            "auth_configured": bool(s.api_token),
+            "version": "2.0",
+            "auth_configured": len(users) > 0,
+            "n_users": len(users),
+            "multi_tenant": is_multi,
             "now": datetime.now().isoformat(),
-        })
+        }
+        if not is_multi and users:
+            s = get_user_settings(users[0].user_id)
+            body["xlsx_present"] = s.xlsx_path.is_file()
+            body["db_present"] = s.db_path.is_file()
+            body["anchor_default"] = s.anchor
+        return jsonify(body)
 
     @app.get("/api/config")
     def config():
-        _require_auth()
+        _require_auth(); _block_if_switched_mutation()
         s = get_settings()
         return jsonify({
-            "base_dir": str(s.base_dir),
+            "user_id": g.active_user_id,
+            "is_admin": g.is_admin,
+            "is_switched": g.is_switched,
+            "auth_user_id": g.auth_user.user_id if g.auth_user else None,
+            "auth_user_display_name": g.auth_user.display_name if g.auth_user else None,
             "xlsx_path": str(s.xlsx_path),
-            "db_path": str(s.db_path),
-            "data_dir": str(s.data_dir),
-            "backups_dir": str(s.backups_dir),
+            "xlsx_present": s.xlsx_path.is_file(),
+            "db_present": s.db_path.is_file(),
             "anchor": s.anchor,
             "supported_sheets": sorted(ALLOWED_SHEETS),
             "event_sheets": list(SHEET_PREFIX.keys()),
@@ -181,7 +248,7 @@ def create_app() -> Flask:
 
     @app.get("/api/summary")
     def summary():
-        _require_auth()
+        _require_auth(); _block_if_switched_mutation()
         anchor = _parse_query_anchor()
         fecha = _parse_query_fecha()
         holdings, conn = _holdings(fecha, anchor)
@@ -190,9 +257,11 @@ def create_app() -> Flask:
             return jsonify({
                 "fecha": fecha.isoformat(),
                 "anchor": anchor,
-                "patrimonio_total": tp["total_anchor"],
+                "patrimonio_total": tp["total_anchor"],            # NETO
                 "patrimonio_invertible": tp["total_investible"],
                 "patrimonio_no_invertible": tp["total_non_investible"],
+                "total_assets": tp["total_assets"],
+                "total_liabilities": tp["total_liabilities"],
                 "unconverted_count": tp["total_unconverted_count"],
                 "by_asset_class": by_asset_class(holdings),
                 "by_account": by_account(holdings),
@@ -205,7 +274,7 @@ def create_app() -> Flask:
 
     @app.get("/api/holdings")
     def holdings_endpoint():
-        _require_auth()
+        _require_auth(); _block_if_switched_mutation()
         anchor = _parse_query_anchor()
         fecha = _parse_query_fecha()
         holdings, conn = _holdings(fecha, anchor)
@@ -233,7 +302,7 @@ def create_app() -> Flask:
 
     @app.get("/api/equity-curve")
     def equity_curve():
-        _require_auth()
+        _require_auth(); _block_if_switched_mutation()
         anchor = _parse_query_anchor()
         investible_only = request.args.get("investible") == "true"
         per_account = request.args.get("per_account") == "true"
@@ -257,9 +326,85 @@ def create_app() -> Flask:
         finally:
             conn.close()
 
+    @app.get("/api/holdings-near-target")
+    def holdings_near_target_endpoint():
+        """Holdings cuya distancia al target o stop-loss está dentro del
+        umbral configurado en `alert_distance_bps`. Query param `bps`
+        opcional para override on-the-fly."""
+        _require_auth(); _block_if_switched_mutation()
+        from engine.holdings import filter_near_target
+        from engine.schema import get_setting
+        anchor = _parse_query_anchor()
+        fecha = _parse_query_fecha()
+        holdings, conn = _holdings(fecha, anchor)
+        try:
+            override = request.args.get("bps")
+            if override is not None:
+                try:
+                    bps = float(override)
+                except ValueError:
+                    abort(400, "bps debe ser numérico")
+            else:
+                bps = get_setting(conn, "alert_distance_bps",
+                                   default=10.0, cast=float)
+            alerts = filter_near_target(holdings, alert_distance_bps=bps)
+            return jsonify({
+                "alert_distance_bps": bps,
+                "fecha": fecha.isoformat(),
+                "anchor": anchor,
+                "n_alerts": len(alerts),
+                "alerts": alerts,
+            })
+        finally:
+            conn.close()
+
+    @app.get("/api/settings")
+    def get_settings_endpoint():
+        """Devuelve los settings persistidos en DB (key/value)."""
+        _require_auth()
+        from engine.schema import get_setting
+        conn = db_conn()
+        try:
+            return jsonify({
+                "alert_distance_bps": get_setting(conn, "alert_distance_bps",
+                                                    default=10.0, cast=float),
+                "anchor_currency": get_setting(conn, "anchor_currency",
+                                                default=get_settings().anchor),
+                "pnl_method": get_setting(conn, "pnl_method", default="FIFO"),
+            })
+        finally:
+            conn.close()
+
+    @app.put("/api/settings")
+    def update_settings_endpoint():
+        """Actualiza un setting. Body: {"key": "alert_distance_bps", "value": 50}.
+
+        IMPORTANTE: el valor se persiste a la DB pero NO al Excel master,
+        así que se va a perder en el próximo refresh. Para hacerlo permanente
+        editá la hoja `config` del master.
+        """
+        _require_auth(); _block_if_switched_mutation()
+        from engine.schema import set_setting
+        body = request.get_json(silent=True) or {}
+        key = body.get("key")
+        value = body.get("value")
+        if not key:
+            abort(400, "key requerido")
+        # Whitelist de keys editables
+        allowed = {"alert_distance_bps"}
+        if key not in allowed:
+            abort(400, f"key '{key}' no editable. Permitidos: {sorted(allowed)}")
+        conn = db_conn()
+        try:
+            set_setting(conn, key, value)
+            conn.commit()
+            return jsonify({"ok": True, "key": key, "value": value})
+        finally:
+            conn.close()
+
     @app.get("/api/buying-power")
     def buying_power_endpoint():
-        _require_auth()
+        _require_auth(); _block_if_switched_mutation()
         anchor = _parse_query_anchor()
         fecha = _parse_query_fecha()
         holdings, conn = _holdings(fecha, anchor)
@@ -286,7 +431,7 @@ def create_app() -> Flask:
 
     @app.get("/api/trade-stats")
     def trade_stats_endpoint():
-        _require_auth()
+        _require_auth(); _block_if_switched_mutation()
         anchor = _parse_query_anchor()
         fecha = _parse_query_fecha()
         conn = db_conn()
@@ -310,7 +455,7 @@ def create_app() -> Flask:
 
     @app.get("/api/realized-pnl")
     def realized_pnl_endpoint():
-        _require_auth()
+        _require_auth(); _block_if_switched_mutation()
         fecha = _parse_query_fecha()
         conn = db_conn()
         try:
@@ -343,7 +488,7 @@ def create_app() -> Flask:
 
     @app.get("/api/sheets/<sheet>")
     def list_sheet(sheet):
-        _require_auth()
+        _require_auth(); _block_if_switched_mutation()
         s = get_settings()
         if sheet not in ALLOWED_SHEETS:
             abort(404, f"Sheet '{sheet}' no soportada. Disponibles: {list(SHEET_PREFIX.keys())}")
@@ -354,7 +499,7 @@ def create_app() -> Flask:
 
     @app.get("/api/sheets/<sheet>/<row_id>")
     def get_sheet_row(sheet, row_id):
-        _require_auth()
+        _require_auth(); _block_if_switched_mutation()
         s = get_settings()
         if sheet not in ALLOWED_SHEETS:
             abort(404)
@@ -365,7 +510,7 @@ def create_app() -> Flask:
 
     @app.post("/api/sheets/<sheet>")
     def create_sheet_row(sheet):
-        _require_auth()
+        _require_auth(); _block_if_switched_mutation()
         s = get_settings()
         if sheet not in ALLOWED_SHEETS:
             abort(404)
@@ -388,7 +533,7 @@ def create_app() -> Flask:
 
     @app.put("/api/sheets/<sheet>/<row_id>")
     def update_sheet_row(sheet, row_id):
-        _require_auth()
+        _require_auth(); _block_if_switched_mutation()
         s = get_settings()
         if sheet not in ALLOWED_SHEETS:
             abort(404)
@@ -412,7 +557,7 @@ def create_app() -> Flask:
 
     @app.delete("/api/sheets/<sheet>/<row_id>")
     def delete_sheet_row(sheet, row_id):
-        _require_auth()
+        _require_auth(); _block_if_switched_mutation()
         s = get_settings()
         if sheet not in ALLOWED_SHEETS:
             abort(404)
@@ -431,7 +576,7 @@ def create_app() -> Flask:
 
     @app.post("/api/upload/excel")
     def upload_excel():
-        _require_auth()
+        _require_auth(); _block_if_switched_mutation()
         s = get_settings()
         if "file" not in request.files:
             abort(400, "Subí el archivo en form-data como 'file'")
@@ -452,7 +597,7 @@ def create_app() -> Flask:
 
     @app.get("/api/download/excel")
     def download_excel():
-        _require_auth()
+        _require_auth(); _block_if_switched_mutation()
         s = get_settings()
         if not s.xlsx_path.is_file():
             abort(404, "No hay Excel master")
@@ -464,7 +609,7 @@ def create_app() -> Flask:
 
     @app.post("/api/upload/prices")
     def upload_prices():
-        _require_auth()
+        _require_auth(); _block_if_switched_mutation()
         s = get_settings()
         if "file" not in request.files:
             abort(400, "Subí el CSV en form-data como 'file'")
@@ -486,14 +631,14 @@ def create_app() -> Flask:
 
     @app.post("/api/refresh")
     def refresh():
-        _require_auth()
+        _require_auth(); _block_if_switched_mutation()
         with excel_write_lock():
             stats = reimport_excel()
         return jsonify({"refreshed": True, "import_stats": stats})
 
     @app.get("/api/backups")
     def backups():
-        _require_auth()
+        _require_auth(); _block_if_switched_mutation()
         return jsonify({
             "backups": [
                 {
@@ -517,7 +662,7 @@ def create_app() -> Flask:
           ?ticker=AL30D        — filtra por uno
           ?asset_class=BOND_AR — filtra por clase
         """
-        _require_auth()
+        _require_auth(); _block_if_switched_mutation()
         conn = db_conn()
         try:
             ticker = request.args.get("ticker")
@@ -564,7 +709,7 @@ def create_app() -> Flask:
     @app.get("/api/fx-rates")
     def fx_rates_endpoint():
         """Devuelve la última cotización FX conocida por (moneda, base)."""
-        _require_auth()
+        _require_auth(); _block_if_switched_mutation()
         conn = db_conn()
         try:
             sql = """
@@ -599,7 +744,7 @@ def create_app() -> Flask:
 
         Query: ?anchor=USD para incluir conversión a moneda ancla.
         """
-        _require_auth()
+        _require_auth(); _block_if_switched_mutation()
         anchor = _parse_query_anchor()
         fecha = _parse_query_fecha()
         holdings, conn = _holdings(fecha, anchor)
@@ -628,7 +773,9 @@ def create_app() -> Flask:
                 "items": [
                     {
                         "account": h["account"],
+                        "account_name": h.get("account_name") or h["account"],
                         "account_kind": h.get("account_kind") or "",
+                        "account_institution": h.get("account_institution") or "",
                         "currency": h["native_currency"],
                         "qty": h["qty"],
                         "mv_anchor": h.get("mv_anchor"),
@@ -641,12 +788,405 @@ def create_app() -> Flask:
             conn.close()
 
     # =========================================================================
+    # Calendar — próximos eventos (cupones, vencimientos, cierres tarjetas, fundings)
+    # =========================================================================
+
+    @app.get("/api/calendar")
+    def calendar_endpoint():
+        """Devuelve eventos calendarizados de los próximos N días.
+
+        Query: ?days=60 (default 60).
+
+        Eventos incluidos:
+          - Maturity de bonos (assets.maturity)
+          - Cierres y vencimientos de tarjetas (próximo + siguiente)
+          - Funding cierres (cauciones que vencen)
+          - Recurrentes próximos (sueldo, alquiler, servicios)
+        """
+        _require_auth(); _block_if_switched_mutation()
+        from datetime import timedelta
+        import calendar as _cal
+        days_ahead = int(request.args.get("days", 60))
+        today = date.today()
+        until = today + timedelta(days=days_ahead)
+        events = []
+
+        conn = db_conn()
+        try:
+            # 1. Maturity de bonos
+            cur = conn.execute(
+                """SELECT ticker, name, maturity, currency, asset_class
+                   FROM assets WHERE maturity IS NOT NULL AND maturity != ''"""
+            )
+            for r in cur.fetchall():
+                try:
+                    md = date.fromisoformat(r["maturity"][:10])
+                    if today <= md <= until:
+                        events.append({
+                            "fecha": md.isoformat(),
+                            "tipo": "maturity_bono",
+                            "icon": "📜",
+                            "title": f"Vencimiento {r['ticker']}",
+                            "subtitle": r["name"] or "",
+                            "amount": None,
+                            "currency": r["currency"],
+                            "ref_id": r["ticker"],
+                        })
+                except (ValueError, TypeError):
+                    pass
+
+            # 2. Tarjetas: próximos cierres + vencimientos
+            cur = conn.execute(
+                """SELECT code, name, card_close_day, card_due_day, card_currency
+                   FROM accounts
+                   WHERE kind='CARD_CREDIT' AND card_close_day IS NOT NULL"""
+            )
+            for r in cur.fetchall():
+                close_day = r["card_close_day"]
+                due_day = r["card_due_day"]
+                # Próximos N cierres
+                cur_y, cur_m = today.year, today.month
+                for _ in range(4):  # próximos 4 ciclos = ~4 meses
+                    last = _cal.monthrange(cur_y, cur_m)[1]
+                    close_d = date(cur_y, cur_m, min(close_day, last))
+                    if close_d >= today and close_d <= until:
+                        events.append({
+                            "fecha": close_d.isoformat(),
+                            "tipo": "card_close",
+                            "icon": "💳",
+                            "title": f"Cierre {r['name']}",
+                            "subtitle": r["code"],
+                            "amount": None,
+                            "currency": r["card_currency"] or "ARS",
+                            "ref_id": r["code"],
+                        })
+                    if due_day:
+                        # Due es mes siguiente al cierre
+                        due_y = cur_y + (1 if cur_m == 12 else 0)
+                        due_m = 1 if cur_m == 12 else cur_m + 1
+                        last_due = _cal.monthrange(due_y, due_m)[1]
+                        due_d = date(due_y, due_m, min(due_day, last_due))
+                        if due_d >= today and due_d <= until:
+                            events.append({
+                                "fecha": due_d.isoformat(),
+                                "tipo": "card_due",
+                                "icon": "💸",
+                                "title": f"Vto {r['name']}",
+                                "subtitle": r["code"],
+                                "amount": None,
+                                "currency": r["card_currency"] or "ARS",
+                                "ref_id": r["code"],
+                            })
+                    # Avanzar mes
+                    cur_m += 1
+                    if cur_m > 12:
+                        cur_m = 1; cur_y += 1
+
+            # 3. Cauciones que vencen — leemos del Excel para tener
+            #    Fecha Fin / Status / Monto sin tener que reconstruirlo
+            #    desde events.
+            try:
+                fund_rows = list_rows(get_settings().xlsx_path, "funding")
+            except Exception:
+                fund_rows = []
+            for fr in fund_rows:
+                if (fr.get("Status") or "").upper() == "CLOSED":
+                    continue
+                if not fr.get("Fecha Fin"):
+                    continue
+                try:
+                    fin = date.fromisoformat(str(fr["Fecha Fin"])[:10])
+                except (ValueError, TypeError):
+                    continue
+                if today <= fin <= until:
+                    events.append({
+                        "fecha": fin.isoformat(),
+                        "tipo": "funding_close",
+                        "icon": "💰",
+                        "title": f"Vence {fr.get('Tipo', '')} {fr.get('Subtipo', '')}",
+                        "subtitle": f"{fr.get('Fund ID', '')} · {fr.get('Cuenta', '')}",
+                        "amount": float(fr["Monto"]) if fr.get("Monto") else None,
+                        "currency": fr.get("Moneda", ""),
+                        "ref_id": fr.get("Fund ID"),
+                    })
+
+            # 4. Recurrentes activos en los próximos N días
+            cur = conn.execute("SELECT * FROM recurring_rules WHERE active=1")
+            rules = cur.fetchall()
+            for rule in rules:
+                # Generar próximas N ocurrencias dentro de la ventana
+                day_of_month = rule["day_of_month"] or 1
+                cur_y, cur_m = today.year, today.month
+                for _ in range(3):
+                    last = _cal.monthrange(cur_y, cur_m)[1]
+                    occ = date(cur_y, cur_m, min(day_of_month, last))
+                    if occ >= today and occ <= until:
+                        events.append({
+                            "fecha": occ.isoformat(),
+                            "tipo": "recurring_" + rule["event_type"].lower(),
+                            "icon": "🔁" if rule["event_type"] == "INCOME" else "📅",
+                            "title": rule["rule_name"],
+                            "subtitle": rule["description"] or "",
+                            "amount": rule["amount"],
+                            "currency": rule["asset"],
+                            "ref_id": str(rule["rule_id"]),
+                        })
+                    cur_m += 1
+                    if cur_m > 12:
+                        cur_m = 1; cur_y += 1
+
+            events.sort(key=lambda e: e["fecha"])
+            return jsonify({"days": days_ahead, "n": len(events), "events": events})
+        finally:
+            conn.close()
+
+    # =========================================================================
+    # Admin: gestión de usuarios + switch view
+    # =========================================================================
+
+    @app.get("/api/admin/users")
+    def admin_list_users():
+        """Lista todos los users (sin tokens completos, solo preview)."""
+        _require_admin()
+        users = load_users()
+        config_ids = set(u.user_id for u in users)
+        disk_ids = set(list_user_ids())
+        orphans = disk_ids - config_ids
+        return jsonify({
+            "users": [
+                {
+                    "user_id": u.user_id,
+                    "display_name": u.display_name,
+                    "is_admin": u.is_admin,
+                    "token_preview": u.token[:8] + "..." if len(u.token) > 8 else "?",
+                    "has_xlsx": (get_user_settings(u.user_id).xlsx_path).is_file(),
+                    "has_db": (get_user_settings(u.user_id).db_path).is_file(),
+                }
+                for u in users
+            ],
+            "orphan_folders": sorted(orphans),
+            "n_users": len(users),
+            "persistent": is_persistent(),
+        })
+
+    @app.post("/api/admin/users")
+    def admin_create_user():
+        """Crea un nuevo user.
+
+        Body JSON:
+          { "user_id": "amigo", "display_name": "Marcos", "is_admin": false,
+            "token": "auto"   ← si "auto", se genera random }
+
+        Acciones:
+          1. Genera token (si no se pasa)
+          2. Crea folder inputs/<user_id>/
+          3. Genera el Excel master (build_master + add_carga_inicial_sheet)
+          4. Agrega user a WM_USERS_JSON in-memory
+          5. Devuelve el token al admin para que lo comparta
+
+        IMPORTANTE: el WSGI file de PythonAnywhere tiene que actualizarse
+        para que el user persista entre reloads. La response incluye el
+        snippet a copiar en el WSGI.
+        """
+        _require_admin()
+        body = request.get_json(silent=True) or {}
+        user_id = (body.get("user_id") or "").strip().lower()
+        if not user_id or not user_id.replace("_", "").replace("-", "").isalnum():
+            abort(400, "user_id inválido (solo letras/números/_/-, lowercase)")
+        # Verificar duplicado
+        existing = resolve_user_by_token("__never_match__")  # noop, just to ensure load
+        for u in load_users():
+            if u.user_id == user_id:
+                abort(400, f"Ya existe un user con id '{user_id}'")
+
+        display_name = body.get("display_name") or user_id
+        is_admin = bool(body.get("is_admin", False))
+        token = body.get("token") or ""
+        if not token or token == "auto":
+            import secrets
+            token = secrets.token_hex(32)
+
+        # Crear folders y master vacío
+        new_settings = get_user_settings(user_id)
+        new_settings.inputs_dir.mkdir(parents=True, exist_ok=True)
+        new_settings.user_data_dir.mkdir(parents=True, exist_ok=True)
+        new_settings.backups_dir.mkdir(parents=True, exist_ok=True)
+
+        # Generar master con build_master + add_carga_inicial
+        from build_master import build_master
+        try:
+            from add_carga_inicial_sheet import add_carga_inicial_sheet
+        except ImportError:
+            add_carga_inicial_sheet = None
+
+        try:
+            build_master(new_settings.xlsx_path)
+            if add_carga_inicial_sheet:
+                add_carga_inicial_sheet(new_settings.xlsx_path)
+            # Limpiar las filas de ejemplo de TODAS las hojas de eventos
+            # (blotter, ingresos, gastos, etc) para que el user nuevo arranque
+            # con master vacío, listo para que cargue su data inicial.
+            _blank_event_sheets(new_settings.xlsx_path)
+        except Exception as e:
+            abort(500, f"No se pudo crear el master para '{user_id}': {e}")
+
+        # Auto-import: crear la DB del user para que /api/summary y similares
+        # funcionen apenas hace login. Sin este import, switch read-only crashea
+        # con FileNotFoundError porque la DB no existe.
+        import_stats = None
+        try:
+            import_stats = reimport_excel(settings=new_settings)
+        except Exception as e:
+            print(f"[admin_create_user] WARN auto-import falló para "
+                  f"'{user_id}': {e} — el user va a tener que hacer refresh manual")
+
+        # Persistir en config in-memory (NO sobrevive un reload del web app)
+        add_user_to_config(user_id, token, display_name=display_name,
+                            is_admin=is_admin)
+
+        persistent = is_persistent()
+        response = {
+            "created": True,
+            "user_id": user_id,
+            "display_name": display_name,
+            "is_admin": is_admin,
+            "token": token,
+            "url": request.host_url.rstrip("/"),
+            "import_stats": import_stats,
+            "persistent": persistent,
+        }
+        if persistent:
+            response["info"] = ("✓ User guardado en disk (WM_USERS_FILE). "
+                                 "Sobrevive reloads sin tocar el WSGI.")
+        else:
+            response["wsgi_snippet"] = _build_wsgi_snippet()
+            response["warning"] = (
+                "⚠ Para que el user persista a reloads, agregá WM_USERS_FILE "
+                "al WSGI (ver MULTITENANT.md). Mientras tanto, el user vive "
+                "solo en memoria del server. Como workaround inmediato, copiá "
+                "el snippet de wsgi_snippet al WSGI file."
+            )
+        return jsonify(response), 201
+
+    def _blank_event_sheets(xlsx_path):
+        """Borra las filas de DATOS (no headers) de las hojas de eventos del
+        master de un user nuevo. Mantiene cuentas/monedas/especies/aforos
+        completos como templates. Header en row 4."""
+        from openpyxl import load_workbook
+        wb = load_workbook(filename=str(xlsx_path))
+        EVENT_SHEETS = (
+            "blotter", "ingresos", "gastos",
+            "transferencias_cash", "transferencias_activos",
+            "funding", "pasivos", "pagos_pasivos",
+            "recurrentes", "asientos_contables",
+        )
+        HEADER_ROW = 4
+        for sheet_name in EVENT_SHEETS:
+            if sheet_name not in wb.sheetnames:
+                continue
+            ws = wb[sheet_name]
+            if ws.max_row > HEADER_ROW:
+                ws.delete_rows(HEADER_ROW + 1, ws.max_row - HEADER_ROW)
+        wb.save(str(xlsx_path))
+
+    @app.post("/api/admin/users/<user_id>/seed-demo")
+    def admin_seed_demo(user_id):
+        """Sobreescribe el master del user con datos demo hard-coded fijos.
+
+        Útil para tener un user 'demo' con datos repetibles para mostrar la app.
+        Después de seed, también re-importa la DB.
+        """
+        _require_admin()
+        if not any(u.user_id == user_id for u in load_users()):
+            abort(404, f"User '{user_id}' no existe")
+        # Hacer backup del master actual antes de overwritearlo
+        target = get_user_settings(user_id)
+        if target.xlsx_path.is_file():
+            with excel_write_lock(settings=target):
+                backup_excel(settings=target)
+        # Seed
+        from seed_demo import seed_demo
+        try:
+            stats = seed_demo(target.xlsx_path)
+        except Exception as e:
+            abort(500, f"Seed demo falló: {e}")
+        # Re-importar
+        try:
+            import_stats = reimport_excel(settings=target)
+        except Exception as e:
+            return jsonify({
+                "seeded": True, "seed_stats": stats,
+                "import_failed": str(e),
+            }), 200
+        return jsonify({
+            "seeded": True,
+            "user_id": user_id,
+            "seed_stats": stats,
+            "import_stats": import_stats,
+        })
+
+    @app.delete("/api/admin/users/<user_id>")
+    def admin_delete_user(user_id):
+        """Borra un user del config in-memory. NO borra los archivos del disk
+        (por seguridad). Si querés borrar también, usá ?delete_data=true."""
+        _require_admin()
+        if user_id == g.auth_user.user_id:
+            abort(400, "No podés borrar tu propio user")
+        if not any(u.user_id == user_id for u in load_users()):
+            abort(404, f"User '{user_id}' no existe")
+
+        delete_data = request.args.get("delete_data") == "true"
+        remove_user_from_config(user_id)
+
+        if delete_data:
+            import shutil
+            try:
+                ud = get_user_settings(user_id).user_data_dir
+                if ud.is_dir(): shutil.rmtree(ud)
+                inp = get_user_settings(user_id).inputs_dir
+                if inp.is_dir(): shutil.rmtree(inp)
+            except OSError as e:
+                return jsonify({"removed_config": True, "data_deleted": False,
+                                 "error": str(e)})
+        return jsonify({"removed_config": True, "data_deleted": delete_data})
+
+    @app.post("/api/admin/switch")
+    def admin_switch():
+        """Switch view del admin a otro user (read-only).
+
+        Body: {"user_id": "amigo"}  o {"user_id": null} para volver.
+        """
+        _require_admin()
+        body = request.get_json(silent=True) or {}
+        target = body.get("user_id")
+        token = g.user_token
+        if target is None or target == "" or target == g.auth_user.user_id:
+            admin_switch_clear(token)
+            return jsonify({"switched": False, "active_user_id": g.auth_user.user_id})
+        try:
+            admin_switch_to(token, target)
+        except (PermissionError, ValueError) as e:
+            abort(400, str(e))
+        return jsonify({"switched": True, "active_user_id": target,
+                         "warning": "Modo read-only. POST/PUT/DELETE están bloqueados."})
+
+    def _build_wsgi_snippet():
+        """Devuelve un fragmento de código para el WSGI file con el JSON
+        actual de users."""
+        import os, json
+        return (
+            "# Reemplazar tu WM_API_TOKEN viejo por esto:\n"
+            f"os.environ['WM_USERS_JSON'] = '''{os.environ.get('WM_USERS_JSON', '{}')}'''\n"
+            f"os.environ['WM_ADMIN_USER'] = '{os.environ.get('WM_ADMIN_USER', '')}'\n"
+        )
+
+    # =========================================================================
     # Reports
     # =========================================================================
 
     @app.get("/api/report/html")
     def report_html():
-        _require_auth()
+        _require_auth(); _block_if_switched_mutation()
         anchor = _parse_query_anchor()
         fecha = _parse_query_fecha()
         s = get_settings()
@@ -666,7 +1206,7 @@ def create_app() -> Flask:
 
     @app.get("/api/report/excel")
     def report_excel():
-        _require_auth()
+        _require_auth(); _block_if_switched_mutation()
         anchor = _parse_query_anchor()
         fecha = _parse_query_fecha()
         s = get_settings()

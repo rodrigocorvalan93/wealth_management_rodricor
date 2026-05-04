@@ -243,6 +243,42 @@ def import_margin_config(conn, ws):
     return n
 
 
+def import_config(conn, ws):
+    """Hoja 'config': pares (Concepto, Valor) → settings table.
+
+    Solo se almacenan keys que el engine reconoce. Otras filas se loguean.
+    El mapping concepto → key es case-insensitive y normaliza espacios.
+    """
+    from .schema import set_setting
+
+    # Mapping de "Concepto" en Excel → key canónica en settings table.
+    KNOWN_KEYS = {
+        "moneda base de reporte":          "anchor_currency",
+        "fecha de arranque":                "start_date",
+        "tolerancia qty (cero)":            "qty_zero_tolerance",
+        "metodo pnl realizado":             "pnl_method",
+        "método pnl realizado":             "pnl_method",
+        "default plazo byma":               "byma_settle_default",
+        "distancia alerta target (bps)":    "alert_distance_bps",
+        "distancia alerta target":          "alert_distance_bps",
+    }
+
+    n = 0
+    for r, row in _read_rows(ws):
+        concepto = _to_str(row.get("Concepto"))
+        valor = row.get("Valor")
+        if not concepto:
+            continue
+        key = KNOWN_KEYS.get(concepto.strip().lower())
+        if not key:
+            continue
+        if valor is None or (isinstance(valor, str) and not valor.strip()):
+            continue
+        set_setting(conn, key, valor)
+        n += 1
+    return n
+
+
 def import_funding(conn, ws):
     """Hoja 'funding': cauciones, pases, préstamos de corto plazo.
 
@@ -473,6 +509,12 @@ def import_blotter(conn, ws):
         description = (_to_str(row.get("Description"))
                        or f"{side} {qty} {ticker} @ {precio}")
 
+        # Target / Stop-loss (solo se almacenan, alertas se computan en
+        # holdings.py). Ambos opcionales.
+        target_price = _to_float(row.get("Precio Target"))
+        stop_loss_price = _to_float(row.get("Stop Loss"))
+        target_currency = _to_str(row.get("Moneda Target")) or moneda
+
         # FX: si la moneda del trade != moneda nativa del asset, convertir
         # el unit_price a moneda nativa para que el inventario sea consistente.
         asset_ccy = _get_asset_currency(conn, ticker)
@@ -493,13 +535,16 @@ def import_blotter(conn, ws):
         else:
             precio_native = precio
 
-        # Crear evento
+        # Crear evento (con target/stop si fueron especificados)
         eid = insert_event(
             conn, EventType.TRADE,
             event_date=trade_date, settle_date=settle_date,
             description=description, external_id=external_id,
             source_row=r, source_sheet="blotter",
             notes=_to_str(row.get("Notes")),
+            target_price=target_price,
+            stop_loss_price=stop_loss_price,
+            target_currency=target_currency if (target_price or stop_loss_price) else None,
         )
 
         # Movements:
@@ -956,6 +1001,8 @@ def import_all(db_path: str | Path, xlsx_path: str | Path,
         stats["aforos"] = import_aforos(conn, wb["aforos"])
     if "margin_config" in wb.sheetnames:
         stats["margin_config"] = import_margin_config(conn, wb["margin_config"])
+    if "config" in wb.sheetnames:
+        stats["config"] = import_config(conn, wb["config"])
 
     conn.commit()
 
