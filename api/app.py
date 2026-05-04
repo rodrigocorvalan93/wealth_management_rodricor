@@ -1044,6 +1044,42 @@ def create_app() -> Flask:
                         "memoria del server."),
         }), 201
 
+    @app.post("/api/admin/users/<user_id>/seed-demo")
+    def admin_seed_demo(user_id):
+        """Sobreescribe el master del user con datos demo hard-coded fijos.
+
+        Útil para tener un user 'demo' con datos repetibles para mostrar la app.
+        Después de seed, también re-importa la DB.
+        """
+        _require_admin()
+        if not any(u.user_id == user_id for u in load_users()):
+            abort(404, f"User '{user_id}' no existe")
+        # Hacer backup del master actual antes de overwritearlo
+        target = get_user_settings(user_id)
+        if target.xlsx_path.is_file():
+            with excel_write_lock(settings=target):
+                backup_excel(settings=target)
+        # Seed
+        from seed_demo import seed_demo
+        try:
+            stats = seed_demo(target.xlsx_path)
+        except Exception as e:
+            abort(500, f"Seed demo falló: {e}")
+        # Re-importar
+        try:
+            import_stats = reimport_excel(settings=target)
+        except Exception as e:
+            return jsonify({
+                "seeded": True, "seed_stats": stats,
+                "import_failed": str(e),
+            }), 200
+        return jsonify({
+            "seeded": True,
+            "user_id": user_id,
+            "seed_stats": stats,
+            "import_stats": import_stats,
+        })
+
     @app.delete("/api/admin/users/<user_id>")
     def admin_delete_user(user_id):
         """Borra un user del config in-memory. NO borra los archivos del disk

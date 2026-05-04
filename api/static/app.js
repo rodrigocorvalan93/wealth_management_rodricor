@@ -138,6 +138,9 @@
     deleteUser: (id, deleteData) =>
       API.req(`/api/admin/users/${encodeURIComponent(id)}${deleteData ? '?delete_data=true' : ''}`,
               { method: "DELETE" }),
+    seedDemo: (id) =>
+      API.req(`/api/admin/users/${encodeURIComponent(id)}/seed-demo`,
+              { method: "POST" }),
     switchUser: (target) =>
       API.req("/api/admin/switch", { method: "POST", json: { user_id: target } }),
   };
@@ -581,6 +584,21 @@
         toast(e.message, "error");
       }
     },
+    async seedDemoData(userId) {
+      if (!confirm(`Sobreescribir datos del user '${userId}' con el dataset demo?\n\n` +
+                    `Se hará backup del master actual antes. La data demo es fija ` +
+                    `(misma cada vez).`)) return;
+      try {
+        const r = await API.seedDemo(userId);
+        const stats = r.seed_stats || {};
+        const summary = Object.entries(stats).map(([k,v]) => `${k}: ${v}`).join(", ");
+        toast(`✓ Demo seedeado en '${userId}'. ${summary}`, "success");
+        API._bustCache();
+        invalidateMeta();
+        render();
+      } catch (e) { toast(e.message, "error"); }
+    },
+
     async switchToUser(userId) {
       try {
         await API.switchUser(userId);
@@ -2460,13 +2478,18 @@
                     xlsx: ${u.has_xlsx ? '✓' : '✗'} · db: ${u.has_db ? '✓' : '✗'}
                   </div>
                 </div>
-                <div class="right">
+                <div class="right" style="display: flex; flex-direction: column; gap: 4px;">
                   ${u.user_id !== cfg.auth_user_id ? `
                     <button class="btn ghost" style="padding: 4px 10px; font-size: 11px;"
                             data-onclick="switchToUser" data-arg="${escapeHtml(u.user_id)}">
                       👁 ver
                     </button>
-                    <button class="btn" style="padding: 4px 10px; font-size: 11px; background: var(--red); color: white; margin-top: 4px;"
+                    <button class="btn ghost" style="padding: 4px 10px; font-size: 11px;"
+                            data-onclick="seedDemoData" data-arg="${escapeHtml(u.user_id)}"
+                            title="Sobreescribir master con datos demo fijos">
+                      🎬 demo
+                    </button>
+                    <button class="btn" style="padding: 4px 10px; font-size: 11px; background: var(--red); color: white;"
                             data-onclick="deleteUserAction" data-arg="${escapeHtml(u.user_id)}">
                       🗑
                     </button>
