@@ -251,7 +251,14 @@ def import_funding(conn, ws):
       - Si Status='CLOSED': 1 evento FUNDING_CLOSE al cerrar (con interés)
 
     TOMA: TOMA dinero (recibo cash, debo capital + interés).
-    COLOCA: COLOCO dinero (entrego cash, cobro capital + interés).
+      - cocos: +cash
+      - caucion_pasivo_<ccy> (LIABILITY): +deuda  ← se RESTA del PN
+    COLOCA: COLOCO dinero (entrego cash, tengo crédito por cobrar).
+      - cocos: -cash
+      - caucion_activo_<ccy> (CASH_BROKER): +crédito  ← se SUMA al PN
+
+    Esto netea correctamente: durante la vida de la caución, el PN no se
+    infla — el cash entrante (TOMA) está compensado por la deuda generada.
 
     Sprint E: Si tiene 'Linked Trade ID', se usa para vincular costo/ingreso
     de funding al trade (visible en reportes de leverage).
@@ -288,6 +295,30 @@ def import_funding(conn, ws):
         if tna > 1.5:
             tna = tna / 100.0
 
+        # Cuenta contracuenta del funding (auto-creada si no existe).
+        # TOMA: deuda → kind=LIABILITY (resta del PN)
+        # COLOCA: crédito por cobrar → kind=CASH_BROKER (suma al PN)
+        if tipo == "TOMA":
+            counter_account = f"caucion_pasivo_{moneda.lower()}"
+            counter_kind = AccountKind.LIABILITY
+            counter_name = f"Cauciones tomadas pendientes ({moneda})"
+        else:
+            counter_account = f"caucion_activo_{moneda.lower()}"
+            counter_kind = AccountKind.CASH_BROKER
+            counter_name = f"Cauciones colocadas pendientes ({moneda})"
+        # Crear la cuenta si no existe (idempotente — INSERT OR REPLACE).
+        # investible=1: estos pasivos/créditos son reales y siempre afectan PN
+        # (en ambas vistas, "todo" y "solo invertible"). El flag investible
+        # sigue aplicándose: el pasivo se acumula al PN invertible para
+        # representar correctamente "lo que realmente tenés disponible".
+        insert_account(
+            conn, code=counter_account, name=counter_name, kind=counter_kind,
+            currency=moneda,
+            investible=1,
+            cash_purpose="FUNDING",
+            notes="Auto-creada por import_funding",
+        )
+
         # FUNDING_OPEN
         sign_cash = 1 if tipo == "TOMA" else -1   # TOMA: gano cash; COLOCA: pierdo cash
         eid_open = insert_event(
@@ -305,21 +336,24 @@ def import_funding(conn, ws):
             qty=sign_cash * monto,
             notes=f"{tipo} {subtipo} {fund_id}",
         )
-        # Contracuenta: deuda/colocación. Usamos external_income/expense como neutralizador
-        # (modelo simple — la "pata" del pasivo se materializa al cierre con interés).
+        # Contracuenta: deuda (TOMA) o crédito por cobrar (COLOCA).
+        # Mismo signo que cash (positivo) para representar el saldo
+        # acumulado de la deuda/crédito en esa cuenta.
+        # Para TOMA: counter_account (LIABILITY) gana +monto = saldo deudor
+        # Para COLOCA: counter_account (CASH_BROKER) gana +monto = receivable
         insert_movement(
             conn, eid_open,
-            account=("external_expense" if tipo == "TOMA" else "external_income"),
+            account=counter_account,
             asset=moneda,
-            qty=-sign_cash * monto,
+            qty=monto,  # saldo positivo en la cuenta de funding
             notes=f"Contracuenta {tipo} {fund_id}",
         )
 
         # FUNDING_CLOSE: solo si status CLOSED y tenemos fecha fin
         if status == "CLOSED" and f_fin:
             interes = monto * tna * (dias / 365.0) if dias > 0 else 0.0
-            # TOMA cierro: pago monto + interés (cash sale)
-            # COLOCA cierro: recibo monto + interés (cash entra)
+            # TOMA cierro: pago monto + interés (cash sale, deuda cancelada)
+            # COLOCA cierro: recibo monto + interés (cash entra, crédito cancelado)
             sign_close = -sign_cash
             eid_close = insert_event(
                 conn, EventType.FUNDING_CLOSE,
@@ -331,18 +365,19 @@ def import_funding(conn, ws):
                 notes=(f"Linked Trade: {linked_trade_id}"
                        if linked_trade_id else None),
             )
-            # Capital de vuelta
+            # Capital de vuelta en la cuenta de cash
             insert_movement(
                 conn, eid_close, account=cuenta, asset=moneda,
                 qty=sign_close * monto,
                 notes=f"Capital {fund_id}",
             )
+            # Cancelar el saldo en la cuenta de funding (signo opuesto al OPEN)
             insert_movement(
                 conn, eid_close,
-                account=("external_income" if tipo == "TOMA" else "external_expense"),
+                account=counter_account,
                 asset=moneda,
-                qty=-sign_close * monto,
-                notes=f"Cancelación capital {fund_id}",
+                qty=-monto,
+                notes=f"Cancelación {tipo} {fund_id}",
             )
             # Interés (si hay)
             if abs(interes) > 1e-9:

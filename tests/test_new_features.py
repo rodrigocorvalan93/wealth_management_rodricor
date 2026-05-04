@@ -188,8 +188,8 @@ def test_b2_holdings_carry_investible():
 
 
 def test_b3_total_pn_split():
-    """total_pn separa total / invertible / no-invertible."""
-    print("\n[B3] total_pn separa invertible:")
+    """total_pn separa total / invertible / no-invertible y resta pasivos."""
+    print("\n[B3] total_pn separa invertible y resta pasivos:")
     with tempfile.TemporaryDirectory() as tmp:
         conn, _ = _setup_db(Path(tmp))
         holdings = calculate_holdings(conn, fecha=date(2026, 5, 2),
@@ -197,12 +197,23 @@ def test_b3_total_pn_split():
         tp = total_pn(holdings, "ARS")
         assert "total_investible" in tp
         assert "total_non_investible" in tp
+        assert "total_assets" in tp
+        assert "total_liabilities" in tp
         # Sanity: investible + non_invertible == total
         assert abs(tp["total_investible"] + tp["total_non_investible"]
                    - tp["total_anchor"]) < 1e-3
-        # cash_reserva (800k ARS) está en non_invertible
-        assert tp["total_non_investible"] >= 800000 - 1
-        print(f"  ✓ Total: {tp['total_anchor']:,.0f} = "
+        # cash_reserva (800k ARS, investible=0) → contribuye 800k a non_invertible
+        assert abs(tp["total_non_investible"] - 800000) < 1, \
+            f"non_invertible debería ser exactamente 800k (cash_reserva), got {tp['total_non_investible']}"
+        # La caución TOMA del master ejemplo (200M ARS) crea un LIABILITY
+        # que se suma a total_liabilities y se resta de total_anchor
+        assert tp["total_liabilities"] >= 200_000_000 - 1, \
+            f"total_liabilities debería incluir la caución 200M, got {tp['total_liabilities']}"
+        # PN total = activos - pasivos
+        assert abs(tp["total_anchor"] - (tp["total_assets"] - tp["total_liabilities"])) < 1
+        print(f"  ✓ Activos: {tp['total_assets']:,.0f}, "
+              f"Pasivos: {tp['total_liabilities']:,.0f}")
+        print(f"  ✓ PN Total NETO: {tp['total_anchor']:,.0f} = "
               f"Inv: {tp['total_investible']:,.0f} + "
               f"NoInv: {tp['total_non_investible']:,.0f}")
 
@@ -439,8 +450,8 @@ def test_d4_buying_power_summary():
 # =============================================================================
 
 def test_e1_funding_imported():
-    """Hoja funding genera FUNDING_OPEN events con linked trade."""
-    print("\n[E1] funding import:")
+    """Hoja funding genera FUNDING_OPEN events con linked trade y pasivo real."""
+    print("\n[E1] funding import + pasivo real:")
     with tempfile.TemporaryDirectory() as tmp:
         conn, _ = _setup_db(Path(tmp))
         cur = conn.execute(
@@ -449,13 +460,11 @@ def test_e1_funding_imported():
         rows = list(cur.fetchall())
         assert len(rows) >= 1, f"esperaba ≥1 FUNDING_OPEN, got {len(rows)}"
         ev = rows[0]
-        # external_id debe ser F0001
         assert ev["external_id"] == "F0001"
-        # notes debe tener "Linked Trade: T0001-A"
-        assert "T0001-A" in (ev["notes"] or ""), f"notes: {ev['notes']}"
+        assert "T0001-A" in (ev["notes"] or "")
         print(f"  ✓ {len(rows)} FUNDING_OPEN, primero linked a T0001-A")
 
-        # Verificar que generó movements: cocos +200M ARS, contracuenta -200M
+        # Verificar movements: cocos +200M ARS, caucion_pasivo_ars +200M ARS
         cur = conn.execute(
             """SELECT account, asset, qty FROM movements
                WHERE event_id=? ORDER BY account""",
@@ -463,11 +472,90 @@ def test_e1_funding_imported():
         )
         movs = list(cur.fetchall())
         assert len(movs) == 2
-        # cocos gana 200M (TOMA cash)
         cocos_mov = [m for m in movs if m["account"] == "cocos"][0]
         assert cocos_mov["qty"] == 200000000
-        print(f"  ✓ Movement cocos: +{cocos_mov['qty']:,.0f} ARS (TOMA caución)")
+        # Contracuenta: caucion_pasivo_ars (NO external_expense ya)
+        liab_mov = [m for m in movs if m["account"] == "caucion_pasivo_ars"][0]
+        assert liab_mov["qty"] == 200000000, \
+            f"caucion_pasivo_ars debería +200M (saldo deudor), got {liab_mov['qty']}"
+        print(f"  ✓ cocos: +{cocos_mov['qty']:,.0f} ARS")
+        print(f"  ✓ caucion_pasivo_ars: +{liab_mov['qty']:,.0f} ARS (deuda)")
+
+        # Verificar que la cuenta caucion_pasivo_ars existe con kind=LIABILITY
+        cur = conn.execute(
+            "SELECT kind FROM accounts WHERE code='caucion_pasivo_ars'"
+        )
+        row = cur.fetchone()
+        assert row is not None and row["kind"] == "LIABILITY", \
+            f"caucion_pasivo_ars debería ser LIABILITY, got {row}"
+        print(f"  ✓ caucion_pasivo_ars existe con kind=LIABILITY")
         conn.close()
+
+
+def test_f1_caucion_neteo_pn():
+    """Caución TOMA abierta: PN delta = 0 (cash compensa con deuda)."""
+    print("\n[F1] caución TOMA neteo PN:")
+    with tempfile.TemporaryDirectory() as tmp:
+        conn, _ = _setup_db(Path(tmp))
+        holdings = calculate_holdings(conn, fecha=date(2026, 5, 2),
+                                       anchor_currency="ARS")
+        # Buscar el pasivo
+        liabs = [h for h in holdings if h["account"] == "caucion_pasivo_ars"]
+        assert liabs, "caucion_pasivo_ars no aparece en holdings"
+        liab = liabs[0]
+        assert liab["is_liability"] is True
+        assert liab["mv_anchor"] == 200_000_000   # saldo deudor positivo
+        assert liab["mv_pn_anchor"] == -200_000_000  # impacta PN restando
+        print(f"  ✓ caucion_pasivo_ars: balance +{liab['mv_anchor']:,.0f}, "
+              f"PN impact {liab['mv_pn_anchor']:,.0f}")
+
+        # En total_pn, los 200M deudores netean los 200M cash que entraron a cocos
+        # Sin la caución, cocos tendría algún saldo X. Con la caución cocos tiene
+        # X+200M cash + (-200M) deuda = X PN neto. Sin inflar.
+        tp = total_pn(holdings, "ARS")
+        assert tp["total_liabilities"] >= 200_000_000
+        print(f"  ✓ Pasivos totales: {tp['total_liabilities']:,.0f} ARS")
+        print(f"  ✓ PN neto (Activos - Pasivos): {tp['total_anchor']:,.0f} ARS")
+
+
+def test_f2_card_credit_resta_pn():
+    """Tarjeta de crédito con saldo deudor resta del PN (no inflarlo)."""
+    print("\n[F2] tarjeta de crédito resta PN:")
+    with tempfile.TemporaryDirectory() as tmp:
+        conn, _ = _setup_db(Path(tmp))
+        # En el master ejemplo hay un gasto de 35k ARS con galicia_visa_ars
+        holdings = calculate_holdings(conn, fecha=date(2026, 5, 2),
+                                       anchor_currency="ARS")
+        cards = [h for h in holdings if h["account_kind"] == "CARD_CREDIT"
+                 and h.get("mv_anchor") is not None
+                 and abs(h["mv_anchor"]) > 1e-6]
+        if not cards:
+            print(f"  (no hay saldo de tarjeta en el ejemplo, skip)")
+            return
+        for c in cards:
+            assert c["is_liability"] is True
+            assert c["mv_pn_anchor"] == -c["mv_anchor"], \
+                f"PN impact tarjeta debería ser negativo del balance"
+            print(f"  ✓ {c['account']}: saldo +{c['mv_anchor']:,.0f}, "
+                  f"PN impact {c['mv_pn_anchor']:,.0f}")
+
+
+def test_f3_filter_helpers():
+    """filter_assets y filter_liabilities particionan correctamente."""
+    print("\n[F3] filter_assets / filter_liabilities:")
+    with tempfile.TemporaryDirectory() as tmp:
+        conn, _ = _setup_db(Path(tmp))
+        from engine.holdings import filter_assets, filter_liabilities
+        holdings = calculate_holdings(conn, fecha=date(2026, 5, 2),
+                                       anchor_currency="ARS")
+        assets = filter_assets(holdings)
+        liabs = filter_liabilities(holdings)
+        assert len(assets) + len(liabs) == len(holdings)
+        for h in assets:
+            assert not h.get("is_liability")
+        for h in liabs:
+            assert h.get("is_liability")
+        print(f"  ✓ {len(holdings)} holdings = {len(assets)} activos + {len(liabs)} pasivos")
 
 
 # =============================================================================
@@ -511,6 +599,50 @@ def test_exporter_excel_html_smoke():
         conn.close()
 
 
+def test_html_view_toggle():
+    """HTML report incluye toggle JS funcional con ambas vistas embebidas."""
+    print("\n[TOGGLE] HTML toggle entre 'Todo' y 'Solo invertible':")
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        conn, _ = _setup_db(tmp)
+        html_out = tmp / "report.html"
+        export_html(conn, html_out, fecha=date(2026, 5, 2),
+                    anchor_currency="ARS", default_view="all")
+        html = html_out.read_text(encoding="utf-8")
+
+        # UI elements
+        assert 'class="view-toggle"' in html
+        assert 'data-view="all"' in html
+        assert 'data-view="investible"' in html
+        # JS data
+        assert 'const VIEWS = ' in html
+        assert '"all"' in html and '"investible"' in html
+        assert 'DEFAULT_VIEW = "all"' in html
+        # Containers vacíos a llenar por JS
+        assert 'id="topHoldingsBody"' in html
+        assert 'id="byAccountBody"' in html
+        # Función renderView debe estar
+        assert 'function renderView' in html
+        print(f"  ✓ Toggle UI + JS data + render function presentes")
+
+        # Default view = investible
+        export_html(conn, html_out, fecha=date(2026, 5, 2),
+                    anchor_currency="ARS", default_view="investible")
+        html2 = html_out.read_text(encoding="utf-8")
+        assert 'DEFAULT_VIEW = "investible"' in html2
+        print(f"  ✓ default_view='investible' respetado")
+
+        # Excel con --investible-only
+        from engine.exporter import export_excel
+        xlsx_inv = tmp / "rep_inv.xlsx"
+        export_excel(conn, xlsx_inv, fecha=date(2026, 5, 2),
+                     anchor_currency="ARS", investible_only=True,
+                     record_snapshot=False)
+        assert xlsx_inv.is_file()
+        print(f"  ✓ Excel investible_only ({xlsx_inv.stat().st_size:,} bytes)")
+        conn.close()
+
+
 # =============================================================================
 # Main
 # =============================================================================
@@ -531,7 +663,11 @@ if __name__ == "__main__":
         test_d3_buying_power_margin_ibkr,
         test_d4_buying_power_summary,
         test_e1_funding_imported,
+        test_f1_caucion_neteo_pn,
+        test_f2_card_credit_resta_pn,
+        test_f3_filter_helpers,
         test_exporter_excel_html_smoke,
+        test_html_view_toggle,
     ]
     failed = []
     for t in tests:

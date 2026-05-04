@@ -37,6 +37,7 @@ from .holdings import (
     calculate_holdings, total_pn,
     by_asset_class, by_account, by_currency,
     filter_investible, filter_non_investible, by_cash_purpose,
+    filter_assets, filter_liabilities,
 )
 from .pnl import (
     calculate_realized_pnl, aggregate_pnl_by_asset,
@@ -300,7 +301,8 @@ def _sheet_cash_position(wb, holdings, anchor_ccy):
     widths = [25, 10, 18, 18]
     _write_headers(ws, 1, headers, widths)
 
-    cash_only = [h for h in holdings if h["is_cash"]]
+    # Solo cash de cuentas-activo (no incluye saldos deudores de tarjetas)
+    cash_only = [h for h in holdings if h["is_cash"] and not h.get("is_liability")]
     cash_only.sort(key=lambda h: -(h["mv_anchor"] or 0))
 
     for i, h in enumerate(cash_only, start=2):
@@ -506,29 +508,86 @@ def _sheet_trade_stats(wb, fills, anchor_ccy):
         ])
 
 
+def _sheet_pasivos(wb, holdings, anchor_ccy):
+    """Sección Pasivos: cauciones, tarjetas, préstamos. Cada saldo positivo
+    es plata que debés y resta del PN."""
+    ws = wb.create_sheet("Pasivos")
+
+    liabs = filter_liabilities(holdings)
+    liabs = [h for h in liabs if h.get("mv_anchor") is not None
+             and abs(h["mv_anchor"]) > 1e-6]
+
+    ws.cell(row=1, column=1, value="PASIVOS (deuda)").font = FONT_BOLD
+    ws.cell(row=2, column=1,
+            value=("Cuentas LIABILITY (cauciones, préstamos) y CARD_CREDIT "
+                   "(saldos de tarjetas). Cada saldo positivo es plata que debés.")
+            ).font = FONT_SUBTITLE
+
+    headers = [
+        "Cuenta", "Tipo", "Moneda", "Propósito",
+        f"Saldo deudor ({anchor_ccy})", f"Impacto en PN ({anchor_ccy})",
+        "Notas",
+    ]
+    widths = [25, 14, 8, 22, 20, 22, 30]
+    _write_headers(ws, 4, headers, widths)
+
+    if not liabs:
+        ws.cell(row=5, column=1,
+                value="Sin pasivos pendientes 🎉").font = FONT_SUBTITLE
+        return
+
+    total_liab = 0
+    for i, h in enumerate(liabs, start=5):
+        balance = h["mv_anchor"] or 0
+        pn_impact = h.get("mv_pn_anchor") or 0
+        total_liab += balance
+        _write_row(ws, i, [
+            h["account"], h.get("account_kind") or "",
+            h["asset"], h.get("cash_purpose") or "",
+            balance, pn_impact, h.get("name") or "",
+        ], formats=[
+            None, None, None, None, FMT_NUMBER, FMT_NUMBER, None,
+        ])
+
+    # Total
+    row = 5 + len(liabs) + 1
+    ws.cell(row=row, column=1, value="TOTAL PASIVOS").font = FONT_BOLD
+    cell = ws.cell(row=row, column=5, value=total_liab)
+    cell.font = FONT_BOLD
+    cell.number_format = FMT_NUMBER
+    cell = ws.cell(row=row, column=6, value=-total_liab)
+    cell.font = FONT_BOLD
+    cell.number_format = FMT_NUMBER
+
+
 def _sheet_invertible(wb, holdings, anchor_ccy):
-    """Sprint B: vista de PN invertible vs no-invertible."""
+    """Sprint B: vista de PN invertible vs no-invertible + balance contable."""
     ws = wb.create_sheet("PN Invertible")
 
     tp = total_pn(holdings, anchor_ccy)
 
-    ws.cell(row=1, column=1, value="PN INVERTIBLE vs NO-INVERTIBLE").font = FONT_BOLD
+    ws.cell(row=1, column=1, value="PN INVERTIBLE vs NO-INVERTIBLE + BALANCE").font = FONT_BOLD
     ws.cell(row=2, column=1,
-            value="Excluye cuentas marcadas como Investible=NO en la hoja 'cuentas'.").font = FONT_SUBTITLE
+            value="PN = Activos - Pasivos. Pasivos: cauciones tomadas, tarjetas, préstamos.").font = FONT_SUBTITLE
 
-    ws.cell(row=4, column=1, value="PN Total").font = FONT_NORMAL
-    cell = ws.cell(row=4, column=2, value=tp["total_anchor"])
-    cell.number_format = FMT_NUMBER
-    ws.cell(row=4, column=3, value=anchor_ccy).font = FONT_SUBTITLE
-
-    ws.cell(row=5, column=1, value="PN Invertible").font = FONT_BOLD
-    cell = ws.cell(row=5, column=2, value=tp["total_investible"])
-    cell.font = FONT_BOLD
-    cell.number_format = FMT_NUMBER
-
-    ws.cell(row=6, column=1, value="PN No-Invertible").font = FONT_NORMAL
-    cell = ws.cell(row=6, column=2, value=tp["total_non_investible"])
-    cell.number_format = FMT_NUMBER
+    rows = [
+        ("Activos Totales", tp["total_assets"], FONT_NORMAL),
+        ("Pasivos Totales", -tp["total_liabilities"], FONT_NORMAL),  # mostrado como negativo
+        ("PN Total NETO", tp["total_anchor"], FONT_BOLD),
+        ("", None, None),
+        ("PN Invertible", tp["total_investible"], FONT_BOLD),
+        ("PN No-Invertible", tp["total_non_investible"], FONT_NORMAL),
+    ]
+    for i, (label, val, font) in enumerate(rows, start=4):
+        if not label:
+            continue
+        ws.cell(row=i, column=1, value=label).font = font or FONT_NORMAL
+        if val is not None:
+            cell = ws.cell(row=i, column=2, value=val)
+            cell.font = font or FONT_NORMAL
+            cell.number_format = FMT_NUMBER
+        if i == 4 or i == 8:
+            ws.cell(row=i, column=3, value=anchor_ccy).font = FONT_SUBTITLE
 
     # Cash por purpose
     ws.cell(row=8, column=1, value="CASH POR PROPÓSITO").font = FONT_BOLD
@@ -782,25 +841,34 @@ def _sheet_pnl_no_realizado(wb, holdings, anchor_ccy):
 # =============================================================================
 
 def export_excel(conn, output_path, fecha=None, anchor_currency="USD",
-                 record_snapshot=True):
+                 record_snapshot=True, investible_only=False):
     """Genera Excel multi-sheet del portfolio. Devuelve Path del archivo.
 
     Si record_snapshot=True, appendea un snapshot del PN a `pn_snapshots`
     (necesario para construir la equity curve histórica).
+
+    Si investible_only=True, los breakdowns (asset class / cuenta / moneda /
+    holdings) excluyen las cuentas marcadas como NO-INVERTIBLE.
     """
     if fecha is None:
         fecha = date.today()
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    holdings = calculate_holdings(conn, fecha=fecha, anchor_currency=anchor_currency)
+    holdings_full = calculate_holdings(conn, fecha=fecha, anchor_currency=anchor_currency)
     fills = calculate_realized_pnl(conn, fecha_hasta=fecha)
 
     if record_snapshot:
         try:
-            record_snapshots(conn, holdings, fecha, anchor_currency)
+            record_snapshots(conn, holdings_full, fecha, anchor_currency)
         except Exception as e:
             print(f"[exporter] WARN no se pudo guardar snapshot: {e}")
+
+    # Vista filtrada vs completa
+    if investible_only:
+        holdings = filter_investible(holdings_full)
+    else:
+        holdings = holdings_full
 
     wb = Workbook()
     if "Sheet" in wb.sheetnames:
@@ -810,14 +878,16 @@ def export_excel(conn, output_path, fecha=None, anchor_currency="USD",
     _sheet_holdings(wb, holdings, anchor_currency)
     _sheet_pn_by_account(wb, holdings, anchor_currency)
     _sheet_pn_by_class(wb, holdings, anchor_currency)
-    _sheet_invertible(wb, holdings, anchor_currency)            # Sprint B
+    # PN Invertible siempre usa la vista completa (compara ambos lados)
+    _sheet_invertible(wb, holdings_full, anchor_currency)
+    _sheet_pasivos(wb, holdings_full, anchor_currency)          # Fix: pasivos
     _sheet_cash_position(wb, holdings, anchor_currency)
-    _sheet_buying_power(wb, conn, holdings, anchor_currency)    # Sprint D
-    _sheet_equity_curve(wb, conn, anchor_currency)              # Sprint C
+    _sheet_buying_power(wb, conn, holdings_full, anchor_currency)
+    _sheet_equity_curve(wb, conn, anchor_currency)
     _sheet_tarjetas(wb, conn, fecha)
     _sheet_pnl_realizado(wb, fills, anchor_currency)
     _sheet_pnl_no_realizado(wb, holdings, anchor_currency)
-    _sheet_trade_stats(wb, fills, anchor_currency)              # Sprint A
+    _sheet_trade_stats(wb, fills, anchor_currency)
 
     wb.save(str(output_path))
     return output_path
@@ -846,7 +916,14 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   .subtitle {{ color: #595959; font-size: 14px; margin-bottom: 24px; }}
   .kpi-grid {{
     display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px;
+    margin-bottom: 16px;
+  }}
+  .kpi-grid.balance {{
+    display: grid; grid-template-columns: repeat(2, 1fr); gap: 16px;
     margin-bottom: 24px;
+  }}
+  .kpi-grid.balance .kpi {{
+    background: #FAFBFC;
   }}
   .kpi {{
     background: white; border-radius: 12px; padding: 20px;
@@ -890,6 +967,28 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   .stat-mini-label {{ color: #595959; }}
   .stat-mini-value {{ font-weight: 600; font-variant-numeric: tabular-nums; }}
   details summary {{ cursor: pointer; font-weight: 600; color: #1F3864; }}
+  .view-toggle {{
+    display: inline-flex; background: white; border-radius: 10px;
+    padding: 4px; box-shadow: 0 2px 4px rgba(0,0,0,0.05); margin: 0 0 20px 0;
+    gap: 4px;
+  }}
+  .view-toggle button {{
+    border: none; background: transparent; padding: 8px 18px;
+    border-radius: 8px; cursor: pointer; font-size: 13px; font-weight: 600;
+    color: #595959; transition: background .15s, color .15s;
+  }}
+  .view-toggle button.active {{
+    background: #1F3864; color: white;
+  }}
+  .view-toggle button:hover:not(.active) {{
+    background: #f0f0f0;
+  }}
+  .view-tag {{
+    display: inline-block; background: #E8F4F8; color: #1F3864;
+    padding: 2px 8px; border-radius: 6px; font-size: 11px; font-weight: 600;
+    margin-left: 8px; vertical-align: middle;
+  }}
+  .empty-row {{ color: #999; font-style: italic; text-align: center; }}
 </style>
 </head>
 <body>
@@ -897,9 +996,14 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   <h1>📊 Portfolio</h1>
   <div class="subtitle">Fecha: {fecha}  ·  Moneda ancla: {anchor_ccy}</div>
 
+  <div class="view-toggle" role="tablist" aria-label="Vista">
+    <button data-view="all" id="btnViewAll">📦 Todo</button>
+    <button data-view="investible" id="btnViewInv">💎 Solo invertible</button>
+  </div>
+
   <div class="kpi-grid">
     <div class="kpi">
-      <div class="kpi-label">Patrimonio Neto Total</div>
+      <div class="kpi-label">Patrimonio Neto (Activos − Pasivos)</div>
       <div class="kpi-value">{pn_formatted}</div>
       <div class="kpi-currency">{anchor_ccy}</div>
     </div>
@@ -915,15 +1019,28 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     </div>
   </div>
 
+  <div class="kpi-grid balance">
+    <div class="kpi">
+      <div class="kpi-label">📈 Activos Totales</div>
+      <div class="kpi-value positive">{total_assets_formatted}</div>
+      <div class="kpi-currency">{anchor_ccy}</div>
+    </div>
+    <div class="kpi">
+      <div class="kpi-label">📉 Pasivos Totales (deuda)</div>
+      <div class="kpi-value negative">{total_liabilities_formatted}</div>
+      <div class="kpi-currency">{anchor_ccy} (cauciones, tarjetas, préstamos)</div>
+    </div>
+  </div>
+
   {warn_html}
 
   <div class="grid">
     <div class="card">
-      <h2>Por Asset Class</h2>
+      <h2>Por Asset Class <span class="view-tag" id="tagClass"></span></h2>
       <div class="chart-container"><canvas id="chartClass"></canvas></div>
     </div>
     <div class="card">
-      <h2>Por Moneda Nativa</h2>
+      <h2>Por Moneda Nativa <span class="view-tag" id="tagCcy"></span></h2>
       <div class="chart-container"><canvas id="chartCcy"></canvas></div>
     </div>
   </div>
@@ -948,7 +1065,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   </div>
 
   <div class="card" style="margin-top: 24px;">
-    <h2>Top 15 Posiciones</h2>
+    <h2>Top 15 Posiciones <span class="view-tag" id="tagTop"></span></h2>
     <table>
       <thead>
         <tr>
@@ -961,18 +1078,38 @@ HTML_TEMPLATE = """<!DOCTYPE html>
           <th class="num">Unrealized %</th>
         </tr>
       </thead>
-      <tbody>
-{top_holdings_rows}
-      </tbody>
+      <tbody id="topHoldingsBody"></tbody>
+    </table>
+  </div>
+
+  <div class="card" style="margin-top: 24px; border-left: 4px solid #C00000;">
+    <h2>📉 Pasivos (deuda) <span class="view-tag" id="tagLiab"></span></h2>
+    <div class="info">
+      Cuentas LIABILITY (cauciones tomadas, préstamos) y CARD_CREDIT (saldos
+      de tarjetas). Cada balance positivo es plata que <b>debés</b>; impacta
+      el PN total restando.
+    </div>
+    <table>
+      <thead>
+        <tr>
+          <th>Cuenta</th>
+          <th>Tipo</th>
+          <th>Moneda</th>
+          <th>Propósito</th>
+          <th class="num">Saldo deudor</th>
+          <th class="num">Impacto en PN ({anchor_ccy})</th>
+        </tr>
+      </thead>
+      <tbody id="liabilitiesBody"></tbody>
     </table>
   </div>
 
   <div class="grid" style="margin-top: 24px;">
     <div class="card">
-      <h2>PN por Cuenta</h2>
+      <h2>PN por Cuenta <span class="view-tag" id="tagAcc"></span></h2>
       <table>
         <thead><tr><th>Cuenta</th><th class="num">MV ({anchor_ccy})</th><th class="num">%</th></tr></thead>
-        <tbody>{by_account_rows}</tbody>
+        <tbody id="byAccountBody"></tbody>
       </table>
     </div>
     <div class="card">
@@ -998,34 +1135,128 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 </div>
 
 <script>
-const dataClass = {data_class_json};
-const dataCcy = {data_ccy_json};
+const VIEWS = {views_json};
+const DEFAULT_VIEW = "{default_view}";
 const equityData = {equity_curve_json};
+const ANCHOR = "{anchor_ccy}";
 
-new Chart(document.getElementById('chartClass'), {{
-  type: 'doughnut',
-  data: {{
-    labels: dataClass.labels,
-    datasets: [{{
-      data: dataClass.values,
-      backgroundColor: ['#1F3864','#2E5B9C','#4F81BD','#8DB4E2','#B8CCE4','#DCE6F1','#F2F2F2'],
-    }}]
-  }},
-  options: {{ responsive: true, maintainAspectRatio: false }}
+// Helpers
+function fmtNum(v, dec) {{
+  if (v === null || v === undefined) return "-";
+  return Number(v).toLocaleString('es-AR', {{
+    minimumFractionDigits: dec || 0,
+    maximumFractionDigits: dec || 2,
+  }});
+}}
+function fmtPct(v) {{
+  if (v === null || v === undefined) return "-";
+  const cls = v > 0 ? "positive" : v < 0 ? "negative" : "";
+  const sign = v > 0 ? "+" : "";
+  return `<span class="${{cls}}">${{sign}}${{(v * 100).toFixed(2)}}%</span>`;
+}}
+
+// Chart instances (re-renderables)
+let chartClass = null, chartCcy = null;
+
+function buildDoughnut(canvasId, data, palette) {{
+  return new Chart(document.getElementById(canvasId), {{
+    type: 'doughnut',
+    data: {{
+      labels: data.labels,
+      datasets: [{{ data: data.values, backgroundColor: palette }}]
+    }},
+    options: {{ responsive: true, maintainAspectRatio: false }}
+  }});
+}}
+
+function renderView(viewKey) {{
+  const v = VIEWS[viewKey];
+  if (!v) return;
+
+  // 1. Asset class chart
+  if (chartClass) chartClass.destroy();
+  chartClass = buildDoughnut('chartClass', v.cls,
+    ['#1F3864','#2E5B9C','#4F81BD','#8DB4E2','#B8CCE4','#DCE6F1','#F2F2F2','#7E7E7E']);
+
+  // 2. Currency chart
+  if (chartCcy) chartCcy.destroy();
+  chartCcy = buildDoughnut('chartCcy', v.ccy,
+    ['#1F3864','#00B050','#C00000','#FFC107','#9C27B0','#FF5722']);
+
+  // 3. Top holdings table
+  const topBody = document.getElementById('topHoldingsBody');
+  if (!v.top_holdings || v.top_holdings.length === 0) {{
+    topBody.innerHTML = '<tr><td colspan="7" class="empty-row">Sin posiciones en esta vista</td></tr>';
+  }} else {{
+    topBody.innerHTML = v.top_holdings.map(h => `
+      <tr>
+        <td>${{h.account}}</td>
+        <td>${{h.asset}}</td>
+        <td>${{h.asset_class || ''}}</td>
+        <td class="num">${{fmtNum(h.qty, 4)}}</td>
+        <td class="num">${{fmtNum(h.market_price, 4)}}</td>
+        <td class="num">${{fmtNum(h.mv_anchor, 2)}}</td>
+        <td class="num">${{fmtPct(h.unrealized_pct)}}</td>
+      </tr>
+    `).join('');
+  }}
+
+  // 4. PN por cuenta table
+  const accBody = document.getElementById('byAccountBody');
+  if (!v.accs || v.accs.length === 0) {{
+    accBody.innerHTML = '<tr><td colspan="3" class="empty-row">Sin cuentas en esta vista</td></tr>';
+  }} else {{
+    accBody.innerHTML = v.accs.map(a => {{
+      const cls = a.mv < 0 ? 'negative' : '';
+      return `
+      <tr>
+        <td>${{a.account}}</td>
+        <td class="num"><span class="${{cls}}">${{fmtNum(a.mv, 2)}}</span></td>
+        <td class="num">${{(a.pct * 100).toFixed(1)}}%</td>
+      </tr>
+    `;
+    }}).join('');
+  }}
+
+  // 5. Pasivos table
+  const liabBody = document.getElementById('liabilitiesBody');
+  if (!v.liabilities || v.liabilities.length === 0) {{
+    liabBody.innerHTML = '<tr><td colspan="6" class="empty-row">Sin pasivos pendientes 🎉</td></tr>';
+  }} else {{
+    liabBody.innerHTML = v.liabilities.map(l => `
+      <tr>
+        <td><b>${{l.account}}</b></td>
+        <td>${{l.kind || ''}}</td>
+        <td>${{l.asset || ''}}</td>
+        <td>${{l.purpose || ''}}</td>
+        <td class="num"><span class="negative">${{fmtNum(l.balance, 2)}}</span></td>
+        <td class="num"><span class="negative">${{fmtNum(l.pn_impact, 2)}}</span></td>
+      </tr>
+    `).join('');
+  }}
+
+  // 6. Tags
+  const tagText = viewKey === 'investible' ? 'solo invertible' : 'todo';
+  ['tagClass','tagCcy','tagTop','tagAcc','tagLiab'].forEach(id => {{
+    const el = document.getElementById(id);
+    if (el) el.textContent = tagText;
+  }});
+
+  // 6. Toggle buttons active state
+  document.querySelectorAll('.view-toggle button').forEach(b => {{
+    b.classList.toggle('active', b.dataset.view === viewKey);
+  }});
+}}
+
+// Wire up toggle
+document.querySelectorAll('.view-toggle button').forEach(btn => {{
+  btn.addEventListener('click', () => renderView(btn.dataset.view));
 }});
 
-new Chart(document.getElementById('chartCcy'), {{
-  type: 'doughnut',
-  data: {{
-    labels: dataCcy.labels,
-    datasets: [{{
-      data: dataCcy.values,
-      backgroundColor: ['#1F3864','#00B050','#C00000','#FFC107','#9C27B0','#FF5722'],
-    }}]
-  }},
-  options: {{ responsive: true, maintainAspectRatio: false }}
-}});
+// Initial render
+renderView(DEFAULT_VIEW);
 
+// Equity curve (independiente del toggle — siempre muestra Total + Invertible)
 if (equityData && equityData.labels && equityData.labels.length > 0) {{
   const palette = ['#1F3864','#00B050','#C00000','#FFC107','#9C27B0','#FF5722',
                    '#4F81BD','#8DB4E2','#2E5B9C','#595959'];
@@ -1268,56 +1499,98 @@ def _equity_curve_chart_data(conn, anchor_ccy):
     return {"labels": all_dates, "series": series}
 
 
+def _compute_view_data(holdings, anchor_currency):
+    """Calcula los datasets de un "view" para el HTML toggle.
+
+    Devuelve dict con cls/ccy/accs/top_holdings/liabilities listos para JSON o tablas.
+    Top holdings excluye pasivos (van a su sección propia).
+    """
+    cls_data = by_asset_class(holdings)
+    ccy_data = by_currency(holdings)
+    accs = by_account(holdings)
+    accs_total = sum(abs(v) for v in accs.values())
+
+    # Top 15 ASSETS (no liabilities)
+    assets_only = filter_assets(holdings)
+    top_assets = sorted(
+        [h for h in assets_only if h.get("mv_anchor") is not None],
+        key=lambda h: -(h["mv_anchor"] or 0),
+    )[:15]
+
+    # Pasivos (CARD_CREDIT + LIABILITY) con su detalle
+    liabilities = filter_liabilities(holdings)
+    liab_rows = sorted(
+        [h for h in liabilities if h.get("mv_anchor") is not None and abs(h["mv_anchor"]) > 1e-6],
+        key=lambda h: -(h["mv_anchor"] or 0),
+    )
+
+    return {
+        "cls": {"labels": list(cls_data.keys()), "values": list(cls_data.values())},
+        "ccy": {"labels": list(ccy_data.keys()), "values": list(ccy_data.values())},
+        "accs": [
+            {"account": acc, "mv": val,
+             "pct": (val / accs_total) if accs_total else 0}
+            for acc, val in list(accs.items())[:15]
+        ],
+        "top_holdings": [
+            {
+                "account": h["account"],
+                "asset": h["asset"],
+                "asset_class": h.get("asset_class", "") or "",
+                "qty": h["qty"],
+                "market_price": h["market_price"],
+                "mv_anchor": h["mv_anchor"],
+                "unrealized_pct": h.get("unrealized_pct"),
+            }
+            for h in top_assets
+        ],
+        "liabilities": [
+            {
+                "account": h["account"],
+                "asset": h["asset"],
+                "kind": h.get("account_kind") or "",
+                "balance": h["mv_anchor"],          # positivo = saldo deudor
+                "pn_impact": h.get("mv_pn_anchor"), # negativo = resta del PN
+                "purpose": h.get("cash_purpose") or "",
+            }
+            for h in liab_rows
+        ],
+    }
+
+
 def export_html(conn, output_path, fecha=None, anchor_currency="USD",
-                record_snapshot=True):
-    """Genera HTML autocontenido del portfolio. Devuelve Path."""
+                record_snapshot=True, default_view="all"):
+    """Genera HTML autocontenido del portfolio. Devuelve Path.
+
+    El HTML incluye un TOGGLE entre vista "Todo" (incluye no-invertibles) y
+    "Solo invertible" (excluye reserva no declarada, etc.). Ambos datasets
+    se incrustan en el HTML; el toggle JS hace el switch sin re-cargar.
+
+    `default_view`: 'all' o 'investible' — qué vista se muestra al abrir.
+    """
     if fecha is None:
         fecha = date.today()
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    holdings = calculate_holdings(conn, fecha=fecha, anchor_currency=anchor_currency)
+    holdings_full = calculate_holdings(conn, fecha=fecha, anchor_currency=anchor_currency)
     fills = calculate_realized_pnl(conn, fecha_hasta=fecha)
 
     if record_snapshot:
         try:
-            record_snapshots(conn, holdings, fecha, anchor_currency)
+            record_snapshots(conn, holdings_full, fecha, anchor_currency)
         except Exception as e:
             print(f"[exporter] WARN no se pudo guardar snapshot: {e}")
 
-    tp = total_pn(holdings, anchor_currency)
-    cls_data = by_asset_class(holdings)
-    ccy_data = by_currency(holdings)
-    accs = by_account(holdings)
-    accs_total = sum(accs.values())
+    tp = total_pn(holdings_full, anchor_currency)
+    holdings_inv = filter_investible(holdings_full)
 
-    # Top 15 holdings
-    top_15 = [h for h in holdings[:15]]
-    top_rows = []
-    for h in top_15:
-        top_rows.append(
-            f'<tr>'
-            f'<td>{h["account"]}</td>'
-            f'<td>{h["asset"]}</td>'
-            f'<td>{h.get("asset_class", "")}</td>'
-            f'<td class="num">{_fmt_number(h["qty"], 4)}</td>'
-            f'<td class="num">{_fmt_number(h["market_price"], 4)}</td>'
-            f'<td class="num">{_fmt_number(h["mv_anchor"])}</td>'
-            f'<td class="num">{_fmt_pct(h.get("unrealized_pct"))}</td>'
-            f'</tr>'
-        )
+    # Datasets para ambas vistas
+    view_all = _compute_view_data(holdings_full, anchor_currency)
+    view_inv = _compute_view_data(holdings_inv, anchor_currency)
 
-    # By account
-    by_acc_rows = []
-    for acc, val in list(accs.items())[:15]:
-        pct = (val / accs_total) if accs_total else 0
-        by_acc_rows.append(
-            f'<tr><td>{acc}</td>'
-            f'<td class="num">{_fmt_number(val)}</td>'
-            f'<td class="num">{pct*100:.1f}%</td></tr>'
-        )
-
-    # PnL por año + moneda
+    # PnL por año + moneda (mismo en ambas vistas — los trades cerrados
+    # son cerrados, no dependen de qué cuentas son invertibles)
     pnl_yc = aggregate_pnl_by_year_currency(fills)
     pnl_year_rows = []
     for item in pnl_yc:
@@ -1331,13 +1604,13 @@ def export_html(conn, output_path, fecha=None, anchor_currency="USD",
     if not pnl_year_rows:
         pnl_year_rows.append('<tr><td colspan="4" style="text-align: center; color: #595959;">Sin trades cerrados aún</td></tr>')
 
-    # Warn
+    # Warn de FX faltante
     warn = ""
     if tp["total_unconverted_count"] > 0:
         warn = f'<div class="warn">⚠ {tp["total_unconverted_count"]} posiciones sin FX hacia {anchor_currency}, no incluidas en el total</div>'
 
-    # Cash purpose rows (Sprint B)
-    purposes = by_cash_purpose(holdings)
+    # Cash purpose (siempre vista completa)
+    purposes = by_cash_purpose(holdings_full)
     cash_purpose_rows = []
     for p, val in purposes.items():
         cash_purpose_rows.append(
@@ -1346,29 +1619,30 @@ def export_html(conn, output_path, fecha=None, anchor_currency="USD",
     if not cash_purpose_rows:
         cash_purpose_rows.append('<tr><td colspan="2" style="color: #595959; text-align: center;">Sin cash registrado</td></tr>')
 
+    # Render datasets como JSON para el toggle JS
+    views_json = json.dumps({
+        "all": view_all,
+        "investible": view_inv,
+        "default": default_view if default_view in ("all", "investible") else "all",
+    })
+
     html = HTML_TEMPLATE.format(
         fecha=fecha.isoformat(),
         anchor_ccy=anchor_currency,
         pn_formatted=_fmt_number(tp["total_anchor"]),
         pn_invertible_formatted=_fmt_number(tp["total_investible"]),
         pn_non_invertible_formatted=_fmt_number(tp["total_non_investible"]),
+        total_assets_formatted=_fmt_number(tp["total_assets"]),
+        total_liabilities_formatted=_fmt_number(tp["total_liabilities"]),
         warn_html=warn,
-        top_holdings_rows="\n".join(top_rows),
-        by_account_rows="\n".join(by_acc_rows),
         pnl_year_rows="\n".join(pnl_year_rows),
         cash_purpose_rows="\n".join(cash_purpose_rows),
         trade_stats_block=_html_trade_stats_block(fills, anchor_currency),
-        buying_power_block=_html_buying_power_block(conn, holdings, anchor_currency),
+        buying_power_block=_html_buying_power_block(conn, holdings_full, anchor_currency),
         equity_curve_block=_html_equity_curve_block(conn, anchor_currency),
-        data_class_json=json.dumps({
-            "labels": list(cls_data.keys()),
-            "values": list(cls_data.values()),
-        }),
-        data_ccy_json=json.dumps({
-            "labels": list(ccy_data.keys()),
-            "values": list(ccy_data.values()),
-        }),
         equity_curve_json=json.dumps(_equity_curve_chart_data(conn, anchor_currency)),
+        views_json=views_json,
+        default_view=default_view if default_view in ("all", "investible") else "all",
     )
 
     output_path.write_text(html, encoding="utf-8")

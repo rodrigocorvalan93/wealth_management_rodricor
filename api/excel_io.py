@@ -49,7 +49,7 @@ BORDER_THIN = Border(
 )
 
 
-# Sheet → prefijo de Row ID
+# Sheet → prefijo de Row ID (auto-generado para hojas de eventos)
 SHEET_PREFIX = {
     "blotter": "BL",
     "gastos": "GS",
@@ -61,6 +61,34 @@ SHEET_PREFIX = {
     "recurrentes": "RC",
     "pagos_pasivos": "PP",
 }
+
+# Hojas maestras: usan natural key (no auto-genera Row ID).
+# {sheet: column_with_natural_key}
+MASTER_SHEETS = {
+    "especies": "Ticker",
+    "monedas":  "Code",
+    "cuentas":  "Code",
+    "aforos":   None,  # composite key, ver más abajo (skip por ahora)
+    "margin_config": "Account",
+}
+
+# Todas las hojas soportadas por la API
+ALLOWED_SHEETS = set(SHEET_PREFIX.keys()) | set(
+    s for s, k in MASTER_SHEETS.items() if k is not None
+)
+
+
+def is_master_sheet(sheet: str) -> bool:
+    """True si la hoja usa natural key en vez de Row ID auto-generado."""
+    return sheet in MASTER_SHEETS and MASTER_SHEETS[sheet] is not None
+
+
+def _key_column_for(sheet: str) -> str:
+    """Devuelve la columna que se usa como handle de fila en esta hoja."""
+    if is_master_sheet(sheet):
+        return MASTER_SHEETS[sheet]
+    return "Row ID"
+
 
 HEADER_ROW = 4  # convención del master
 
@@ -162,7 +190,10 @@ def _serialize_value(value: Any) -> Any:
 def list_rows(xlsx_path: Path, sheet: str) -> list[dict]:
     """Lista todas las filas de una hoja como dicts.
 
-    El dict incluye 'row_id' (de la columna Row ID) y todos los headers.
+    Para hojas de eventos: incluye 'row_id' tomado de la columna 'Row ID'.
+    Para hojas maestras: incluye 'row_id' tomado de la columna natural
+    (Ticker para especies, Code para monedas/cuentas, etc).
+
     Filas completamente vacías se filtran.
     """
     wb = load_workbook(filename=str(xlsx_path), data_only=True)
@@ -175,6 +206,7 @@ def list_rows(xlsx_path: Path, sheet: str) -> list[dict]:
 
     last_col = max(headers.values())
     last_row = _last_data_row(ws, last_col_with_header=last_col)
+    key_col_name = _key_column_for(sheet)
 
     out = []
     for r in range(HEADER_ROW + 1, last_row + 1):
@@ -187,10 +219,10 @@ def list_rows(xlsx_path: Path, sheet: str) -> list[dict]:
             row_dict[h] = _serialize_value(v)
         if all_empty:
             continue
-        # Normalizar: row_id como key principal
-        rid = row_dict.get("Row ID") or row_dict.get("row_id")
-        if rid:
-            row_dict["row_id"] = rid
+        # Normalizar: row_id como key principal (puede ser "Row ID" o natural)
+        rid = row_dict.get(key_col_name) or row_dict.get("row_id")
+        if rid is not None:
+            row_dict["row_id"] = str(rid).strip()
         # Excel row number (útil para debug, no para identificar)
         row_dict["_excel_row"] = r
         out.append(row_dict)
@@ -198,10 +230,14 @@ def list_rows(xlsx_path: Path, sheet: str) -> list[dict]:
 
 
 def get_row(xlsx_path: Path, sheet: str, row_id: str) -> Optional[dict]:
-    """Devuelve la fila con ese Row ID o None."""
+    """Devuelve la fila con ese ID o None.
+
+    Para hojas maestras, `row_id` es el natural key (ej: ticker AL30D).
+    """
     rows = list_rows(xlsx_path, sheet)
+    target = str(row_id).strip()
     for row in rows:
-        if row.get("row_id") == row_id:
+        if str(row.get("row_id") or "").strip() == target:
             return row
     return None
 
@@ -238,13 +274,14 @@ def _ensure_row_id_column(ws: Worksheet, headers: dict) -> int:
 
 
 def append_row(xlsx_path: Path, sheet: str, data: dict) -> str:
-    """Agrega una fila nueva. Devuelve el Row ID asignado.
+    """Agrega una fila nueva. Devuelve el ID asignado.
 
-    `data`: dict de {header: value}. Los headers desconocidos se ignoran.
+    Para hojas de eventos: auto-genera Row ID (BL-XXXX, GS-XXXX, etc).
+    Para hojas maestras: requiere que `data` contenga el natural key
+    (Ticker / Code / Account según corresponda) y falla si ya existe.
     """
-    if sheet not in SHEET_PREFIX:
-        raise ValueError(f"Sheet '{sheet}' no soportada para append")
-    prefix = SHEET_PREFIX[sheet]
+    if sheet not in ALLOWED_SHEETS:
+        raise ValueError(f"Sheet '{sheet}' no soportada")
 
     wb = load_workbook(filename=str(xlsx_path))
     if sheet not in wb.sheetnames:
@@ -254,6 +291,45 @@ def append_row(xlsx_path: Path, sheet: str, data: dict) -> str:
     if not headers:
         raise ValueError(f"Hoja '{sheet}' sin headers")
 
+    if is_master_sheet(sheet):
+        # MASTER: usar natural key del data, no auto-genera
+        key_col_name = _key_column_for(sheet)
+        natural_key = data.get(key_col_name)
+        if not natural_key:
+            raise ValueError(
+                f"Para crear en '{sheet}' tenés que enviar '{key_col_name}'"
+            )
+        natural_key = str(natural_key).strip()
+        # Validar que no esté duplicado
+        existing = get_row(xlsx_path, sheet, natural_key)
+        if existing is not None:
+            raise ValueError(
+                f"Ya existe '{key_col_name}={natural_key}' en {sheet}. "
+                f"Usá PUT /api/sheets/{sheet}/{natural_key} para modificar."
+            )
+        last_col = max(headers.values())
+        last_row = _last_data_row(ws, last_col_with_header=last_col)
+        new_row = last_row + 1
+        for h, c in headers.items():
+            if h in data:
+                val = _coerce_value(data[h])
+                if val is None and h == key_col_name:
+                    continue  # ya validado arriba
+                cell = ws.cell(row=new_row, column=c, value=val)
+                cell.font = FONT_INPUT
+                cell.fill = FILL_INPUT
+                cell.border = BORDER_THIN
+                if isinstance(val, (date, datetime)):
+                    cell.number_format = "yyyy-mm-dd"
+                elif isinstance(val, (int, float)):
+                    cell.number_format = '#,##0.0000;[Red](#,##0.0000)'
+        wb.save(str(xlsx_path))
+        return natural_key
+
+    # EVENT: auto-generar Row ID
+    if sheet not in SHEET_PREFIX:
+        raise ValueError(f"Sheet '{sheet}' no soportada para append (evento)")
+    prefix = SHEET_PREFIX[sheet]
     row_id_col = _ensure_row_id_column(ws, headers)
     used = _used_row_ids(ws, headers)
     new_id = _next_row_id(prefix, used)
@@ -262,7 +338,6 @@ def append_row(xlsx_path: Path, sheet: str, data: dict) -> str:
     last_row = _last_data_row(ws, last_col_with_header=last_col)
     new_row = last_row + 1
 
-    # Escribir todos los headers conocidos
     for h, c in headers.items():
         if h == "Row ID":
             cell = ws.cell(row=new_row, column=c, value=new_id)
@@ -275,7 +350,6 @@ def append_row(xlsx_path: Path, sheet: str, data: dict) -> str:
             cell.font = FONT_INPUT
             cell.fill = FILL_INPUT
             cell.border = BORDER_THIN
-            # Formato amigable según tipo
             if isinstance(val, (date, datetime)):
                 cell.number_format = "yyyy-mm-dd"
             elif isinstance(val, (int, float)):
@@ -286,33 +360,37 @@ def append_row(xlsx_path: Path, sheet: str, data: dict) -> str:
 
 
 def update_row(xlsx_path: Path, sheet: str, row_id: str, data: dict) -> dict:
-    """Modifica los campos de una fila por Row ID. Devuelve la fila actualizada.
+    """Modifica los campos de una fila por ID. Devuelve la fila actualizada.
 
-    Solo se modifican las claves presentes en `data` que coinciden con headers.
+    Para hojas maestras: la columna del natural key NO se puede modificar
+    desde update (filtramos data). Si querés cambiar el key, borrá y creá.
     """
     wb = load_workbook(filename=str(xlsx_path))
     if sheet not in wb.sheetnames:
         raise ValueError(f"Hoja '{sheet}' no existe")
     ws = wb[sheet]
     headers = _read_headers(ws)
-    if "Row ID" not in headers:
-        raise ValueError(f"Hoja '{sheet}' no tiene columna Row ID")
 
-    rid_col = headers["Row ID"]
+    key_col_name = _key_column_for(sheet)
+    if key_col_name not in headers:
+        raise ValueError(f"Hoja '{sheet}' no tiene columna '{key_col_name}'")
+
+    key_col = headers[key_col_name]
     last_col = max(headers.values())
     last_row = _last_data_row(ws, last_col_with_header=last_col)
 
     target_row = None
+    target_key = str(row_id).strip()
     for r in range(HEADER_ROW + 1, last_row + 1):
-        if str(ws.cell(row=r, column=rid_col).value or "").strip() == row_id:
+        if str(ws.cell(row=r, column=key_col).value or "").strip() == target_key:
             target_row = r
             break
     if target_row is None:
-        raise KeyError(f"Row ID '{row_id}' no encontrado en hoja '{sheet}'")
+        raise KeyError(f"'{row_id}' no encontrado en hoja '{sheet}'")
 
     for h, c in headers.items():
-        if h == "Row ID":
-            continue
+        if h == key_col_name:
+            continue  # natural key / Row ID inmutables vía update
         if h in data:
             val = _coerce_value(data[h])
             cell = ws.cell(row=target_row, column=c, value=val)
@@ -329,38 +407,49 @@ def update_row(xlsx_path: Path, sheet: str, row_id: str, data: dict) -> dict:
 
 
 def delete_row(xlsx_path: Path, sheet: str, row_id: str) -> bool:
-    """Limpia los datos de la fila (deja vacía pero NO la elimina).
+    """Borra una fila.
 
-    Esto evita renumerar Row IDs subsiguientes y mantiene estabilidad.
-    Devuelve True si encontró y limpió la fila.
+    - Hojas de eventos: SOFT delete (limpia campos, preserva Row ID tombstone)
+      para mantener estabilidad de IDs subsiguientes.
+    - Hojas maestras: HARD delete (remueve la fila entera). El natural key
+      no debe quedar como tombstone porque colisionaría con futuros agregados.
+
+    Devuelve True si encontró y borró la fila.
     """
     wb = load_workbook(filename=str(xlsx_path))
     if sheet not in wb.sheetnames:
         return False
     ws = wb[sheet]
     headers = _read_headers(ws)
-    if "Row ID" not in headers:
+
+    key_col_name = _key_column_for(sheet)
+    if key_col_name not in headers:
         return False
 
-    rid_col = headers["Row ID"]
+    key_col = headers[key_col_name]
     last_col = max(headers.values())
     last_row = _last_data_row(ws, last_col_with_header=last_col)
 
     target_row = None
+    target_key = str(row_id).strip()
     for r in range(HEADER_ROW + 1, last_row + 1):
-        if str(ws.cell(row=r, column=rid_col).value or "").strip() == row_id:
+        if str(ws.cell(row=r, column=key_col).value or "").strip() == target_key:
             target_row = r
             break
     if target_row is None:
         return False
 
-    # Limpiar todos los campos excepto Row ID (lo dejamos como tombstone).
-    # IMPORTANTE: openpyxl ignora `ws.cell(..., value=None)` cuando ya hay
-    # valor — hay que asignar via `cell.value = None`.
-    for h, c in headers.items():
-        if h == "Row ID":
-            continue
-        ws.cell(row=target_row, column=c).value = None
+    if is_master_sheet(sheet):
+        # Hard delete: remueve la fila físicamente
+        ws.delete_rows(target_row, 1)
+    else:
+        # Soft delete: limpia todos los campos excepto Row ID (tombstone)
+        # IMPORTANTE: openpyxl ignora `ws.cell(..., value=None)` cuando ya hay
+        # valor — hay que asignar via `cell.value = None`.
+        for h, c in headers.items():
+            if h == key_col_name:
+                continue
+            ws.cell(row=target_row, column=c).value = None
 
     wb.save(str(xlsx_path))
     return True

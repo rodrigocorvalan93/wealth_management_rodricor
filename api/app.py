@@ -45,7 +45,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from flask import (
-    Flask, request, jsonify, send_file, abort, Response,
+    Flask, request, jsonify, send_file, send_from_directory,
+    abort, Response, render_template,
 )
 
 from engine.holdings import (
@@ -68,12 +69,30 @@ from .state import (
     list_backups, prune_backups, reimport_excel,
 )
 from .excel_io import (
-    SHEET_PREFIX, list_rows, get_row, append_row, update_row, delete_row,
+    SHEET_PREFIX, MASTER_SHEETS, ALLOWED_SHEETS, is_master_sheet,
+    list_rows, get_row, append_row, update_row, delete_row,
 )
 
 
 def create_app() -> Flask:
-    app = Flask(__name__)
+    app = Flask(__name__,
+                static_folder="static",
+                template_folder="templates",
+                static_url_path="/static")
+
+    # --- PWA: shell HTML ---
+    @app.route("/")
+    def root():
+        return render_template("pwa.html")
+
+    # Service worker debe servirse desde la raíz (no /static/) para tener
+    # scope completo. Lo redirigimos.
+    @app.route("/sw.js")
+    def service_worker():
+        resp = send_from_directory(app.static_folder, "sw.js")
+        resp.headers["Service-Worker-Allowed"] = "/"
+        resp.headers["Cache-Control"] = "no-cache"
+        return resp
 
     # --- CORS abierto (single user, token-protected) ---
     @app.after_request
@@ -151,7 +170,9 @@ def create_app() -> Flask:
             "data_dir": str(s.data_dir),
             "backups_dir": str(s.backups_dir),
             "anchor": s.anchor,
-            "supported_sheets": list(SHEET_PREFIX.keys()),
+            "supported_sheets": sorted(ALLOWED_SHEETS),
+            "event_sheets": list(SHEET_PREFIX.keys()),
+            "master_sheets": {k: v for k, v in MASTER_SHEETS.items() if v is not None},
         })
 
     # =========================================================================
@@ -324,7 +345,7 @@ def create_app() -> Flask:
     def list_sheet(sheet):
         _require_auth()
         s = get_settings()
-        if sheet not in SHEET_PREFIX:
+        if sheet not in ALLOWED_SHEETS:
             abort(404, f"Sheet '{sheet}' no soportada. Disponibles: {list(SHEET_PREFIX.keys())}")
         if not s.xlsx_path.is_file():
             abort(404, "Excel master no presente")
@@ -335,7 +356,7 @@ def create_app() -> Flask:
     def get_sheet_row(sheet, row_id):
         _require_auth()
         s = get_settings()
-        if sheet not in SHEET_PREFIX:
+        if sheet not in ALLOWED_SHEETS:
             abort(404)
         row = get_row(s.xlsx_path, sheet, row_id)
         if row is None:
@@ -346,14 +367,17 @@ def create_app() -> Flask:
     def create_sheet_row(sheet):
         _require_auth()
         s = get_settings()
-        if sheet not in SHEET_PREFIX:
+        if sheet not in ALLOWED_SHEETS:
             abort(404)
         data = request.get_json(silent=True) or {}
         if not isinstance(data, dict):
             abort(400, "Body debe ser un JSON object con {header: value}")
         with excel_write_lock():
             backup_excel()
-            row_id = append_row(s.xlsx_path, sheet, data)
+            try:
+                row_id = append_row(s.xlsx_path, sheet, data)
+            except ValueError as e:
+                abort(400, str(e))
             stats = reimport_excel()
             prune_backups(keep_last=50)
         return jsonify({
@@ -366,7 +390,7 @@ def create_app() -> Flask:
     def update_sheet_row(sheet, row_id):
         _require_auth()
         s = get_settings()
-        if sheet not in SHEET_PREFIX:
+        if sheet not in ALLOWED_SHEETS:
             abort(404)
         data = request.get_json(silent=True) or {}
         if not isinstance(data, dict):
@@ -377,6 +401,8 @@ def create_app() -> Flask:
                 row = update_row(s.xlsx_path, sheet, row_id, data)
             except KeyError as e:
                 abort(404, str(e))
+            except ValueError as e:
+                abort(400, str(e))
             stats = reimport_excel()
             prune_backups(keep_last=50)
         return jsonify({
@@ -388,7 +414,7 @@ def create_app() -> Flask:
     def delete_sheet_row(sheet, row_id):
         _require_auth()
         s = get_settings()
-        if sheet not in SHEET_PREFIX:
+        if sheet not in ALLOWED_SHEETS:
             abort(404)
         with excel_write_lock():
             backup_excel()
@@ -478,6 +504,141 @@ def create_app() -> Flask:
                 for b in list_backups(limit=50)
             ],
         })
+
+    # =========================================================================
+    # Cotizaciones (precios + FX) y cash por cuenta
+    # =========================================================================
+
+    @app.get("/api/prices")
+    def prices_endpoint():
+        """Devuelve la última cotización conocida por ticker.
+
+        Query params:
+          ?ticker=AL30D        — filtra por uno
+          ?asset_class=BOND_AR — filtra por clase
+        """
+        _require_auth()
+        conn = db_conn()
+        try:
+            ticker = request.args.get("ticker")
+            asset_class = request.args.get("asset_class")
+            sql = """
+                SELECT p.ticker, p.price, p.currency, p.fecha, p.source,
+                       a.name, a.asset_class
+                FROM prices p
+                INNER JOIN (
+                    SELECT ticker, MAX(fecha) AS max_fecha
+                    FROM prices GROUP BY ticker
+                ) m ON p.ticker = m.ticker AND p.fecha = m.max_fecha
+                LEFT JOIN assets a ON a.ticker = p.ticker
+            """
+            params = []
+            wheres = []
+            if ticker:
+                wheres.append("p.ticker = ?")
+                params.append(ticker)
+            if asset_class:
+                wheres.append("a.asset_class = ?")
+                params.append(asset_class)
+            if wheres:
+                sql += " WHERE " + " AND ".join(wheres)
+            sql += " ORDER BY a.asset_class, p.ticker"
+            rows = conn.execute(sql, params).fetchall()
+            return jsonify({
+                "n": len(rows),
+                "items": [
+                    {
+                        "ticker": r["ticker"],
+                        "name": r["name"] or "",
+                        "asset_class": r["asset_class"] or "",
+                        "price": r["price"],
+                        "currency": r["currency"],
+                        "fecha": r["fecha"],
+                        "source": r["source"] or "",
+                    } for r in rows
+                ],
+            })
+        finally:
+            conn.close()
+
+    @app.get("/api/fx-rates")
+    def fx_rates_endpoint():
+        """Devuelve la última cotización FX conocida por (moneda, base)."""
+        _require_auth()
+        conn = db_conn()
+        try:
+            sql = """
+                SELECT fr.fecha, fr.moneda, fr.rate, fr.base, fr.source
+                FROM fx_rates fr
+                INNER JOIN (
+                    SELECT moneda, base, MAX(fecha) AS max_fecha
+                    FROM fx_rates GROUP BY moneda, base
+                ) m ON fr.moneda = m.moneda AND fr.base = m.base
+                       AND fr.fecha = m.max_fecha
+                ORDER BY fr.base, fr.moneda
+            """
+            rows = conn.execute(sql).fetchall()
+            return jsonify({
+                "n": len(rows),
+                "items": [
+                    {
+                        "fecha": r["fecha"],
+                        "moneda": r["moneda"],
+                        "rate": r["rate"],
+                        "base": r["base"],
+                        "source": r["source"] or "",
+                    } for r in rows
+                ],
+            })
+        finally:
+            conn.close()
+
+    @app.get("/api/cash")
+    def cash_endpoint():
+        """Saldos cash por cuenta (todas las monedas).
+
+        Query: ?anchor=USD para incluir conversión a moneda ancla.
+        """
+        _require_auth()
+        anchor = _parse_query_anchor()
+        fecha = _parse_query_fecha()
+        holdings, conn = _holdings(fecha, anchor)
+        try:
+            cash_items = [h for h in holdings if h.get("is_cash")]
+            # Excluir pasivos (los saldos deudores de tarjetas no son cash positivo)
+            cash_items = [h for h in cash_items if not h.get("is_liability")]
+            cash_items.sort(key=lambda h: -(h.get("mv_anchor") or 0))
+            # Subtotales por moneda
+            by_ccy = {}
+            for h in cash_items:
+                ccy = h["native_currency"]
+                if ccy not in by_ccy:
+                    by_ccy[ccy] = {"qty": 0.0, "mv_anchor": 0.0, "n": 0}
+                by_ccy[ccy]["qty"] += h["qty"]
+                if h.get("mv_anchor") is not None:
+                    by_ccy[ccy]["mv_anchor"] += h["mv_anchor"]
+                by_ccy[ccy]["n"] += 1
+            total_anchor = sum(h.get("mv_anchor") or 0 for h in cash_items)
+            return jsonify({
+                "anchor": anchor,
+                "fecha": fecha.isoformat(),
+                "n": len(cash_items),
+                "total_anchor": total_anchor,
+                "by_currency": by_ccy,
+                "items": [
+                    {
+                        "account": h["account"],
+                        "account_kind": h.get("account_kind") or "",
+                        "currency": h["native_currency"],
+                        "qty": h["qty"],
+                        "mv_anchor": h.get("mv_anchor"),
+                        "cash_purpose": h.get("cash_purpose") or "",
+                        "investible": h.get("investible", True),
+                    } for h in cash_items
+                ],
+            })
+        finally:
+            conn.close()
 
     # =========================================================================
     # Reports
