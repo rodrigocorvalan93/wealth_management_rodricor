@@ -349,8 +349,14 @@ def main():
     p = argparse.ArgumentParser(description="Sync local → PythonAnywhere")
     p.add_argument("--skip-loaders", action="store_true",
                    help="No correr loaders (usar CSVs ya generados)")
+    p.add_argument("--upload-excel", action="store_true",
+                   help="SUBIR el Excel master local al server, sobreescribiendo "
+                        "el del server. Usar solo si editaste el Excel local. "
+                        "Por defecto NO se sube para evitar pisar trades cargados "
+                        "desde la PWA.")
     p.add_argument("--skip-excel", action="store_true",
-                   help="No subir el Excel master")
+                   help="(Deprecated) No subir el Excel master. Ya es el default; "
+                        "se mantiene por compat con scripts viejos.")
     p.add_argument("--only-excel", action="store_true",
                    help="Solo subir Excel master + refresh")
     p.add_argument("--only-prices", action="store_true",
@@ -414,8 +420,17 @@ def main():
 
     upload_csvs(cfg)
 
-    if not args.skip_excel:
+    # Excel upload: por DEFAULT no se sube, para evitar sobreescribir
+    # cambios hechos desde la PWA del iPhone (trades, gastos, etc.).
+    # Solo se sube si --upload-excel se pasa explícitamente.
+    if args.upload_excel and not args.skip_excel:
         upload_excel(cfg, args.xlsx)
+    elif not args.skip_excel:
+        # Skip default — informar al usuario para que sepa que NO se sube
+        print("\n→ Excel master: NO se sube (default). Si editaste el Excel "
+              "local y querés sincronizarlo al server, usá --upload-excel.")
+        print("  ⚠ Si cargás trades/gastos desde la PWA, NO uses --upload-excel "
+              "después o vas a sobreescribir esos cambios.")
 
     trigger_refresh(cfg)
 

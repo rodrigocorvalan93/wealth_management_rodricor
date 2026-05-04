@@ -115,11 +115,13 @@ TRADES_DEMO = [
     #  qty, precio, moneda, cuenta_cash, comision, moneda_com,
     #  precio_target, stop_loss, moneda_target, description, notes)
 
-    # AR: AL30D + GGAL.BA en cocos
+    # AR: AL30D + GGAL.BA en cocos.
+    # Bonos: precio en decimal (% / 100). BYMA devuelve % y el importer
+    # los escala al insertar; el blotter siempre usa decimal.
     ("D0001", date(2026, 1, 15), date(2026, 1, 17),
-     "cocos_demo", "BH", "AL30D", "BUY", 1500, 65.50, "USB",
+     "cocos_demo", "BH", "AL30D", "BUY", 1500, 0.6550, "USB",
      "cocos_demo", 0, "USB",
-     75.0, 60.0, "USB", "BUY AL30D — buy & hold", "[DEMO]"),
+     0.75, 0.60, "USB", "BUY AL30D — buy & hold", "[DEMO]"),
     ("D0002", date(2026, 2, 1), date(2026, 2, 5),
      "cocos_demo", "TRADING", "GGAL.BA", "BUY", 200, 6500, "ARS",
      "cocos_demo", 0, "ARS",

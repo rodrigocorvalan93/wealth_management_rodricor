@@ -73,14 +73,33 @@ def import_prices_csv(conn, path):
     Acepta headers en inglés (fecha,ticker,price,currency,source) o
     español (Fecha,Ticker,Precio,Moneda,Fuente).
 
+    Bonos en BYMA: el feed devuelve precios como "% del valor nominal"
+    (ej AL30D = 65.50 significa 65.50% de par). El qty del ledger está en
+    valor nominal (VN). Para que mv = qty × price funcione (ej 1500 VN ×
+    0.6550 = 982.5 USB), el price tiene que estar en DECIMAL, no en %.
+
+    Si el asset es BOND_AR o BOND_US, dividimos el precio por 100 al
+    importar (convirtiendo de % a decimal). Para equities, ETFs, FCIs,
+    cripto, cash: sin escalado.
+
     Devuelve cantidad de filas insertadas/actualizadas.
     """
     path = Path(path)
     if not path.is_file():
         return 0
 
+    # Cargar el mapa ticker → asset_class para saber qué dividir por 100
+    asset_classes = {}
+    try:
+        for r in conn.execute("SELECT ticker, asset_class FROM assets"):
+            asset_classes[r[0]] = r[1]
+    except Exception:
+        pass  # tabla assets no existe todavía; sin scaling
+
+    BOND_CLASSES = {"BOND_AR", "BOND_US"}
     n = 0
     skipped = 0
+    scaled = 0
     with open(path, encoding="utf-8") as f:
         reader = csv.DictReader(f)
         if not reader.fieldnames:
@@ -118,6 +137,11 @@ def import_prices_csv(conn, path):
                 skipped += 1
                 continue
 
+            # Bonos: convertir % de par → decimal (BYMA devuelve %, ledger usa decimal)
+            if asset_classes.get(ticker) in BOND_CLASSES:
+                price = price / 100.0
+                scaled += 1
+
             conn.execute(
                 """
                 INSERT INTO prices (fecha, ticker, price, currency, source)
@@ -134,6 +158,8 @@ def import_prices_csv(conn, path):
     conn.commit()
     if skipped:
         print(f"[prices] {path.name}: {skipped} filas inválidas saltadas")
+    if scaled:
+        print(f"[prices] {path.name}: {scaled} precios de bonos escalados /100 (% → decimal)")
     return n
 
 
