@@ -1,18 +1,35 @@
 name: Sync prices to PythonAnywhere
 
-# Corre todos los loaders + sube los CSVs al server.
-# Frecuencia: lunes a viernes 22:30 UTC = 19:30 hora AR (después del cierre BYMA).
-# También se puede correr manualmente desde el tab Actions de GitHub.
+# Corre todos los loaders + sube los CSVs al server + dispara /api/refresh.
+# Frecuencia: cada 2 horas, lunes a viernes, durante horario de mercado AR/US.
+#
+# Schedule en UTC. Argentina = UTC-3.
+#   13:30 UTC = 10:30 AR  (BYMA recién abre 11:00, pero hay datos overnight)
+#   15:30 UTC = 12:30 AR
+#   17:30 UTC = 14:30 AR
+#   19:30 UTC = 16:30 AR  (cierre próximo BYMA)
+#   21:30 UTC = 18:30 AR  (post-close BYMA, US a media sesión)
+# Cripto + FX: ok 24/7.
+#
+# Para CAMBIAR la frecuencia:
+#   - Cada hora: cron "0 13-22 * * 1-5"   (10 corridas/día)
+#   - Cada 2 hs: cron "30 13/2 * * 1-5"   (default actual, 5 corridas/día)
+#   - Cada 6 hs: cron "0 6,12,18 * * *"   (4 corridas/día, 24/7)
+#
+# También se puede correr manualmente desde Actions tab → "Run workflow".
 
 on:
   schedule:
-    - cron: "30 22 * * 1-5"
+    - cron: "30 13,15,17,19,21 * * 1-5"
   workflow_dispatch:
 
 jobs:
   sync:
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    concurrency:
+      group: sync-prices
+      cancel-in-progress: false  # NO cancelar en medio: dejar terminar
 
     steps:
       - uses: actions/checkout@v4
@@ -20,7 +37,7 @@ jobs:
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.10"
+          python-version: "3.11"
           cache: pip
 
       - name: Install deps
@@ -35,7 +52,6 @@ jobs:
           WM_API_TOKEN: ${{ secrets.WM_API_TOKEN }}
           WM_API_URL: ${{ secrets.WM_API_URL }}
         run: |
-          # Genera secrets.txt con las credenciales (queda solo en el runner)
           {
             [ -n "$OMS_USER" ] && echo "OMS_USER=$OMS_USER"
             [ -n "$OMS_PASS" ] && echo "OMS_PASS=$OMS_PASS"
@@ -45,8 +61,30 @@ jobs:
             [ -n "$WM_API_URL" ] && echo "WM_API_URL=$WM_API_URL"
           } > secrets.txt
 
-      - name: Run sync (loaders + upload + refresh)
+      - name: Bajar Excel master del server (necesario para tickers_union)
+        env:
+          WM_API_TOKEN: ${{ secrets.WM_API_TOKEN }}
+          WM_API_URL: ${{ secrets.WM_API_URL }}
         run: |
-          # Skip Excel upload — el master vive en el server y sería sobrescribir
-          python sync.py --skip-excel
+          # Sin el Excel del server, tickers_union.py no encuentra qué tickers
+          # fetchear y los loaders default usan listas hardcoded (no respeta
+          # las especies que cargaste en la PWA).
+          mkdir -p inputs/rodricor
+          curl -fsS -H "Authorization: Bearer $WM_API_TOKEN" \
+               "$WM_API_URL/api/download/excel" \
+               -o inputs/rodricor/wealth_management.xlsx
+          ls -la inputs/rodricor/
+
+      - name: Run sync (loaders + upload CSVs + refresh)
+        run: |
+          # NO subir el Excel local (el del server es la fuente de verdad).
+          # Por default sync.py YA NO sube el Excel — sólo lo hace si pasamos
+          # --upload-excel explícito. Acá lo omitimos.
+          python sync.py
         continue-on-error: false
+
+      - name: Resumen
+        if: always()
+        run: |
+          echo "Loaders + uploads + refresh completados a $(date -u)"
+          ls -la data/ 2>/dev/null | head

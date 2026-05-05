@@ -88,6 +88,17 @@ def create_app() -> Flask:
                 template_folder="templates",
                 static_url_path="/static")
 
+    # Limite de tamaño de upload (50 MB). Flask aborta con 413 si se excede.
+    # Aplica a todos los endpoints. Excel masters reales pesan <500 KB y
+    # CSVs típicos <100 KB, así que 50 MB es generoso.
+    app.config["MAX_CONTENT_LENGTH"] = 50 * 1024 * 1024
+
+    @app.errorhandler(413)
+    def upload_too_large(_e):
+        from flask import jsonify
+        return jsonify({"error": True, "code": 413,
+                         "message": "Archivo demasiado grande (máx 50 MB)"}), 413
+
     # --- PWA: shell HTML ---
     @app.route("/")
     def root():
@@ -632,22 +643,25 @@ def create_app() -> Flask:
     @app.post("/api/refresh")
     def refresh():
         _require_auth(); _block_if_switched_mutation()
+        # Lock cubre TODO el flujo: re-import + record_snapshots. Sin esto,
+        # otra request podría leer la DB durante init_db(drop_existing=True)
+        # del reimport y obtener data parcial / corrupta.
         with excel_write_lock():
             stats = reimport_excel()
-        # Después del reimport, grabar un snapshot del PN del día.
-        # Sin esto, la equity curve solo evoluciona cuando bajás un reporte
-        # (que era el único path que llamaba record_snapshots).
-        try:
-            anchor = get_settings().anchor
-            today = date.today()
-            holdings, conn = _holdings(today, anchor)
+            # Grabar snapshot del PN del día. Necesario para que la equity
+            # curve evolucione (antes solo ocurría al bajar un reporte).
             try:
-                n = record_snapshots(conn, holdings, today, anchor_currency=anchor)
-            finally:
-                conn.close()
-            stats["snapshots"] = n
-        except Exception as e:
-            print(f"[refresh] WARN no pude grabar snapshot: {e}")
+                anchor = get_settings().anchor
+                today = date.today()
+                holdings, conn = _holdings(today, anchor)
+                try:
+                    n = record_snapshots(conn, holdings, today, anchor_currency=anchor)
+                    conn.commit()
+                finally:
+                    conn.close()
+                stats["snapshots"] = n
+            except Exception as e:
+                print(f"[refresh] WARN no pude grabar snapshot: {e}")
         return jsonify({"refreshed": True, "import_stats": stats})
 
     @app.get("/api/performance")

@@ -5,20 +5,34 @@ manualmente desde la PC.
 
 ## Workflows incluidos
 
-### `sync-prices.yml` — corre loaders y sube CSVs (5x/semana)
+### `sync-prices.yml` — corre loaders y sube CSVs (cada 2 hs en horario de mercado)
 
 Corre los loaders de precios (FX, BYMA, CAFCI, cripto, yfinance) en un runner
-de GitHub y sube los CSVs resultantes al server vía API.
+de GitHub y sube los CSVs resultantes al server vía API. Después dispara
+`/api/refresh` para que la DB tome los precios nuevos.
 
-- **Schedule**: lunes a viernes 22:30 UTC (19:30 hora AR — después del cierre BYMA).
+Para que tickers_union detecte tus especies actuales, primero baja el Excel
+master del server con `/api/download/excel` (pre-step del workflow).
+
+**NO sube el Excel** — el master del server es la fuente de verdad y se
+actualiza desde la PWA.
+
+- **Schedule por defecto**: lunes a viernes 13:30 / 15:30 / 17:30 / 19:30 / 21:30 UTC
+  (= 10:30, 12:30, 14:30, 16:30, 18:30 hora AR — cubre apertura BYMA, mid-session,
+  cierre BYMA y mid-session US).
+- **Para cambiar la frecuencia** edita el `cron:` del workflow:
+    - Cada hora: `"0 13-22 * * 1-5"` (10/día)
+    - Cada 2 hs: default actual (5/día)
+    - Cada 6 hs 24/7: `"0 6,12,18 * * *"` (4/día, incluye fin de semana)
 - **Manual**: tab **Actions** en GitHub → "Sync prices" → "Run workflow".
 
-### `daily-snapshot.yml` — fuerza refresh y snapshot diario del PN
+### `daily-snapshot.yml` — backup diario de snapshot del PN
 
-Pega `/api/refresh` y luego `/api/report/html` para que se genere el snapshot
-del día. Asegura una equity curve continua sin huecos.
+Pega `/api/refresh` para que se grabe un snapshot del PN del día. Hoy
+`/api/refresh` ya graba snapshot por sí solo — este workflow es un safety net
+para garantizar que haya AL MENOS uno por día aunque sync-prices falle.
 
-- **Schedule**: todos los días 23:00 UTC (20:00 AR).
+- **Schedule**: todos los días 23:30 UTC (20:30 AR — después del cierre US).
 - **Manual**: ídem.
 
 ## Setup (una sola vez)

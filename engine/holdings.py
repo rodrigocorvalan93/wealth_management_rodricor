@@ -105,14 +105,46 @@ def _load_asset_map(conn):
     return out
 
 
-def _get_active_target(conn, account, asset):
-    """Devuelve {target_price, stop_loss_price, target_currency, set_at} para
-    el holding, leyendo el BUY más reciente con target o stop no-null.
+def _load_all_active_targets(conn):
+    """Pre-carga targets/stops del BUY más reciente para CADA (account, asset)
+    en un solo query. Devuelve dict {(account, asset): target_dict}.
 
-    Si nunca se setearon target/stop para este (account, asset), devuelve None.
-    Esta es la "tesis viva" del trade: el último target/stop que el user
-    ingresó al comprar este activo en esta cuenta.
+    Es la versión batch de _get_active_target — evita N+1 cuando hay
+    muchos holdings.
     """
+    out = {}
+    cur = conn.execute(
+        """
+        SELECT m.account, m.asset, e.target_price, e.stop_loss_price,
+               e.target_currency, e.event_date, e.event_id
+        FROM events e
+        JOIN movements m ON m.event_id = e.event_id
+        WHERE e.event_type = 'TRADE'
+          AND m.qty > 0
+          AND (e.target_price IS NOT NULL OR e.stop_loss_price IS NOT NULL)
+        ORDER BY m.account, m.asset, e.event_date DESC, e.event_id DESC
+        """
+    )
+    for r in cur.fetchall():
+        key = (r["account"], r["asset"])
+        # ORDER DESC dentro de cada (account, asset): la primera fila es la
+        # más reciente. Los siguientes para el mismo key se ignoran.
+        if key in out:
+            continue
+        out[key] = {
+            "target_price": r["target_price"],
+            "stop_loss_price": r["stop_loss_price"],
+            "target_currency": r["target_currency"],
+            "set_at": r["event_date"],
+        }
+    return out
+
+
+def _get_active_target(conn, account, asset, _cache=None):
+    """Wrapper compatible: usa cache batch si se pasa, si no hace el query
+    individual (back-compat con tests viejos que llaman directamente)."""
+    if _cache is not None:
+        return _cache.get((account, asset))
     cur = conn.execute(
         """
         SELECT e.target_price, e.stop_loss_price, e.target_currency, e.event_date
@@ -260,6 +292,8 @@ def calculate_holdings(conn, fecha=None, anchor_currency="USD"):
     asset_map = _load_asset_map(conn)
     assets_set = set(asset_map.keys())
     account_meta = _load_account_meta(conn)
+    # Pre-load targets en un solo query (evita N+1 si hay muchos holdings)
+    targets_cache = _load_all_active_targets(conn)
 
     # Encontrar todas las (cuenta, activo) que tengan al menos un movement
     cur = conn.execute(
@@ -370,7 +404,8 @@ def calculate_holdings(conn, fecha=None, anchor_currency="USD"):
         dist_to_target_bps = None
         dist_to_stop_bps = None
         if not is_cash:
-            target_info = _get_active_target(conn, account, asset)
+            target_info = _get_active_target(conn, account, asset,
+                                                _cache=targets_cache)
             if target_info:
                 target_currency = target_info["target_currency"] or native_ccy
                 # Si target está en otra moneda, convertir a moneda nativa para

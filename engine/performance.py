@@ -76,25 +76,36 @@ def get_external_flows(conn, fecha_desde, fecha_hasta, anchor_currency="USD"):
         """,
         (*BOUNDARY_ACCOUNTS, fecha_desde, fecha_hasta),
     )
+    # Cache de tasas de FX por (asset, fecha) — evita queries repetidas si
+    # hay muchos flujos de la misma moneda en la misma fecha.
+    fx_cache: dict[tuple[str, str], float] = {}
+
+    def _convert(flow_native, asset, fecha):
+        if asset == anchor_currency:
+            return flow_native
+        cache_key = (asset, fecha)
+        if cache_key in fx_cache:
+            rate = fx_cache[cache_key]
+            return None if rate is None else flow_native * rate
+        try:
+            # Usamos amount=1 para obtener la tasa, luego multiplicamos
+            converted = fx_convert(conn, 1.0, asset, anchor_currency,
+                                     fecha, fallback_days=14)
+            fx_cache[cache_key] = converted
+            return flow_native * converted
+        except FxError:
+            fx_cache[cache_key] = None
+            return None
+
     by_fecha = {}
     for row in cur.fetchall():
         fecha = row["fecha"] if hasattr(row, "__getitem__") else row[0]
         qty = row["qty"]
         asset = row["asset"]
-        # Convertir a moneda ancla. El flujo desde el lado del portfolio
-        # es -qty (boundary ganó qty → portfolio perdió esa misma qty).
-        flow_native = -qty
-        if asset == anchor_currency:
-            flow_anchor = flow_native
-        else:
-            try:
-                flow_anchor = fx_convert(conn, flow_native, asset,
-                                          anchor_currency, fecha,
-                                          fallback_days=14)
-            except FxError:
-                # Sin FX: skip (preferimos no contaminar la métrica con
-                # flujos no convertidos).
-                continue
+        flow_native = -qty  # boundary ganó → portfolio perdió esa cantidad
+        flow_anchor = _convert(flow_native, asset, fecha)
+        if flow_anchor is None:
+            continue  # FX faltante, skip silently
         by_fecha[fecha] = by_fecha.get(fecha, 0.0) + flow_anchor
 
     return [{"fecha": f, "amount_anchor": v}
