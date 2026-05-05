@@ -46,22 +46,11 @@ def _to_iso(d) -> str:
     raise ValueError(f"Fecha inválida: {d!r}")
 
 
-def get_rate(conn, fecha, moneda: str, base: str = DEFAULT_BASE,
-             fallback_days: int = FX_FALLBACK_DAYS) -> Optional[float]:
-    """Devuelve `rate` (1 unidad de `moneda` cuesta `rate` unidades de `base`).
-
-    Si moneda == base devuelve 1.0.
-    Si no encuentra rate exacto, busca hasta `fallback_days` hacia atrás.
-    Si moneda es una stablecoin (currencies.is_stable=1), redirige al rate de
-    su quote_vs (ej USDC → usa rate de USD, paridad implícita 1:1).
-    Devuelve None si no encuentra nada (caller decide qué hacer).
-    """
-    if moneda == base:
-        return 1.0
-
-    fecha_iso = _to_iso(fecha)
-
-    # Búsqueda exacta primero
+def _direct_rate(conn, fecha_iso: str, moneda: str, base: str,
+                  fallback_days: int) -> Optional[float]:
+    """Búsqueda directa en fx_rates (sin recursión / cross). Devuelve None
+    si no hay fila para (fecha, moneda, base) ni para los `fallback_days`
+    días previos."""
     cur = conn.execute(
         "SELECT rate FROM fx_rates WHERE fecha=? AND moneda=? AND base=?",
         (fecha_iso, moneda, base),
@@ -70,7 +59,6 @@ def get_rate(conn, fecha, moneda: str, base: str = DEFAULT_BASE,
     if row is not None:
         return float(row["rate"] if hasattr(row, "keys") else row[0])
 
-    # Fallback: hasta N días hacia atrás
     if fallback_days > 0:
         cur = conn.execute(
             """SELECT fecha, rate FROM fx_rates
@@ -85,10 +73,64 @@ def get_rate(conn, fecha, moneda: str, base: str = DEFAULT_BASE,
         if row is not None:
             return float(row["rate"] if hasattr(row, "keys") else row[1])
 
-    # Si llegamos acá, no encontramos rate explícito.
-    # Resolución implícita para stablecoins: si la moneda es stable y tiene
-    # `quote_vs`, redirigir al rate de quote_vs (paridad 1:1).
-    # Ej: USDC stable, quote_vs=USD → usa rate(USD) como rate(USDC).
+    return None
+
+
+def get_rate(conn, fecha, moneda: str, base: str = DEFAULT_BASE,
+             fallback_days: int = FX_FALLBACK_DAYS,
+             _seen: Optional[set] = None) -> Optional[float]:
+    """Devuelve `rate` (1 unidad de `moneda` cuesta `rate` unidades de `base`).
+
+    Si moneda == base devuelve 1.0.
+    Estrategia de búsqueda (en orden):
+      1. Rate directo en fx_rates para (fecha, moneda, base) — exacto o
+         hasta `fallback_days` hacia atrás.
+      2. Rate inverso: 1 / rate(base, moneda) si existiera la fila inversa.
+      3. Cross-rate vía pivots ARS, USD, USB (según haga falta):
+         rate(moneda, pivot) / rate(base, pivot).
+      4. Stablecoin: si moneda.is_stable=1 con quote_vs, recurre con quote_vs.
+
+    Devuelve None si no encuentra nada (caller decide qué hacer).
+    """
+    if moneda == base:
+        return 1.0
+
+    fecha_iso = _to_iso(fecha)
+
+    # Guard contra recursión infinita en cross-rate
+    if _seen is None:
+        _seen = set()
+    key = (moneda, base)
+    if key in _seen:
+        return None
+    _seen = _seen | {key}
+
+    # 1. Directo
+    direct = _direct_rate(conn, fecha_iso, moneda, base, fallback_days)
+    if direct is not None:
+        return direct
+
+    # 2. Inverso (rate(base, moneda) → 1/rate)
+    inverse = _direct_rate(conn, fecha_iso, base, moneda, fallback_days)
+    if inverse is not None and inverse != 0:
+        return 1.0 / inverse
+
+    # 3. Cross-rate vía pivots conocidos. Si tenemos rates contra USD pero
+    #    pedimos contra ARS (o viceversa), encadenamos vía un pivote.
+    PIVOTS = ("ARS", "USD", "USB")
+    for pivot in PIVOTS:
+        if pivot in (moneda, base):
+            continue
+        # rate(moneda, pivot) y rate(base, pivot) — recursión limitada
+        r_m = get_rate(conn, fecha, moneda, pivot, fallback_days, _seen)
+        if r_m is None:
+            continue
+        r_b = get_rate(conn, fecha, base, pivot, fallback_days, _seen)
+        if r_b is None or r_b == 0:
+            continue
+        return r_m / r_b
+
+    # 4. Stablecoin: redirigir a su quote_vs
     cur = conn.execute(
         "SELECT is_stable, quote_vs FROM currencies WHERE code=?",
         (moneda,),
@@ -98,8 +140,7 @@ def get_rate(conn, fecha, moneda: str, base: str = DEFAULT_BASE,
         is_stable = row["is_stable"] if hasattr(row, "keys") else row[0]
         quote_vs = row["quote_vs"] if hasattr(row, "keys") else row[1]
         if is_stable and quote_vs and quote_vs != moneda:
-            # Recursión 1-nivel: pedir rate del quote_vs
-            return get_rate(conn, fecha, quote_vs, base, fallback_days)
+            return get_rate(conn, fecha, quote_vs, base, fallback_days, _seen)
 
     return None
 
@@ -109,47 +150,32 @@ def convert(conn, amount: float, from_ccy: str, to_ccy: str,
             fallback_days: int = FX_FALLBACK_DAYS) -> float:
     """Convierte `amount` from_ccy → to_ccy en `fecha`.
 
-    Estrategia:
-    - Si from_ccy == to_ccy, devuelve `amount`.
-    - Si una de las dos es la base, usa el rate directo.
-    - Si ninguna es la base, va vía cross-rate: from→base→to.
+    Llama a `get_rate(from_ccy, to_ccy)` que ya implementa la búsqueda
+    directa, inversa, cross-rate vía pivots (ARS / USD / USB) y stablecoins.
 
-    Lanza FxError si no encuentra el rate necesario.
+    Lanza FxError si no encuentra ningún path.
     """
     if from_ccy == to_ccy:
         return amount
 
-    # Caso 1: from es la base (ARS → USB): amount / rate(USB)
-    if from_ccy == base:
-        rate_to = get_rate(conn, fecha, to_ccy, base, fallback_days)
-        if rate_to is None:
-            raise FxError(
-                f"Falta FX: ({to_ccy}/{base}) en {_to_iso(fecha)} "
-                f"(o hasta {fallback_days}d antes)"
-            )
-        return amount / rate_to
+    # 1. Intento directo: rate(from, to). get_rate ya hace cross internamente.
+    rate = get_rate(conn, fecha, from_ccy, to_ccy, fallback_days)
+    if rate is not None:
+        return amount * rate
 
-    # Caso 2: to es la base (USB → ARS): amount * rate(USB)
-    if to_ccy == base:
-        rate_from = get_rate(conn, fecha, from_ccy, base, fallback_days)
-        if rate_from is None:
-            raise FxError(
-                f"Falta FX: ({from_ccy}/{base}) en {_to_iso(fecha)} "
-                f"(o hasta {fallback_days}d antes)"
-            )
-        return amount * rate_from
-
-    # Caso 3: cross-rate vía base. from → base → to
+    # 2. Intento explícito vía la base por defecto (ARS) — preserva
+    #    compatibilidad con setups que solo tienen rates con base=ARS.
     rate_from = get_rate(conn, fecha, from_ccy, base, fallback_days)
     rate_to = get_rate(conn, fecha, to_ccy, base, fallback_days)
-    if rate_from is None or rate_to is None:
-        missing = []
-        if rate_from is None: missing.append(f"{from_ccy}/{base}")
-        if rate_to is None: missing.append(f"{to_ccy}/{base}")
-        raise FxError(
-            f"Falta FX para cross {from_ccy}→{to_ccy} en {_to_iso(fecha)}: {missing}"
-        )
-    return amount * rate_from / rate_to
+    if rate_from is not None and rate_to is not None and rate_to != 0:
+        return amount * rate_from / rate_to
+
+    missing = []
+    if rate_from is None: missing.append(f"{from_ccy}/{base}")
+    if rate_to is None: missing.append(f"{to_ccy}/{base}")
+    raise FxError(
+        f"Falta FX para {from_ccy}→{to_ccy} en {_to_iso(fecha)}: {missing}"
+    )
 
 
 def import_fx_csv(conn, csv_path: str | Path) -> int:
@@ -203,8 +229,16 @@ def import_fx_csv(conn, csv_path: str | Path) -> int:
 
 
 def auto_load_fx(conn, data_dir: str | Path = "data") -> int:
-    """Si existe data/fx_historico.csv, lo carga. Devuelve filas importadas."""
-    p = Path(data_dir) / "fx_historico.csv"
-    if p.is_file():
-        return import_fx_csv(conn, p)
-    return 0
+    """Carga los CSVs de FX disponibles en `data/`. Devuelve filas totales.
+
+    Carga en orden:
+      - data/fx_historico.csv  → ARS-related (USB, USD CCL, USD oficial)
+      - data/fx_foreign.csv    → foreign FX vía Yahoo Finance (EUR, GBP, JPY, ...)
+    """
+    n = 0
+    base = Path(data_dir)
+    for fname in ("fx_historico.csv", "fx_foreign.csv"):
+        p = base / fname
+        if p.is_file():
+            n += import_fx_csv(conn, p)
+    return n

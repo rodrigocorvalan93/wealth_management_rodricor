@@ -139,6 +139,9 @@ def calculate_realized_pnl(conn, fecha_hasta=None):
                 while qty_to_sell > 1e-9 and lots:
                     lot = lots[0]
                     qty_match = min(qty_to_sell, lot.qty)
+                    # NOTA: si qty_to_sell > suma de lots, el sobrante queda
+                    # sin matchear (short selling implícito) — se loguea al
+                    # salir del while.
 
                     # Calcular PnL para este match
                     pnl = (unit_price - lot.unit_price) * qty_match
@@ -173,6 +176,16 @@ def calculate_realized_pnl(conn, fecha_hasta=None):
 
                     if lot.qty < 1e-9:
                         lots.popleft()
+
+                # Sobrante sin matchear → short / oversold. Avisar.
+                if qty_to_sell > 1e-6:
+                    import sys as _sys
+                    print(
+                        f"[pnl] WARN venta sin lots: account={account} asset={asset} "
+                        f"fecha={event_date} qty_oversold={qty_to_sell:.6f}. "
+                        f"Posible short selling o data input error (más SELL que BUY).",
+                        file=_sys.stderr,
+                    )
 
     # Ordenar por fecha_venta desc
     all_fills.sort(key=lambda f: f.fecha_venta, reverse=True)
