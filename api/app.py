@@ -337,6 +337,160 @@ def create_app() -> Flask:
         finally:
             conn.close()
 
+    @app.get("/api/asset/<path:ticker>/history")
+    def asset_history_endpoint(ticker):
+        """Detalle histórico de un activo: primera compra, todas las
+        operaciones, evolución de precio + qty + market value, y métricas
+        de retorno desde la incorporación.
+
+        Query: ?account=cocos (opcional, filtra por cuenta)
+        """
+        _require_auth(); _block_if_switched_mutation()
+        from engine.prices import get_price
+        from engine.fx import convert as fx_convert, FxError
+        anchor = _parse_query_anchor()
+        account_filter = request.args.get("account")
+        conn = db_conn()
+        try:
+            # 1) Movimientos del activo (ordenados ascendente)
+            params = [ticker]
+            sql = """
+                SELECT m.movement_id, m.account, m.qty, m.unit_price,
+                       m.price_currency, e.event_date, e.event_type, e.description
+                FROM movements m
+                JOIN events e ON e.event_id = m.event_id
+                WHERE m.asset = ?
+            """
+            if account_filter:
+                sql += " AND m.account = ?"
+                params.append(account_filter)
+            sql += " ORDER BY e.event_date ASC, m.movement_id ASC"
+            cur = conn.execute(sql, params)
+            movements = [dict(r) for r in cur.fetchall()]
+            if not movements:
+                return jsonify({"error": "asset sin movimientos"}), 404
+
+            # 2) Datos del asset (currency, asset_class, name)
+            cur = conn.execute(
+                "SELECT name, asset_class, currency FROM assets WHERE ticker=?",
+                (ticker,),
+            )
+            row = cur.fetchone()
+            asset_info = dict(row) if row else {"name": ticker, "asset_class": "?",
+                                                 "currency": None}
+
+            first_date = movements[0]["event_date"][:10]
+
+            # 3) Posición actual (qty + avg_cost) — sin filtrar account si
+            #    queremos toda la posición consolidada
+            qty = 0.0
+            cost_acum = 0.0
+            qty_buys = 0.0
+            for m in movements:
+                qty += m["qty"]
+                if m["qty"] > 0 and m["unit_price"] is not None:
+                    cost_acum += m["qty"] * m["unit_price"]
+                    qty_buys += m["qty"]
+            avg_cost = (cost_acum / qty_buys) if qty_buys > 0 else None
+
+            # 4) Serie de precios desde first_date hasta hoy
+            cur = conn.execute(
+                """SELECT fecha, price, currency FROM prices
+                   WHERE ticker=? AND fecha >= ?
+                   ORDER BY fecha ASC""",
+                (ticker, first_date),
+            )
+            prices = [{"fecha": r["fecha"], "price": r["price"],
+                        "currency": r["currency"]} for r in cur.fetchall()]
+
+            # 5) Construir evolución: para cada precio, calcular qty_held,
+            #    market_value, unrealized_pnl
+            qty_by_date = []
+            running_qty = 0.0
+            for m in movements:
+                running_qty += m["qty"]
+                qty_by_date.append((m["event_date"][:10], running_qty))
+
+            def qty_at(fecha_iso):
+                # qty acumulada al cierre de fecha_iso (incluye movimientos de ese día)
+                q = 0.0
+                for d, rq in qty_by_date:
+                    if d <= fecha_iso:
+                        q = rq
+                    else:
+                        break
+                return q
+
+            evolution = []
+            for p in prices:
+                q = qty_at(p["fecha"])
+                if q == 0 and not evolution:
+                    continue  # skip pre-position prices
+                mv_native = q * p["price"]
+                evolution.append({
+                    "fecha": p["fecha"],
+                    "price": p["price"],
+                    "currency": p["currency"],
+                    "qty": q,
+                    "mv_native": mv_native,
+                })
+
+            # 6) Métricas: precio inicial (avg_cost), precio actual, %
+            current_price = prices[-1]["price"] if prices else (avg_cost or 0)
+            return_pct = None
+            if avg_cost and avg_cost > 0:
+                return_pct = (current_price - avg_cost) / avg_cost
+            unrealized_native = (
+                (current_price - (avg_cost or current_price)) * qty
+                if qty != 0 else 0.0
+            )
+
+            # 7) PnL realizado del activo (desde fills)
+            from engine.pnl import calculate_realized_pnl
+            fills = [f for f in calculate_realized_pnl(conn) if f.asset == ticker]
+            realized_pnl_total = sum(f.pnl_realizado for f in fills)
+            realized_currency = fills[0].currency if fills else asset_info["currency"]
+
+            # 8) Días desde primera compra
+            try:
+                from datetime import date as _date
+                d0 = _date.fromisoformat(first_date)
+                days_held = (_date.today() - d0).days
+            except Exception:
+                days_held = None
+
+            return jsonify({
+                "ticker": ticker,
+                "name": asset_info["name"],
+                "asset_class": asset_info["asset_class"],
+                "native_currency": asset_info["currency"],
+                "first_purchase_date": first_date,
+                "days_held": days_held,
+                "current_qty": qty,
+                "avg_cost": avg_cost,
+                "current_price": current_price,
+                "unrealized_pnl_native": unrealized_native,
+                "return_pct": return_pct,
+                "realized_pnl_total": realized_pnl_total,
+                "realized_currency": realized_currency,
+                "n_trades": sum(1 for m in movements if m["qty"] != 0),
+                "movements": [
+                    {
+                        "fecha": m["event_date"][:10],
+                        "account": m["account"],
+                        "qty": m["qty"],
+                        "unit_price": m["unit_price"],
+                        "currency": m["price_currency"],
+                        "event_type": m["event_type"],
+                        "description": m["description"],
+                    }
+                    for m in movements
+                ],
+                "evolution": evolution,
+            })
+        finally:
+            conn.close()
+
     @app.get("/api/holdings-near-target")
     def holdings_near_target_endpoint():
         """Holdings cuya distancia al target o stop-loss está dentro del
@@ -460,6 +614,86 @@ def create_app() -> Flask:
                 "by_currency": stats_dict,
                 "by_asset": trade_stats_by_asset(fills),
                 "by_account": trade_stats_by_account(fills),
+            })
+        finally:
+            conn.close()
+
+    @app.get("/api/asset-performance")
+    def asset_performance_endpoint():
+        """Tabla de retorno-desde-compra por holding actual.
+
+        Para cada (account, asset) abierto: fecha primera compra, días held,
+        avg_cost, precio actual, return % en moneda nativa, MV en ancla.
+        Útil para "cómo viene rindiendo cada activo desde que lo incorporé".
+
+        Query: ?investible=true para excluir cuentas no-invertibles.
+        """
+        _require_auth(); _block_if_switched_mutation()
+        anchor = _parse_query_anchor()
+        fecha = _parse_query_fecha()
+        investible_only = request.args.get("investible") == "true"
+        holdings, conn = _holdings(fecha, anchor)
+        try:
+            from datetime import date as _date
+            today = _date.today()
+            data = filter_investible(holdings) if investible_only else holdings
+            # Filtrar a posiciones con avg_cost (excluye cash puro y cuentas
+            # sin operaciones de compra)
+            data = [h for h in data if h.get("avg_cost") and h.get("qty")
+                    and not h.get("is_cash")
+                    and h.get("market_price") is not None]
+
+            rows = []
+            for h in data:
+                # Fecha primera compra para (account, asset)
+                cur = conn.execute(
+                    """SELECT MIN(e.event_date) AS d
+                       FROM movements m
+                       JOIN events e ON e.event_id = m.event_id
+                       WHERE m.account=? AND m.asset=? AND m.qty>0""",
+                    (h["account"], h["asset"]),
+                )
+                row = cur.fetchone()
+                first = row["d"][:10] if row and row["d"] else None
+                days = None
+                if first:
+                    try:
+                        days = (today - _date.fromisoformat(first)).days
+                    except Exception:
+                        pass
+                ret_pct = h.get("unrealized_pct")
+                # Anualizado: (1+r)^(365/days)-1 cuando days>0
+                ret_annual = None
+                if ret_pct is not None and days and days > 0:
+                    try:
+                        base = 1.0 + ret_pct
+                        if base > 0:
+                            ret_annual = base ** (365.0 / days) - 1.0
+                    except Exception:
+                        pass
+                rows.append({
+                    "account": h["account"],
+                    "asset": h["asset"],
+                    "asset_class": h.get("asset_class"),
+                    "name": h.get("name"),
+                    "qty": h.get("qty"),
+                    "native_currency": h.get("native_currency"),
+                    "avg_cost": h.get("avg_cost"),
+                    "market_price": h.get("market_price"),
+                    "mv_anchor": h.get("mv_anchor"),
+                    "unrealized_pnl_native": h.get("unrealized_pnl_native"),
+                    "return_pct": ret_pct,
+                    "return_annualized": ret_annual,
+                    "first_purchase_date": first,
+                    "days_held": days,
+                })
+            rows.sort(key=lambda r: -(r["return_pct"] or -1e9))
+            return jsonify({
+                "fecha": fecha.isoformat(),
+                "anchor": anchor,
+                "investible_only": investible_only,
+                "n": len(rows),
+                "items": rows,
             })
         finally:
             conn.close()
