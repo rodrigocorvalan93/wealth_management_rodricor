@@ -2565,7 +2565,7 @@
                         · avg fx ${fmt.money(c.avg_fx_in, 4)} → hoy ${fmt.money(c.current_fx, 4)}
                       </div>
                       <div class="meta-line2 muted" style="font-size:11px;">
-                        desde ${escapeHtml(c.first_inflow_date || "?")} (${c.n_inflows} entradas)
+                        desde ${escapeHtml(c.first_inflow_date || "?")} (${c.n_buckets} buckets activos)
                       </div>
                     </div>
                     <div class="right">

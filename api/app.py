@@ -731,39 +731,63 @@ def create_app() -> Flask:
 
             today_iso = fecha.isoformat()
             rows = []
+            from collections import deque
             for h in cash_holdings:
                 ccy = h["native_currency"]
                 qty = h["qty"]
-                # Movimientos qty>0 (entradas) de ese (account, asset)
+                # Todos los movements del cash (entradas y salidas) en orden.
+                # Aplicamos FIFO: outflows consumen los buckets más viejos.
+                # Lo que queda en la cola al final = el cash que tenés HOY,
+                # con su FX de entrada original. Esto evita que cash que
+                # ya gastaste contamine el avg_fx_in.
                 cur = conn.execute(
                     """SELECT m.qty, e.event_date
                        FROM movements m JOIN events e ON e.event_id = m.event_id
-                       WHERE m.account=? AND m.asset=? AND m.qty>0
-                       ORDER BY e.event_date ASC""",
+                       WHERE m.account=? AND m.asset=?
+                       ORDER BY e.event_date ASC, m.movement_id ASC""",
                     (h["account"], ccy),
                 )
-                inflows = [(r["event_date"][:10], r["qty"]) for r in cur.fetchall()]
-                if not inflows:
+                mov_rows = cur.fetchall()
+                if not mov_rows:
                     continue
-                first_date = inflows[0][0]
+                first_date = mov_rows[0]["event_date"][:10]
 
-                # Para cada entrada, FX rate ccy→anchor en esa fecha.
-                # Skip si falta FX (sin warning bloqueante: ese inflow no
-                # entra en el promedio, los otros sí).
+                buckets = deque()  # cada item: (qty_restante, rate_anchor)
+                for r in mov_rows:
+                    q = r["qty"]
+                    d = r["event_date"][:10]
+                    if q > 0:
+                        if ccy == anchor:
+                            rate = 1.0
+                        else:
+                            try:
+                                rate = get_rate(conn, d, ccy, anchor,
+                                                  fallback_days=14)
+                            except Exception:
+                                rate = None
+                        # Aún si no hay FX, agregamos bucket con rate=None
+                        # para preservar la cantidad. En el avg luego se
+                        # ignoran buckets sin rate.
+                        buckets.append([q, rate])
+                    elif q < 0:
+                        rem = abs(q)
+                        while rem > 1e-9 and buckets:
+                            b = buckets[0]
+                            take = min(rem, b[0])
+                            b[0] -= take
+                            rem -= take
+                            if b[0] < 1e-9:
+                                buckets.popleft()
+                        # Si rem > 0: gastaste más de lo que tenías (raro).
+
+                # Avg ponderado sobre lo que queda
                 weighted_rate_num = 0.0
                 weighted_qty = 0.0
-                for d, q in inflows:
-                    if ccy == anchor:
-                        rate = 1.0
-                    else:
-                        try:
-                            rate = get_rate(conn, d, ccy, anchor, fallback_days=14)
-                        except Exception:
-                            rate = None
-                    if rate is None or rate <= 0:
+                for b_qty, b_rate in buckets:
+                    if b_rate is None or b_rate <= 0:
                         continue
-                    weighted_rate_num += rate * q
-                    weighted_qty += q
+                    weighted_rate_num += b_rate * b_qty
+                    weighted_qty += b_qty
                 if weighted_qty <= 0:
                     continue
                 avg_fx_in = weighted_rate_num / weighted_qty
@@ -793,7 +817,7 @@ def create_app() -> Flask:
                     "cost_anchor": cost_anchor,
                     "pnl_anchor": pnl_anchor,
                     "first_inflow_date": first_date,
-                    "n_inflows": len([1 for d, q in inflows]),
+                    "n_buckets": sum(1 for b in buckets if b[1] and b[0] > 1e-9),
                 })
             rows.sort(key=lambda r: -(r["return_pct"] or -1e9))
             return jsonify({
