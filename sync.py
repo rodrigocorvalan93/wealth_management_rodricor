@@ -51,6 +51,7 @@ PYTHON_BIN = sys.executable
 
 PRICE_CSVS = [
     HERE / "data" / "fx_historico.csv",
+    HERE / "data" / "fx_foreign.csv",
     HERE / "data" / "precios_historico.csv",
     HERE / "data" / "precios_cafci.csv",
     HERE / "data" / "precios_cripto.csv",
@@ -136,6 +137,7 @@ def get_loaders():
     # que no se puede inferir solo del ticker. Sigue usando fcis_cafci.txt manual.
     return [
         ("fx",       [PYTHON_BIN, "fx_loader.py"]),
+        ("fx_foreign", [PYTHON_BIN, "yfinance_fx_loader.py"]),
         ("byma",     [PYTHON_BIN, "byma_loader.py", *tickers_arg]),
         ("cafci",    [PYTHON_BIN, "cafci_loader.py"]),
         ("cripto",   [PYTHON_BIN, "cripto_loader.py", *tickers_arg]),

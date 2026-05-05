@@ -1051,20 +1051,6 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   </div>
 
   <div class="card" style="margin-top: 24px;">
-    <h2>🎯 Métricas de Trading (PnL Realizado FIFO)</h2>
-    {trade_stats_block}
-  </div>
-
-  <div class="card" style="margin-top: 24px;">
-    <h2>💪 Poder de Compra por Cuenta</h2>
-    <div class="info">
-      Cocos/Eco: aforos BYMA (caución). IBKR: RegT margin (verificá tus parámetros reales).
-      Valores en {anchor_ccy}.
-    </div>
-    {buying_power_block}
-  </div>
-
-  <div class="card" style="margin-top: 24px;">
     <h2>Top 15 Posiciones <span class="view-tag" id="tagTop"></span></h2>
     <table>
       <thead>
@@ -1080,6 +1066,20 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       </thead>
       <tbody id="topHoldingsBody"></tbody>
     </table>
+  </div>
+
+  <div class="card" style="margin-top: 24px;">
+    <h2>💪 Poder de Compra por Cuenta</h2>
+    <div class="info">
+      Cocos/Eco: aforos BYMA (caución). IBKR: RegT margin (verificá tus parámetros reales).
+      Valores en {anchor_ccy}.
+    </div>
+    {buying_power_block}
+  </div>
+
+  <div class="card" style="margin-top: 24px;">
+    <h2>🎯 Métricas de Trading (PnL Realizado FIFO)</h2>
+    {trade_stats_block}
   </div>
 
   <div class="card" style="margin-top: 24px; border-left: 4px solid #C00000;">

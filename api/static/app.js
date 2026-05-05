@@ -104,9 +104,32 @@
     tradeStats: (anchor) => API.req(`/api/trade-stats?anchor=${anchor || API.anchor()}`),
     buyingPower: (anchor) => API.req(`/api/buying-power?anchor=${anchor || API.anchor()}`),
     realizedPnl: () => API.req(`/api/realized-pnl`),
+    assetHistory: (ticker, account) => {
+      const qs = account ? `?account=${encodeURIComponent(account)}` : "";
+      return API.req(`/api/asset/${encodeURIComponent(ticker)}/history${qs}`);
+    },
+    assetPerformance: (anchor, investible) => API.req(
+      `/api/asset-performance?anchor=${anchor || API.anchor()}&investible=${!!investible}`
+    ),
+    cashPerformance: (anchor) => API.req(
+      `/api/cash-performance?anchor=${anchor || API.anchor()}`
+    ),
     equityCurve: (anchor, investible) => API.req(
       `/api/equity-curve?anchor=${anchor || API.anchor()}&investible=${!!investible}`
     ),
+    deleteSnapshots: (opts) => {
+      const qs = opts && opts.all ? "all=1"
+        : opts && opts.before ? `before=${encodeURIComponent(opts.before)}`
+        : "";
+      return API.req(`/api/snapshots?${qs}`, { method: "DELETE" });
+    },
+    backfillSnapshots: (opts) => {
+      const params = new URLSearchParams();
+      if (opts && opts.cadence) params.set("cadence", opts.cadence);
+      if (opts && opts.from) params.set("from", opts.from);
+      if (opts && opts.to) params.set("to", opts.to);
+      return API.req(`/api/snapshots/backfill?${params.toString()}`, { method: "POST" });
+    },
     refresh: () => API.req("/api/refresh", { method: "POST" }),
     backups: () => API.req("/api/backups"),
 
@@ -247,17 +270,25 @@
   function navigate(path) { window.location.hash = path; }
 
   function matchRoute(hash) {
-    const path = hash.replace(/^#/, "") || "/";
+    const raw = hash.replace(/^#/, "") || "/";
+    const [path, qs] = raw.split("?", 2);
+    const query = {};
+    if (qs) {
+      for (const pair of qs.split("&")) {
+        const [k, v] = pair.split("=", 2);
+        if (k) query[decodeURIComponent(k)] = v ? decodeURIComponent(v) : "";
+      }
+    }
     // Exact match first
-    if (routes[path]) return { handler: routes[path], params: {} };
+    if (routes[path]) return { handler: routes[path], params: { ...query } };
     // Try patterns
     for (const pattern of Object.keys(routes)) {
       const re = new RegExp("^" + pattern.replace(/:(\w+)/g, "([^/]+)") + "$");
       const m = path.match(re);
       if (m) {
         const keys = (pattern.match(/:(\w+)/g) || []).map(k => k.slice(1));
-        const params = {};
-        keys.forEach((k, i) => params[k] = m[i + 1]);
+        const params = { ...query };
+        keys.forEach((k, i) => params[k] = decodeURIComponent(m[i + 1]));
         return { handler: routes[pattern], params };
       }
     }
@@ -654,6 +685,39 @@
         toast(`Error: ${e.message}`, "error");
       }
     },
+    async resetSnapshots() {
+      if (!confirm("¿Borrar TODOS los snapshots históricos? La equity curve arranca de cero. Hacelo si tu PN inicial está contaminado (ej. 0 o un parcial sin FX). El próximo refresh graba un snapshot limpio.")) return;
+      try {
+        const r = await API.deleteSnapshots({ all: true });
+        toast(`Borrados ${r.deleted} snapshots ✓`, "success");
+        await API.refresh();  // graba un snapshot limpio inmediatamente
+        render();
+      } catch (e) {
+        toast(`Error: ${e.message}`, "error");
+      }
+    },
+    async backfillSnapshots() {
+      const cadenceStr = prompt(
+        "Reconstruir equity curve histórica calculando el PN en fechas pasadas a partir de tu historial de movimientos.\n\n" +
+        "Cadencia (días entre snapshots, recomendado 7):", "7"
+      );
+      if (cadenceStr === null) return;
+      const cadence = parseInt(cadenceStr, 10) || 7;
+      const reset = confirm(
+        "¿Borrar snapshots existentes antes de reconstruir?\n" +
+        "OK = borrar y reconstruir desde cero (recomendado si está contaminado).\n" +
+        "Cancelar = preservar snapshots actuales y solo agregar los faltantes."
+      );
+      try {
+        toast("Reconstruyendo histórico...", "info");
+        if (reset) await API.deleteSnapshots({ all: true });
+        const r = await API.backfillSnapshots({ cadence });
+        toast(`Backfill: ${r.n_snapshots_written} snapshots en ${r.n_dates_tried} fechas (${r.fecha_desde} → ${r.fecha_hasta}) ✓`, "success");
+        render();
+      } catch (e) {
+        toast(`Error: ${e.message}`, "error");
+      }
+    },
     setView(v) {
       API.setView(v);
       render();
@@ -921,6 +985,54 @@
             </details>
           </section>
         ` : ""}
+
+        ${(() => {
+          // Cómo vienen rindiendo los activos individuales (top 3 ganadores
+          // / 3 perdedores). Usa unrealized_pct de holdings — return desde
+          // que se incorporó (price actual vs avg cost).
+          const ranked = (holdingsData.items || [])
+            .filter(h => !h.is_cash && !h.is_liability && h.unrealized_pct != null
+                         && h.qty && h.qty !== 0)
+            .map(h => ({...h}))
+            .sort((a, b) => (b.unrealized_pct || 0) - (a.unrealized_pct || 0));
+          if (ranked.length === 0) return "";
+          const winners = ranked.slice(0, 3);
+          const losers = ranked.slice(-3).reverse().filter(h =>
+            !winners.some(w => w.account === h.account && w.asset === h.asset));
+          const renderRow = (h) => {
+            const ret = h.unrealized_pct;
+            const cls = ret > 0 ? "positive" : ret < 0 ? "negative" : "muted";
+            const sign = ret > 0 ? "+" : "";
+            return `
+              <a href="#/asset/${encodeURIComponent(h.asset)}?account=${encodeURIComponent(h.account)}" style="display:flex; justify-content:space-between; padding: 8px 0; border-bottom: 1px solid var(--border); text-decoration:none; color:inherit;">
+                <div style="min-width:0;">
+                  <div style="font-weight:600;">${escapeHtml(h.asset)} <span class="muted" style="font-size:11px;">›</span></div>
+                  <div class="muted" style="font-size:11px;">${escapeHtml(h.account)}</div>
+                </div>
+                <div class="right">
+                  <div class="tabular ${cls}">${sign}${(ret * 100).toFixed(2)}%</div>
+                  <div class="sub muted tabular" style="font-size:11px;">${fmt.money(h.unrealized_pnl_native, 0)} ${escapeHtml(h.native_currency || "")}</div>
+                </div>
+              </a>
+            `;
+          };
+          return `
+            <section>
+              <h2>📊 Cómo van mis activos</h2>
+              <div class="card">
+                ${winners.length > 0 ? `
+                  <div class="muted" style="font-size:11px; padding:4px 0;">🏆 Mejores</div>
+                  ${winners.map(renderRow).join("")}
+                ` : ""}
+                ${losers.length > 0 ? `
+                  <div class="muted" style="font-size:11px; padding:8px 0 4px;">📉 Peores</div>
+                  ${losers.map(renderRow).join("")}
+                ` : ""}
+                <a href="#/asset-performance" class="drill-link">Ver todos los activos →</a>
+              </div>
+            </section>
+          `;
+        })()}
 
         <section>
           <h2>PnL realizado reciente</h2>
@@ -2179,13 +2291,22 @@
                 ${h.stop_loss_price != null ? `🛑 ${fmt.money(h.stop_loss_price, 4)}${dSL != null ? ` <span class="${dSL <= 0 ? 'negative' : 'muted'}">(${dSL >= 0 ? '+' : ''}${dSL.toFixed(0)}bp)</span>` : ''}` : ""}
               </div>
             ` : "";
+            const isClickable = !isCash && !isLiab;
+            const clickHref = isClickable
+              ? `#/asset/${encodeURIComponent(h.asset)}?account=${encodeURIComponent(h.account)}`
+              : null;
+            const wrapOpen = clickHref
+              ? `<a href="${clickHref}" class="list-item" style="align-items: flex-start; text-decoration:none; color:inherit;">`
+              : `<div class="list-item" style="align-items: flex-start;">`;
+            const wrapClose = clickHref ? `</a>` : `</div>`;
             return `
-              <div class="list-item" style="align-items: flex-start;">
+              ${wrapOpen}
                 <div class="meta">
                   <div class="meta-line1">
                     <span style="font-weight: 700;">#${idx + 1}</span>
                     ${escapeHtml(h.asset)}
                     ${tagBits.join(" ")}
+                    ${isClickable ? '<span class="muted" style="font-size:11px;">›</span>' : ""}
                   </div>
                   <div class="meta-line2" style="display: flex; align-items: center; gap: 6px; flex-wrap: wrap;">
                     <span style="display: inline-block;">${accountLabel(h.account, meta.accountsRich)}</span>
@@ -2207,7 +2328,7 @@
                     </div>
                   ` : ""}
                 </div>
-              </div>
+              ${wrapClose}
             `;
           }).join("")}</div>`
         }
@@ -2217,6 +2338,294 @@
           Posiciones con <b>px*</b> tienen precio fallback (sin cotización
           fresca). Subí precios con <code>python sync.py --skip-loaders</code>.
         </div>
+      </main>
+      ${bottomNav("/")}
+    `;
+  });
+
+  // /asset/:ticker — detalle histórico de un activo
+  route("/asset/:ticker", async (params) => {
+    const ticker = params.ticker;
+    const account = params.account || null;
+    let data;
+    try {
+      data = await API.assetHistory(ticker, account);
+    } catch (e) {
+      return `${headerWithBack("Activo", "/holdings")}
+        <main><div class="card danger">${escapeHtml(e.message)}</div></main>`;
+    }
+    const evo = data.evolution || [];
+    const movs = data.movements || [];
+
+    // SVG sparkline del precio en moneda nativa
+    function sparklinePrice(points) {
+      if (!points || points.length < 2) return "";
+      const w = 360, h = 110, pad = 6;
+      const vals = points.map(p => p.price);
+      const min = Math.min(...vals), max = Math.max(...vals);
+      const range = (max - min) || 1;
+      const stepX = (w - pad * 2) / (points.length - 1);
+      const coords = points.map((p, i) => {
+        const x = pad + i * stepX;
+        const y = h - pad - ((p.price - min) / range) * (h - pad * 2);
+        return [x, y];
+      });
+      const path = coords.map(([x, y], i) => `${i === 0 ? 'M' : 'L'}${x.toFixed(1)},${y.toFixed(1)}`).join(" ");
+      const last = coords[coords.length - 1];
+      // Marcar puntos donde hubo trades (overlay verde compra / rojo venta)
+      const tradeDates = new Map();
+      for (const m of movs) {
+        const isBuy = (m.qty || 0) > 0;
+        tradeDates.set(m.fecha, isBuy ? "buy" : "sell");
+      }
+      const markers = points.map((p, i) => {
+        const k = tradeDates.get(p.fecha);
+        if (!k) return "";
+        const [x, y] = coords[i];
+        const c = k === "buy" ? "#10A66B" : "#DC2626";
+        return `<circle cx="${x.toFixed(1)}" cy="${y.toFixed(1)}" r="3.5" fill="${c}" stroke="white" stroke-width="1"/>`;
+      }).join("");
+      return `
+        <svg viewBox="0 0 ${w} ${h}" preserveAspectRatio="none" style="width:100%; height:110px; display:block;">
+          <path d="${path}" fill="none" stroke="#1F3864" stroke-width="2"/>
+          ${markers}
+          <circle cx="${last[0]}" cy="${last[1]}" r="3" fill="#1F3864"/>
+        </svg>
+        <div style="display:flex; justify-content:space-between; font-size:11px; color:var(--muted); margin-top:4px;">
+          <span>${escapeHtml(points[0].fecha)}</span>
+          <span>${escapeHtml(points[points.length - 1].fecha)}</span>
+        </div>
+        <div class="muted" style="font-size:11px; margin-top:4px;">
+          <span style="color:#10A66B;">●</span> compra ·
+          <span style="color:#DC2626;">●</span> venta
+        </div>
+      `;
+    }
+
+    const retCls = data.return_pct == null ? "muted"
+      : data.return_pct > 0 ? "positive" : "negative";
+    const retSign = data.return_pct > 0 ? "+" : "";
+    const ccy = data.native_currency || "";
+
+    return `
+      ${headerWithBack(`📈 ${escapeHtml(data.ticker)}`, "/holdings")}
+      <main>
+        <div class="card" style="margin-bottom:12px;">
+          <div style="display:flex; justify-content:space-between; align-items:baseline;">
+            <div>
+              <div style="font-weight:700; font-size:18px;">${escapeHtml(data.ticker)}</div>
+              <div class="muted" style="font-size:12px;">
+                ${escapeHtml(data.name || "")} ${data.asset_class ? "· " + escapeHtml(data.asset_class) : ""}
+              </div>
+            </div>
+            <div class="tabular ${retCls}" style="text-align:right;">
+              <div style="font-size:18px; font-weight:700;">
+                ${data.return_pct != null ? `${retSign}${(data.return_pct * 100).toFixed(2)}%` : "—"}
+              </div>
+              <div class="muted" style="font-size:11px;">return desde compra</div>
+            </div>
+          </div>
+        </div>
+
+        <div class="kpi-grid" style="margin-bottom:12px;">
+          <div class="kpi">
+            <div class="kpi-label">Desde</div>
+            <div class="kpi-value" style="font-size:16px;">${escapeHtml(data.first_purchase_date || "—")}</div>
+            <div class="kpi-currency muted">${data.days_held != null ? data.days_held + " días" : ""}</div>
+          </div>
+          <div class="kpi">
+            <div class="kpi-label">Qty actual</div>
+            <div class="kpi-value tabular" style="font-size:16px;">${fmt.money(data.current_qty, 4)}</div>
+            <div class="kpi-currency muted">${escapeHtml(ccy)}</div>
+          </div>
+          <div class="kpi">
+            <div class="kpi-label">Avg cost</div>
+            <div class="kpi-value tabular" style="font-size:16px;">${fmt.money(data.avg_cost, 4)}</div>
+            <div class="kpi-currency muted">${escapeHtml(ccy)}</div>
+          </div>
+          <div class="kpi">
+            <div class="kpi-label">Precio actual</div>
+            <div class="kpi-value tabular" style="font-size:16px;">${fmt.money(data.current_price, 4)}</div>
+            <div class="kpi-currency muted">${escapeHtml(ccy)}</div>
+          </div>
+          <div class="kpi">
+            <div class="kpi-label">PnL no realizado</div>
+            <div class="kpi-value tabular ${data.unrealized_pnl_native > 0 ? 'positive' : data.unrealized_pnl_native < 0 ? 'negative' : ''}" style="font-size:16px;">
+              ${fmt.money(data.unrealized_pnl_native, 0)}
+            </div>
+            <div class="kpi-currency muted">${escapeHtml(ccy)}</div>
+          </div>
+          <div class="kpi">
+            <div class="kpi-label">PnL realizado</div>
+            <div class="kpi-value tabular ${data.realized_pnl_total > 0 ? 'positive' : data.realized_pnl_total < 0 ? 'negative' : ''}" style="font-size:16px;">
+              ${fmt.money(data.realized_pnl_total, 0)}
+            </div>
+            <div class="kpi-currency muted">${escapeHtml(data.realized_currency || "")}</div>
+          </div>
+        </div>
+
+        ${evo.length >= 2 ? `
+          <section>
+            <h2>📈 Evolución del precio</h2>
+            <div class="card">${sparklinePrice(evo)}</div>
+          </section>
+        ` : `
+          <div class="card muted" style="margin-bottom:12px;">
+            Sin suficientes precios históricos para graficar. Cargá precios con
+            los loaders para ver la curva.
+          </div>
+        `}
+
+        <section>
+          <h2>📋 Operaciones (${movs.length})</h2>
+          <div class="card">
+            ${movs.length === 0 ? '<div class="muted">Sin operaciones</div>' :
+              movs.map(m => {
+                const isBuy = (m.qty || 0) > 0;
+                const sign = isBuy ? "+" : "";
+                const cls = isBuy ? "positive" : "negative";
+                return `
+                  <div style="display:flex; justify-content:space-between; padding:8px 0; border-bottom:1px solid var(--border);">
+                    <div>
+                      <div style="font-size:13px;">
+                        <span class="tag ${isBuy ? '' : 'danger'}" style="font-size:10px;">
+                          ${isBuy ? "BUY" : "SELL"}
+                        </span>
+                        ${escapeHtml(m.fecha)}
+                      </div>
+                      <div class="muted" style="font-size:11px;">${escapeHtml(m.account)}</div>
+                    </div>
+                    <div class="right">
+                      <div class="tabular ${cls}">${sign}${fmt.money(m.qty, 4)}</div>
+                      ${m.unit_price ? `<div class="sub muted tabular">@ ${fmt.money(m.unit_price, 4)} ${escapeHtml(m.currency || ccy)}</div>` : ""}
+                    </div>
+                  </div>
+                `;
+              }).join("")
+            }
+          </div>
+        </section>
+      </main>
+    `;
+  });
+
+  // /asset-performance — tabla de retorno-desde-compra por holding actual
+  route("/asset-performance", async () => {
+    const view = sessionStorage.getItem("perf_view") || "all";
+    const investible = view === "investible";
+    let data, cashData;
+    try {
+      [data, cashData] = await Promise.all([
+        API.assetPerformance(API.anchor(), investible),
+        API.cashPerformance(API.anchor()),
+      ]);
+    } catch (e) {
+      return `${headerWithBack("Performance por activo", "/")}
+        <main><div class="card danger">${escapeHtml(e.message)}</div></main>`;
+    }
+    const items = data.items || [];
+    const cashItems = (cashData && cashData.items || [])
+      .filter(c => c.currency !== data.anchor);  // ocultar anchor (ret=0)
+
+    return `
+      ${headerWithBack("📊 Performance por activo", "/")}
+      <main>
+        <div class="toggle-pill" style="margin-bottom: 14px; width: 100%;">
+          <button onclick="sessionStorage.setItem('perf_view','all'); render();" class="${view === 'all' ? 'active' : ''}" style="flex:1;">📦 Todo</button>
+          <button onclick="sessionStorage.setItem('perf_view','investible'); render();" class="${view === 'investible' ? 'active' : ''}" style="flex:1;">💎 Invertible</button>
+        </div>
+
+        <div class="card compact muted" style="font-size:12px; margin-bottom: 8px;">
+          Cómo viene rindiendo cada activo desde que lo incorporaste. Return %
+          es (precio actual − avg cost) / avg cost en moneda nativa.
+          Anualizado = (1 + return)^(365/días) − 1.
+        </div>
+
+        ${cashItems.length > 0 ? `
+          <section style="margin-bottom: 16px;">
+            <h2>💵 Cash vs ${escapeHtml(data.anchor)}</h2>
+            <div class="card compact muted" style="font-size:11px; margin-bottom:6px;">
+              Retorno del cash por evolución del FX desde que entró.
+              <b>avg fx</b> = rate ponderado por entradas. Cash en ${escapeHtml(data.anchor)} no aparece (siempre 0%).
+            </div>
+            <div class="list">
+              ${cashItems.map(c => {
+                const ret = c.return_pct;
+                const cls = ret == null ? "muted" : ret > 0 ? "positive" : "negative";
+                const sign = ret > 0 ? "+" : "";
+                return `
+                  <div class="list-item" style="align-items:flex-start;">
+                    <div class="meta">
+                      <div class="meta-line1">
+                        <span style="font-weight:700;">${escapeHtml(c.currency)}</span>
+                        <span class="muted" style="font-size:11px;">cash · ${escapeHtml(c.account)}</span>
+                      </div>
+                      <div class="meta-line2 tabular muted" style="font-size:11px;">
+                        ${fmt.money(c.qty, 2)} ${escapeHtml(c.currency)}
+                        · avg fx ${fmt.money(c.avg_fx_in, 4)} → hoy ${fmt.money(c.current_fx, 4)}
+                      </div>
+                      <div class="meta-line2 muted" style="font-size:11px;">
+                        desde ${escapeHtml(c.first_inflow_date || "?")} (${c.n_inflows} entradas)
+                      </div>
+                    </div>
+                    <div class="right">
+                      <div class="amount tabular ${cls}">
+                        ${ret != null ? sign + (ret * 100).toFixed(2) + "%" : "—"}
+                      </div>
+                      <div class="sub tabular ${(c.pnl_anchor || 0) > 0 ? 'positive' : (c.pnl_anchor || 0) < 0 ? 'negative' : 'muted'}">
+                        ${fmt.money(c.pnl_anchor, 0)} ${escapeHtml(data.anchor)}
+                      </div>
+                      <div class="sub muted tabular" style="font-size:11px;">
+                        MV ${fmt.money(c.mv_anchor, 0)} ${escapeHtml(data.anchor)}
+                      </div>
+                    </div>
+                  </div>
+                `;
+              }).join("")}
+            </div>
+          </section>
+        ` : ""}
+
+        <h2>🎯 Activos</h2>
+        ${items.length === 0 ? `<div class="card muted">Sin holdings con retorno calculable.</div>` :
+          `<div class="list">
+            ${items.map((r, idx) => {
+              const ret = r.return_pct;
+              const retA = r.return_annualized;
+              const cls = ret == null ? "muted" : ret > 0 ? "positive" : "negative";
+              const sign = ret > 0 ? "+" : "";
+              return `
+                <a href="#/asset/${encodeURIComponent(r.asset)}?account=${encodeURIComponent(r.account)}" class="list-item" style="text-decoration:none; color:inherit; align-items:flex-start;">
+                  <div class="meta">
+                    <div class="meta-line1">
+                      <span style="font-weight:700;">#${idx + 1}</span>
+                      ${escapeHtml(r.asset)}
+                      <span class="muted" style="font-size:11px;">›</span>
+                    </div>
+                    <div class="meta-line2 muted" style="font-size:12px;">
+                      ${escapeHtml(r.account)} · ${escapeHtml(r.asset_class || "")}
+                    </div>
+                    <div class="meta-line2 tabular muted" style="font-size:11px; margin-top:2px;">
+                      desde ${escapeHtml(r.first_purchase_date || "?")}
+                      ${r.days_held != null ? "(" + r.days_held + " días)" : ""}
+                    </div>
+                  </div>
+                  <div class="right">
+                    <div class="amount tabular ${cls}">
+                      ${ret != null ? sign + (ret * 100).toFixed(2) + "%" : "—"}
+                    </div>
+                    <div class="sub muted tabular">
+                      ${retA != null ? "ann " + (retA > 0 ? "+" : "") + (retA * 100).toFixed(1) + "%" : ""}
+                    </div>
+                    <div class="sub tabular ${(r.unrealized_pnl_native || 0) > 0 ? 'positive' : (r.unrealized_pnl_native || 0) < 0 ? 'negative' : 'muted'}" style="margin-top:2px;">
+                      ${fmt.money(r.unrealized_pnl_native, 0)} ${escapeHtml(r.native_currency || "")}
+                    </div>
+                  </div>
+                </a>
+              `;
+            }).join("")}
+          </div>`
+        }
       </main>
       ${bottomNav("/")}
     `;
@@ -2835,9 +3244,15 @@
   route("/performance", async () => {
     const view = sessionStorage.getItem("perf_view") || "all";  // 'all' | 'investible'
     const investible = view === "investible";
-    let perf;
+    let perf, ec, tstats, rpnl, holdingsResp;
     try {
-      perf = await API.performance(API.anchor(), investible);
+      [perf, ec, tstats, rpnl, holdingsResp] = await Promise.all([
+        API.performance(API.anchor(), investible),
+        API.equityCurve(API.anchor(), investible),
+        API.tradeStats(),
+        API.realizedPnl(),
+        API.holdings(API.anchor()),
+      ]);
     } catch (e) {
       return `${headerWithBack("📊 Performance", "/settings")}
         <main><div class="card danger">${escapeHtml(e.message)}</div></main>
@@ -2852,6 +3267,56 @@
       const sign = p > 0 ? "+" : "";
       return `<span class="${cls}">${sign}${(p * 100).toFixed(2)}%</span>`;
     };
+
+    // Sparkline SVG de la curva de PN
+    const curve = (ec && ec.total) || [];
+    function sparkline(points) {
+      if (!points || points.length < 2) return "";
+      const w = 320, h = 90, pad = 4;
+      const vals = points.map(p => p.mv_anchor);
+      const min = Math.min(...vals), max = Math.max(...vals);
+      const range = (max - min) || 1;
+      const stepX = (w - pad * 2) / (points.length - 1);
+      const coords = points.map((p, i) => {
+        const x = pad + i * stepX;
+        const y = h - pad - ((p.mv_anchor - min) / range) * (h - pad * 2);
+        return [x, y];
+      });
+      const path = coords.map(([x, y], i) => `${i === 0 ? 'M' : 'L'}${x.toFixed(1)},${y.toFixed(1)}`).join(" ");
+      const last = coords[coords.length - 1];
+      return `
+        <svg viewBox="0 0 ${w} ${h}" preserveAspectRatio="none" style="width:100%; height:90px; display:block;">
+          <path d="${path}" fill="none" stroke="#1F3864" stroke-width="2"/>
+          <circle cx="${last[0]}" cy="${last[1]}" r="3" fill="#1F3864"/>
+        </svg>
+        <div style="display:flex; justify-content:space-between; font-size:11px; color:var(--muted); margin-top:4px;">
+          <span>${escapeHtml(points[0].fecha)}</span>
+          <span>${escapeHtml(points[points.length - 1].fecha)}</span>
+        </div>
+      `;
+    }
+
+    // Trade stats por moneda — orden ARS, USB, USD, otros
+    const byCcy = (tstats && tstats.by_currency) || {};
+    const CCY_ORDER = ["ARS", "USB", "USD"];
+    const ccySort = (a, b) => {
+      const ia = CCY_ORDER.indexOf(a), ib = CCY_ORDER.indexOf(b);
+      return (ia === -1 ? 99 : ia) - (ib === -1 ? 99 : ib);
+    };
+    const sortedCcys = Object.keys(byCcy).sort(ccySort);
+    const totalsByCcy = (rpnl && rpnl.totals_by_currency) || {};
+
+    // Unrealized PnL por moneda nativa (a partir de holdings)
+    const unrealByCcy = {};
+    for (const h of (holdingsResp && holdingsResp.items) || []) {
+      const c = h.native_currency || "?";
+      const v = h.unrealized_pnl_native;
+      if (v == null || isNaN(v)) continue;
+      if (!unrealByCcy[c]) unrealByCcy[c] = { pnl: 0, n: 0 };
+      unrealByCcy[c].pnl += v;
+      unrealByCcy[c].n += 1;
+    }
+    const sortedUnrealCcys = Object.keys(unrealByCcy).sort(ccySort);
 
     return `
       ${headerWithBack("📊 Performance", "/settings")}
@@ -2871,6 +3336,96 @@
             </div>
           </div>
         ` : ""}
+
+        ${curve.length >= 2 ? `
+          <section>
+            <h2>📈 Equity curve</h2>
+            <div class="card">
+              ${sparkline(curve)}
+              <div style="display:flex; justify-content:space-between; margin-top:8px; font-size:13px;">
+                <div><span class="muted">PN inicial:</span> <b class="tabular">${fmt.money(curve[0].mv_anchor)}</b></div>
+                <div><span class="muted">PN actual:</span> <b class="tabular">${fmt.money(curve[curve.length - 1].mv_anchor)}</b></div>
+              </div>
+              <div class="muted" style="font-size:11px; margin-top:6px;">${curve.length} snapshots · ${escapeHtml(perf.anchor_currency || "")}</div>
+            </div>
+          </section>
+        ` : ""}
+
+        <section>
+          <h2>📊 PnL realizado por moneda</h2>
+          <div class="card compact muted" style="font-size:12px; margin-bottom: 8px;">
+            Trades cerrados (FIFO). Los totales no se suman entre monedas porque ARS/USB/USD no son intercambiables sin FX.
+          </div>
+          ${sortedCcys.length === 0 ? `<div class="card muted">Sin trades cerrados aún</div>` :
+            `<div class="card">
+              ${sortedCcys.map(ccy => {
+                const s = byCcy[ccy];
+                const tot = totalsByCcy[ccy];
+                const cls = s.net_pnl > 0 ? "positive" : s.net_pnl < 0 ? "negative" : "muted";
+                return `
+                  <div style="padding:10px 0; border-bottom:1px solid var(--border);">
+                    <div style="display:flex; justify-content:space-between; align-items:baseline; margin-bottom:6px;">
+                      <strong>${escapeHtml(ccy)}</strong>
+                      <span class="tabular ${cls}">${fmt.money(s.net_pnl)} ${escapeHtml(ccy)}</span>
+                    </div>
+                    <div style="display:grid; grid-template-columns:1fr 1fr; gap:4px 8px; font-size:12px;">
+                      <div><span class="muted">Trades:</span> <b>${s.n_trades}</b></div>
+                      <div><span class="muted">Winrate:</span> <b>${(s.winrate * 100).toFixed(1)}%</b></div>
+                      <div><span class="muted">Wins / Loss:</span> <b class="positive">${s.n_winners}</b> / <b class="negative">${s.n_losers}</b></div>
+                      <div><span class="muted">Profit factor:</span> <b>${s.profit_factor != null ? s.profit_factor.toFixed(2) : "∞"}</b></div>
+                      <div><span class="muted">Avg winner:</span> <b class="positive">${fmt.money(s.avg_winner)}</b></div>
+                      <div><span class="muted">Avg loser:</span> <b class="negative">${fmt.money(s.avg_loser)}</b></div>
+                      <div><span class="muted">Best:</span> <b class="positive">${fmt.money(s.best_trade)}</b></div>
+                      <div><span class="muted">Worst:</span> <b class="negative">${fmt.money(s.worst_trade)}</b></div>
+                      <div><span class="muted">Expectancy:</span> <b>${fmt.money(s.expectancy)}</b></div>
+                      <div><span class="muted">Hold avg:</span> <b>${(s.avg_holding_days || 0).toFixed(1)}d</b></div>
+                      <div><span class="muted">Streak W / L:</span> <b>${s.largest_streak_wins} / ${s.largest_streak_losses}</b></div>
+                      <div><span class="muted">Scratch:</span> <b>${s.n_scratch}</b></div>
+                    </div>
+                  </div>
+                `;
+              }).join("")}
+            </div>`
+          }
+        </section>
+
+        <section>
+          <h2>📈 PnL NO realizado (mark-to-market)</h2>
+          <div class="card compact muted" style="font-size:12px; margin-bottom: 8px;">
+            Posiciones abiertas — diferencia entre precio actual y costo promedio, en moneda nativa de cada activo.
+          </div>
+          ${sortedUnrealCcys.length === 0 ? `<div class="card muted">Sin posiciones abiertas</div>` :
+            `<div class="card">
+              ${sortedUnrealCcys.map(ccy => {
+                const u = unrealByCcy[ccy];
+                const cls = u.pnl > 0 ? "positive" : u.pnl < 0 ? "negative" : "muted";
+                return `
+                  <div style="display:flex; justify-content:space-between; padding:8px 0; border-bottom:1px solid var(--border);">
+                    <div>
+                      <strong>${escapeHtml(ccy)}</strong>
+                      <span class="muted" style="font-size:12px;"> · ${u.n} posiciones</span>
+                    </div>
+                    <span class="tabular ${cls}">${fmt.money(u.pnl)} ${escapeHtml(ccy)}</span>
+                  </div>
+                `;
+              }).join("")}
+            </div>`
+          }
+        </section>
+
+        <section>
+          <h2>🧹 Mantenimiento de snapshots</h2>
+          <div class="card compact muted" style="font-size:12px; margin-bottom: 8px;">
+            <b>Reconstruir histórico</b>: calcula el PN en cada fecha pasada
+            usando tu historial de movimientos — la curva arranca desde el
+            primer evento, no desde hoy. <br>
+            <b>Resetear</b>: borra todos los snapshots y arranca desde cero.
+          </div>
+          <button class="btn primary full" data-onclick="backfillSnapshots" style="margin-bottom:6px;">
+            🔄 Reconstruir histórico desde movimientos
+          </button>
+          <button class="btn ghost full" data-onclick="resetSnapshots">🗑 Resetear snapshots</button>
+        </section>
 
         <section>
           <h2>Time Weighted Return (TWR)</h2>

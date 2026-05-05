@@ -40,7 +40,7 @@ from datetime import date, timedelta
 from typing import Optional
 
 from .fx import convert as fx_convert, FxError
-from .snapshots import get_equity_curve
+from .snapshots import get_equity_curve, trim_anomalous_leading
 
 
 BOUNDARY_ACCOUNTS = ("external_income", "external_expense", "opening_balance")
@@ -264,6 +264,9 @@ def performance_summary(conn, anchor_currency="USD", investible_only=False,
     curve = get_equity_curve(conn, anchor_currency=anchor_currency,
                               fecha_desde=fecha_desde, fecha_hasta=fecha_hasta,
                               investible_only=investible_only)
+    # Filtrar snapshots iniciales degenerados (PN parcial / sin FX). Sin esto,
+    # un primer punto con valor ~0 produce TWR/MWR irreales (1900%, 28000%, etc).
+    curve = trim_anomalous_leading(curve)
     if not curve:
         return {
             "anchor_currency": anchor_currency,

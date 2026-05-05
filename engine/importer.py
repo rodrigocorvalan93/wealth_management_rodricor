@@ -310,13 +310,17 @@ def import_funding(conn, ws):
         moneda = _to_str(row.get("Moneda"))
         monto = _to_float(row.get("Monto"))
         tna = _to_float(row.get("TNA")) or 0.0
-        # 'Días' puede venir como fórmula evaluada por openpyxl con data_only=True
+        # 'Días' puede venir como fórmula evaluada por openpyxl con data_only=True.
+        # Si llega 0 / None pero tenemos fechas válidas, lo derivamos de las
+        # fechas — evita interés=0 espurio en cauciones cerradas.
         dias = _to_int(row.get("Días"))
-        if dias is None and f_inicio and f_fin:
+        if (dias is None or dias == 0) and f_inicio and f_fin:
             try:
-                dias = (date.fromisoformat(f_fin) - date.fromisoformat(f_inicio)).days
+                computed = (date.fromisoformat(f_fin) - date.fromisoformat(f_inicio)).days
+                if computed > 0:
+                    dias = computed
             except (ValueError, TypeError):
-                dias = 0
+                pass
         dias = dias or 0
         status = _to_str(row.get("Status")) or "OPEN"
         linked_trade_id = _to_str(row.get("Linked Trade ID"))
@@ -326,6 +330,22 @@ def import_funding(conn, ws):
             continue
         if tipo not in ("TOMA", "COLOCA"):
             continue
+
+        # BUG 7: validar Linked Trade ID — warn si apunta a un trade que no existe.
+        # No bloquea (puede ser data en orden de carga distinto), solo log.
+        if linked_trade_id:
+            cur = conn.execute(
+                "SELECT 1 FROM events WHERE external_id=? AND event_type=? LIMIT 1",
+                (linked_trade_id, EventType.TRADE),
+            )
+            if cur.fetchone() is None:
+                import sys as _sys
+                print(
+                    f"[funding] WARN Fund ID={fund_id}: Linked Trade ID="
+                    f"{linked_trade_id!r} no existe en blotter — la caución "
+                    f"queda sin vinculación en /leverage.",
+                    file=_sys.stderr,
+                )
 
         # Normalizar TNA: si vino como 24 (asumimos %), convertir a 0.24
         if tna > 1.5:
