@@ -650,6 +650,24 @@ def create_app() -> Flask:
             print(f"[refresh] WARN no pude grabar snapshot: {e}")
         return jsonify({"refreshed": True, "import_stats": stats})
 
+    @app.get("/api/performance")
+    def performance_endpoint():
+        """Métricas full de performance: TWR + MWR + flows + curve.
+
+        Query: ?anchor=USD&investible=1
+        """
+        _require_auth(); _block_if_switched_mutation()
+        from engine.performance import performance_summary
+        anchor = _parse_query_anchor()
+        investible = request.args.get("investible") == "1"
+        conn = db_conn()
+        try:
+            data = performance_summary(conn, anchor_currency=anchor,
+                                         investible_only=investible)
+            return jsonify(data)
+        finally:
+            conn.close()
+
     @app.get("/api/returns")
     def returns_endpoint():
         """Returns simples del PN para 1d/1w/1m/3m/ytd/1y.

@@ -132,11 +132,13 @@ def get_loaders():
         tickers_arg = ["--tickers-file", str(legacy_tickers_file)]
     else:
         tickers_arg = []
+    # cafci NO recibe tickers_arg porque necesita un mapping ticker→CAFCI_name
+    # que no se puede inferir solo del ticker. Sigue usando fcis_cafci.txt manual.
     return [
         ("fx",       [PYTHON_BIN, "fx_loader.py"]),
         ("byma",     [PYTHON_BIN, "byma_loader.py", *tickers_arg]),
         ("cafci",    [PYTHON_BIN, "cafci_loader.py"]),
-        ("cripto",   [PYTHON_BIN, "cripto_loader.py"]),
+        ("cripto",   [PYTHON_BIN, "cripto_loader.py", *tickers_arg]),
         ("yfinance", [PYTHON_BIN, "yfinance_loader.py", *tickers_arg]),
     ]
 

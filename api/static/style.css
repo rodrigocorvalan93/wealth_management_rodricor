@@ -376,6 +376,31 @@ main.has-bottom-nav {
   padding-bottom: calc(70px + var(--safe-bottom));
 }
 
+/* === FAB (floating action button) — para agregar items rápido === */
+.fab {
+  position: fixed;
+  right: 16px;
+  bottom: calc(80px + var(--safe-bottom));
+  width: 52px;
+  height: 52px;
+  border-radius: 50%;
+  background: var(--navy);
+  color: white;
+  font-size: 26px;
+  font-weight: 600;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  box-shadow: 0 4px 12px rgba(0,0,0,0.15);
+  text-decoration: none;
+  z-index: 90;
+  transition: transform 0.15s, box-shadow 0.15s;
+}
+.fab:active {
+  transform: scale(0.92);
+  box-shadow: 0 2px 6px rgba(0,0,0,0.2);
+}
+
 /* === Polish general === */
 .kpi {
   transition: box-shadow 0.18s, transform 0.18s;

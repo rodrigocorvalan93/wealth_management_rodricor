@@ -128,6 +128,11 @@
       const inv = investible ? "&investible=1" : "";
       return API.req(`/api/returns?anchor=${a}${inv}`);
     },
+    performance: (anchor, investible) => {
+      const a = anchor || API.anchor();
+      const inv = investible ? "&investible=1" : "";
+      return API.req(`/api/performance?anchor=${a}${inv}`);
+    },
     holdingsNearTarget: (anchor, bpsOverride) => {
       const a = anchor || API.anchor();
       const q = bpsOverride != null ? `&bps=${bpsOverride}` : "";
@@ -953,6 +958,7 @@
             <a href="#/journal" class="btn ghost full">📔 Journal</a>
             <a href="#/transferencias" class="btn ghost full">🔄 Transferencias</a>
           </div>
+          <a href="#/performance" class="btn ghost full" style="margin-top: 8px;">📊 Performance (TWR / MWR)</a>
         </section>
       </main>
       ${bottomNav("/")}
@@ -1109,6 +1115,83 @@
   }
 
   // /gastos
+  // ====================================================================
+  // /flows — vista combinada de gastos + ingresos con toggle
+  // ====================================================================
+  route("/flows", async () => {
+    const tab = sessionStorage.getItem("flows_tab") || "gastos";  // 'gastos' | 'ingresos'
+    const [gastos, ingresos] = await Promise.all([
+      API.listSheet("gastos").catch(() => ({ items: [] })),
+      API.listSheet("ingresos").catch(() => ({ items: [] })),
+    ]);
+    const gastosItems = (gastos.items || []).filter(r => r.Concepto || r.Monto).reverse();
+    const ingresosItems = (ingresos.items || []).filter(r => r.Concepto || r.Monto).reverse();
+
+    const gastosTotal = gastosItems.reduce((s, r) => s + (parseFloat(r.Monto) || 0), 0);
+    const ingresosTotal = ingresosItems.reduce((s, r) => s + (parseFloat(r.Monto) || 0), 0);
+
+    const items = tab === "ingresos" ? ingresosItems : gastosItems;
+    const newRoute = tab === "ingresos" ? "/ingresos/new" : "/gastos/new";
+    const editPath = tab === "ingresos" ? "/ingresos" : "/gastos";
+
+    return `
+      <div class="topbar">
+        <button onclick="window.history.length>1 ? window.history.back() : window.location.hash='/'">‹ Atrás</button>
+        <h1>💸 Flujos</h1>
+        <div></div>
+      </div>
+      <main class="has-bottom-nav">
+        <div class="toggle-pill" style="margin-bottom: 14px; width: 100%;">
+          <button onclick="window._setFlowsTab('gastos')" class="${tab === 'gastos' ? 'active' : ''}" style="flex:1;">
+            💸 Gastos <span class="muted" style="font-size: 11px;">(${gastosItems.length})</span>
+          </button>
+          <button onclick="window._setFlowsTab('ingresos')" class="${tab === 'ingresos' ? 'active' : ''}" style="flex:1;">
+            💰 Ingresos <span class="muted" style="font-size: 11px;">(${ingresosItems.length})</span>
+          </button>
+        </div>
+
+        <div class="kpi-grid">
+          <div class="kpi">
+            <div class="kpi-label">${tab === 'ingresos' ? 'Total ingresos' : 'Total gastos'}</div>
+            <div class="kpi-value ${tab === 'ingresos' ? 'positive' : 'negative'}">
+              ${tab === 'ingresos' ? '+ ' : '- '}${fmt.money(tab === 'ingresos' ? ingresosTotal : gastosTotal)}
+            </div>
+            <div class="kpi-currency muted">${items.length > 0 ? 'todas las monedas, sin convertir' : ''}</div>
+          </div>
+        </div>
+
+        ${items.length === 0 ?
+          emptyState(`Sin ${tab}`, `Tocá + para agregar`) :
+          `<div class="list">${items.map(r => `
+            <a class="list-item" href="#${editPath}/${encodeURIComponent(r.row_id || '')}/edit">
+              <div class="meta">
+                <div class="meta-line1">${escapeHtml(r.Concepto || '(sin concepto)')}</div>
+                <div class="meta-line2">
+                  ${escapeHtml(fmt.date(r.Fecha))} · ${escapeHtml(r.Categoría || r.Categoria || '—')}
+                  ${r.Tipo ? ' · ' + escapeHtml(r.Tipo) : ''}
+                </div>
+              </div>
+              <div class="right">
+                <div class="amount ${tab === 'ingresos' ? 'positive' : 'negative'}">
+                  ${tab === 'ingresos' ? '+ ' : '- '}${fmt.money(r.Monto)}
+                </div>
+                <div class="sub">${escapeHtml(r.Moneda || '')} · ${escapeHtml(r['Cuenta Destino'] || '')}</div>
+              </div>
+            </a>
+          `).join('')}</div>`
+        }
+
+        <a href="#${newRoute}" class="fab" title="Nuevo ${tab === 'ingresos' ? 'ingreso' : 'gasto'}">+</a>
+      </main>
+      ${bottomNav('/flows')}
+    `;
+  });
+
+  window._setFlowsTab = function (tab) {
+    sessionStorage.setItem("flows_tab", tab);
+    render();
+  };
+
   route("/gastos", async () => {
     const data = await API.listSheet("gastos");
     const items = (data.items || []).filter(r => r.Concepto || r.Monto).reverse();
@@ -2135,7 +2218,7 @@
           fresca). Subí precios con <code>python sync.py --skip-loaders</code>.
         </div>
       </main>
-      ${bottomNav("/holdings")}
+      ${bottomNav("/")}
     `;
   });
 
@@ -2746,6 +2829,143 @@
   // ====================================================================
   // /help — manualcitos
   // ====================================================================
+  // ====================================================================
+  // /performance — TWR + MWR + métricas completas
+  // ====================================================================
+  route("/performance", async () => {
+    const view = sessionStorage.getItem("perf_view") || "all";  // 'all' | 'investible'
+    const investible = view === "investible";
+    let perf;
+    try {
+      perf = await API.performance(API.anchor(), investible);
+    } catch (e) {
+      return `${headerWithBack("📊 Performance", "/settings")}
+        <main><div class="card danger">${escapeHtml(e.message)}</div></main>
+        ${bottomNav("/settings")}`;
+    }
+    const twr = perf.twr || {};
+    const mwr = perf.mwr || {};
+
+    const fmtPct = (p) => {
+      if (p == null) return '<span class="muted">·</span>';
+      const cls = p > 0 ? "positive" : p < 0 ? "negative" : "muted";
+      const sign = p > 0 ? "+" : "";
+      return `<span class="${cls}">${sign}${(p * 100).toFixed(2)}%</span>`;
+    };
+
+    return `
+      ${headerWithBack("📊 Performance", "/settings")}
+      <main class="has-bottom-nav">
+        <div class="toggle-pill" style="margin-bottom: 14px; width: 100%;">
+          <button onclick="sessionStorage.setItem('perf_view','all'); render();" class="${view === 'all' ? 'active' : ''}" style="flex:1;">📦 Todo</button>
+          <button onclick="sessionStorage.setItem('perf_view','investible'); render();" class="${view === 'investible' ? 'active' : ''}" style="flex:1;">💎 Invertible</button>
+        </div>
+
+        ${perf.curve_points < 2 ? `
+          <div class="card warn" style="background:#FFF8E1; border-left:4px solid var(--yellow);">
+            <b>⚠ Datos insuficientes</b>
+            <div class="muted" style="font-size:12px; margin-top:4px;">
+              Necesito ≥2 snapshots de PN para calcular returns.
+              Tenés ${perf.curve_points || 0}. Cada <code>refresh</code> graba un snapshot;
+              esperá unos días o forzá refrescos para tener historia.
+            </div>
+          </div>
+        ` : ""}
+
+        <section>
+          <h2>Time Weighted Return (TWR)</h2>
+          <div class="card compact muted" style="font-size:12px; margin-bottom: 8px;">
+            Aísla flujos: muestra cuánto rinde lo que tenés invertido,
+            independiente de cuándo metiste/sacaste plata.
+            <b>Es la métrica estándar de la industria</b> para comparar
+            portfolios o estrategias.
+          </div>
+          <div class="kpi-grid">
+            <div class="kpi">
+              <div class="kpi-label">Return total</div>
+              <div class="kpi-value tabular">${fmtPct(twr.twr_pct)}</div>
+              <div class="kpi-currency muted">${perf.from_date || "?"} → ${perf.to_date || "?"}</div>
+            </div>
+            <div class="kpi">
+              <div class="kpi-label">Anualizado</div>
+              <div class="kpi-value tabular">${fmtPct(twr.twr_annual)}</div>
+              <div class="kpi-currency muted">${twr.n_periods || 0} sub-periodos</div>
+            </div>
+          </div>
+        </section>
+
+        <section>
+          <h2>Money Weighted Return (MWR)</h2>
+          <div class="card compact muted" style="font-size:12px; margin-bottom: 8px;">
+            Ponderado por timing — refleja el éxito <b>real</b> tuyo.
+            Si metiste plata justo antes de un rally, el MWR sube; si metiste
+            antes de una caída, baja. Calculado como <i>Modified Dietz</i>
+            (proxy ≈ IRR).
+          </div>
+          <div class="kpi-grid">
+            <div class="kpi">
+              <div class="kpi-label">Return total</div>
+              <div class="kpi-value tabular">${fmtPct(mwr.mwr_pct)}</div>
+              <div class="kpi-currency muted">flujos = ${fmt.money(mwr.total_flow || 0, 0)} ${escapeHtml(perf.anchor_currency)}</div>
+            </div>
+            <div class="kpi">
+              <div class="kpi-label">Anualizado</div>
+              <div class="kpi-value tabular">${fmtPct(mwr.mwr_annual)}</div>
+              <div class="kpi-currency muted">${mwr.n_flows || 0} flujos</div>
+            </div>
+          </div>
+        </section>
+
+        <section>
+          <h2>Resumen del período</h2>
+          <div class="card">
+            <div style="display:flex; justify-content:space-between; padding:6px 0; border-bottom:1px solid var(--border);">
+              <span class="muted">PN inicial</span>
+              <span class="tabular">${fmt.money(perf.v_begin || 0)} ${escapeHtml(perf.anchor_currency)}</span>
+            </div>
+            <div style="display:flex; justify-content:space-between; padding:6px 0; border-bottom:1px solid var(--border);">
+              <span class="muted">PN final</span>
+              <span class="tabular">${fmt.money(perf.v_end || 0)} ${escapeHtml(perf.anchor_currency)}</span>
+            </div>
+            <div style="display:flex; justify-content:space-between; padding:6px 0; border-bottom:1px solid var(--border);">
+              <span class="muted">Cambio bruto</span>
+              <span class="tabular ${(perf.total_change_abs||0)>=0?'positive':'negative'}">${fmt.money(perf.total_change_abs || 0)} ${escapeHtml(perf.anchor_currency)}</span>
+            </div>
+            <div style="display:flex; justify-content:space-between; padding:6px 0;">
+              <span class="muted">Flujos netos (aportes - retiros)</span>
+              <span class="tabular">${fmt.money(perf.total_flows || 0)} ${escapeHtml(perf.anchor_currency)}</span>
+            </div>
+          </div>
+        </section>
+
+        ${(perf.flows || []).length > 0 ? `
+          <section>
+            <h2>Flujos detectados (${perf.flows.length})</h2>
+            <div class="card compact muted" style="font-size:12px; margin-bottom: 8px;">
+              Sueldos, gastos, opening_balance. Positivo = entró capital.
+            </div>
+            <div class="list" style="max-height: 240px; overflow-y: auto;">
+              ${perf.flows.slice(-30).reverse().map(f => `
+                <div class="list-item">
+                  <div class="meta">
+                    <div class="meta-line1">${escapeHtml(fmt.date(f.fecha))}</div>
+                  </div>
+                  <div class="right">
+                    <div class="amount tabular ${f.amount_anchor >= 0 ? 'positive' : 'negative'}">
+                      ${f.amount_anchor >= 0 ? '+' : ''}${fmt.money(f.amount_anchor)}
+                    </div>
+                    <div class="sub muted">${escapeHtml(perf.anchor_currency)}</div>
+                  </div>
+                </div>
+              `).join("")}
+            </div>
+          </section>
+        ` : ""}
+      </main>
+      ${bottomNav("/settings")}
+    `;
+  });
+
   route("/help", async () => {
     return `
       ${headerWithBack("❓ Ayuda", "/settings")}
@@ -3308,9 +3528,9 @@ python yfinance_loader.py</pre>
   function bottomNav(activePath) {
     const items = [
       { href: "/",         label: "Home",   icon: "🏠" },
-      { href: "/cash",     label: "Cash",   icon: "💵" },
       { href: "/trades",   label: "Trades", icon: "📈" },
-      { href: "/holdings", label: "Posic.", icon: "📋" },
+      { href: "/cash",     label: "Cash",   icon: "💵" },
+      { href: "/flows",    label: "Flujos", icon: "💸" },
       { href: "/settings", label: "Setup",  icon: "⚙️" },
     ];
     return `
