@@ -705,6 +705,35 @@ def create_app() -> Flask:
         finally:
             conn.close()
 
+    @app.delete("/api/snapshots")
+    def delete_snapshots():
+        """Borra snapshots del PN. Útil para limpiar baseline contaminado
+        (snapshots iniciales con PN parcial / sin FX que disparan TWR irreal).
+
+        Query:
+          ?before=YYYY-MM-DD  — borra todos los snapshots con fecha < ese día.
+          ?all=1              — borra todo el histórico de snapshots.
+        Sin parámetros: error.
+        """
+        _require_auth(); _block_if_switched_mutation()
+        before = request.args.get("before")
+        delete_all = request.args.get("all") == "1"
+        if not before and not delete_all:
+            return jsonify({"error": "missing 'before' o 'all=1'"}), 400
+        conn = db_conn()
+        try:
+            if delete_all:
+                cur = conn.execute("DELETE FROM pn_snapshots")
+            else:
+                cur = conn.execute(
+                    "DELETE FROM pn_snapshots WHERE fecha < ?", (before,)
+                )
+            n = cur.rowcount
+            conn.commit()
+            return jsonify({"deleted": n, "before": before, "all": delete_all})
+        finally:
+            conn.close()
+
     @app.get("/api/backups")
     def backups():
         _require_auth(); _block_if_switched_mutation()

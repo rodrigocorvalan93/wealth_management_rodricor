@@ -107,6 +107,12 @@
     equityCurve: (anchor, investible) => API.req(
       `/api/equity-curve?anchor=${anchor || API.anchor()}&investible=${!!investible}`
     ),
+    deleteSnapshots: (opts) => {
+      const qs = opts && opts.all ? "all=1"
+        : opts && opts.before ? `before=${encodeURIComponent(opts.before)}`
+        : "";
+      return API.req(`/api/snapshots?${qs}`, { method: "DELETE" });
+    },
     refresh: () => API.req("/api/refresh", { method: "POST" }),
     backups: () => API.req("/api/backups"),
 
@@ -649,6 +655,17 @@
         await API.refresh();
         invalidateMeta();
         toast("Refresh completado ✓", "success");
+        render();
+      } catch (e) {
+        toast(`Error: ${e.message}`, "error");
+      }
+    },
+    async resetSnapshots() {
+      if (!confirm("¿Borrar TODOS los snapshots históricos? La equity curve arranca de cero. Hacelo si tu PN inicial está contaminado (ej. 0 o un parcial sin FX). El próximo refresh graba un snapshot limpio.")) return;
+      try {
+        const r = await API.deleteSnapshots({ all: true });
+        toast(`Borrados ${r.deleted} snapshots ✓`, "success");
+        await API.refresh();  // graba un snapshot limpio inmediatamente
         render();
       } catch (e) {
         toast(`Error: ${e.message}`, "error");
@@ -2835,9 +2852,15 @@
   route("/performance", async () => {
     const view = sessionStorage.getItem("perf_view") || "all";  // 'all' | 'investible'
     const investible = view === "investible";
-    let perf;
+    let perf, ec, tstats, rpnl, holdingsResp;
     try {
-      perf = await API.performance(API.anchor(), investible);
+      [perf, ec, tstats, rpnl, holdingsResp] = await Promise.all([
+        API.performance(API.anchor(), investible),
+        API.equityCurve(API.anchor(), investible),
+        API.tradeStats(),
+        API.realizedPnl(),
+        API.holdings(API.anchor()),
+      ]);
     } catch (e) {
       return `${headerWithBack("📊 Performance", "/settings")}
         <main><div class="card danger">${escapeHtml(e.message)}</div></main>
@@ -2852,6 +2875,56 @@
       const sign = p > 0 ? "+" : "";
       return `<span class="${cls}">${sign}${(p * 100).toFixed(2)}%</span>`;
     };
+
+    // Sparkline SVG de la curva de PN
+    const curve = (ec && ec.total) || [];
+    function sparkline(points) {
+      if (!points || points.length < 2) return "";
+      const w = 320, h = 90, pad = 4;
+      const vals = points.map(p => p.mv_anchor);
+      const min = Math.min(...vals), max = Math.max(...vals);
+      const range = (max - min) || 1;
+      const stepX = (w - pad * 2) / (points.length - 1);
+      const coords = points.map((p, i) => {
+        const x = pad + i * stepX;
+        const y = h - pad - ((p.mv_anchor - min) / range) * (h - pad * 2);
+        return [x, y];
+      });
+      const path = coords.map(([x, y], i) => `${i === 0 ? 'M' : 'L'}${x.toFixed(1)},${y.toFixed(1)}`).join(" ");
+      const last = coords[coords.length - 1];
+      return `
+        <svg viewBox="0 0 ${w} ${h}" preserveAspectRatio="none" style="width:100%; height:90px; display:block;">
+          <path d="${path}" fill="none" stroke="#1F3864" stroke-width="2"/>
+          <circle cx="${last[0]}" cy="${last[1]}" r="3" fill="#1F3864"/>
+        </svg>
+        <div style="display:flex; justify-content:space-between; font-size:11px; color:var(--muted); margin-top:4px;">
+          <span>${escapeHtml(points[0].fecha)}</span>
+          <span>${escapeHtml(points[points.length - 1].fecha)}</span>
+        </div>
+      `;
+    }
+
+    // Trade stats por moneda — orden ARS, USB, USD, otros
+    const byCcy = (tstats && tstats.by_currency) || {};
+    const CCY_ORDER = ["ARS", "USB", "USD"];
+    const ccySort = (a, b) => {
+      const ia = CCY_ORDER.indexOf(a), ib = CCY_ORDER.indexOf(b);
+      return (ia === -1 ? 99 : ia) - (ib === -1 ? 99 : ib);
+    };
+    const sortedCcys = Object.keys(byCcy).sort(ccySort);
+    const totalsByCcy = (rpnl && rpnl.totals_by_currency) || {};
+
+    // Unrealized PnL por moneda nativa (a partir de holdings)
+    const unrealByCcy = {};
+    for (const h of (holdingsResp && holdingsResp.items) || []) {
+      const c = h.native_currency || "?";
+      const v = h.unrealized_pnl_native;
+      if (v == null || isNaN(v)) continue;
+      if (!unrealByCcy[c]) unrealByCcy[c] = { pnl: 0, n: 0 };
+      unrealByCcy[c].pnl += v;
+      unrealByCcy[c].n += 1;
+    }
+    const sortedUnrealCcys = Object.keys(unrealByCcy).sort(ccySort);
 
     return `
       ${headerWithBack("📊 Performance", "/settings")}
@@ -2871,6 +2944,91 @@
             </div>
           </div>
         ` : ""}
+
+        ${curve.length >= 2 ? `
+          <section>
+            <h2>📈 Equity curve</h2>
+            <div class="card">
+              ${sparkline(curve)}
+              <div style="display:flex; justify-content:space-between; margin-top:8px; font-size:13px;">
+                <div><span class="muted">PN inicial:</span> <b class="tabular">${fmt.money(curve[0].mv_anchor)}</b></div>
+                <div><span class="muted">PN actual:</span> <b class="tabular">${fmt.money(curve[curve.length - 1].mv_anchor)}</b></div>
+              </div>
+              <div class="muted" style="font-size:11px; margin-top:6px;">${curve.length} snapshots · ${escapeHtml(perf.anchor_currency || "")}</div>
+            </div>
+          </section>
+        ` : ""}
+
+        <section>
+          <h2>📊 PnL realizado por moneda</h2>
+          <div class="card compact muted" style="font-size:12px; margin-bottom: 8px;">
+            Trades cerrados (FIFO). Los totales no se suman entre monedas porque ARS/USB/USD no son intercambiables sin FX.
+          </div>
+          ${sortedCcys.length === 0 ? `<div class="card muted">Sin trades cerrados aún</div>` :
+            `<div class="card">
+              ${sortedCcys.map(ccy => {
+                const s = byCcy[ccy];
+                const tot = totalsByCcy[ccy];
+                const cls = s.net_pnl > 0 ? "positive" : s.net_pnl < 0 ? "negative" : "muted";
+                return `
+                  <div style="padding:10px 0; border-bottom:1px solid var(--border);">
+                    <div style="display:flex; justify-content:space-between; align-items:baseline; margin-bottom:6px;">
+                      <strong>${escapeHtml(ccy)}</strong>
+                      <span class="tabular ${cls}">${fmt.money(s.net_pnl)} ${escapeHtml(ccy)}</span>
+                    </div>
+                    <div style="display:grid; grid-template-columns:1fr 1fr; gap:4px 8px; font-size:12px;">
+                      <div><span class="muted">Trades:</span> <b>${s.n_trades}</b></div>
+                      <div><span class="muted">Winrate:</span> <b>${(s.winrate * 100).toFixed(1)}%</b></div>
+                      <div><span class="muted">Wins / Loss:</span> <b class="positive">${s.n_winners}</b> / <b class="negative">${s.n_losers}</b></div>
+                      <div><span class="muted">Profit factor:</span> <b>${s.profit_factor != null ? s.profit_factor.toFixed(2) : "∞"}</b></div>
+                      <div><span class="muted">Avg winner:</span> <b class="positive">${fmt.money(s.avg_winner)}</b></div>
+                      <div><span class="muted">Avg loser:</span> <b class="negative">${fmt.money(s.avg_loser)}</b></div>
+                      <div><span class="muted">Best:</span> <b class="positive">${fmt.money(s.best_trade)}</b></div>
+                      <div><span class="muted">Worst:</span> <b class="negative">${fmt.money(s.worst_trade)}</b></div>
+                      <div><span class="muted">Expectancy:</span> <b>${fmt.money(s.expectancy)}</b></div>
+                      <div><span class="muted">Hold avg:</span> <b>${(s.avg_holding_days || 0).toFixed(1)}d</b></div>
+                      <div><span class="muted">Streak W / L:</span> <b>${s.largest_streak_wins} / ${s.largest_streak_losses}</b></div>
+                      <div><span class="muted">Scratch:</span> <b>${s.n_scratch}</b></div>
+                    </div>
+                  </div>
+                `;
+              }).join("")}
+            </div>`
+          }
+        </section>
+
+        <section>
+          <h2>📈 PnL NO realizado (mark-to-market)</h2>
+          <div class="card compact muted" style="font-size:12px; margin-bottom: 8px;">
+            Posiciones abiertas — diferencia entre precio actual y costo promedio, en moneda nativa de cada activo.
+          </div>
+          ${sortedUnrealCcys.length === 0 ? `<div class="card muted">Sin posiciones abiertas</div>` :
+            `<div class="card">
+              ${sortedUnrealCcys.map(ccy => {
+                const u = unrealByCcy[ccy];
+                const cls = u.pnl > 0 ? "positive" : u.pnl < 0 ? "negative" : "muted";
+                return `
+                  <div style="display:flex; justify-content:space-between; padding:8px 0; border-bottom:1px solid var(--border);">
+                    <div>
+                      <strong>${escapeHtml(ccy)}</strong>
+                      <span class="muted" style="font-size:12px;"> · ${u.n} posiciones</span>
+                    </div>
+                    <span class="tabular ${cls}">${fmt.money(u.pnl)} ${escapeHtml(ccy)}</span>
+                  </div>
+                `;
+              }).join("")}
+            </div>`
+          }
+        </section>
+
+        <section>
+          <h2>🧹 Mantenimiento de snapshots</h2>
+          <div class="card compact muted" style="font-size:12px; margin-bottom: 8px;">
+            Si tu PN inicial está contaminado (ej. <b>0</b> o un parcial sin FX),
+            las métricas TWR/MWR salen irreales. Reseteá el histórico y arrancá limpio.
+          </div>
+          <button class="btn ghost full" data-onclick="resetSnapshots">🗑 Resetear snapshots históricos</button>
+        </section>
 
         <section>
           <h2>Time Weighted Return (TWR)</h2>

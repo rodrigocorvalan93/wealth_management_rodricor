@@ -40,7 +40,9 @@ def record_snapshots(conn, holdings, fecha, anchor_currency="USD"):
     la equity curve quedaría inflada por el monto de las deudas.
 
     Si ya existen para (fecha, account, ancla), se sobreescriben.
-    Devuelve cantidad de snapshots escritos.
+    Devuelve cantidad de snapshots escritos. Si el PN total es 0 (no hay
+    holdings con FX resuelto todavía), no graba nada — un snapshot con valor 0
+    rompe el cálculo de TWR/MWR (división por cero o baseline irreal).
     """
     from .schema import insert_pn_snapshot
 
@@ -66,6 +68,11 @@ def record_snapshots(conn, holdings, fecha, anchor_currency="USD"):
         if h.get("investible", True):
             by_acc_inv[acc] += mv
             total_inv += mv
+
+    # Guard: si el PN total es ~0 los holdings no se resolvieron bien (FX
+    # faltante, sin precios, etc). Grabar un 0 contamina la equity curve.
+    if abs(total_all) < 1e-6:
+        return 0
 
     n = 0
     for acc, val in by_acc_all.items():
@@ -261,6 +268,34 @@ def get_equity_curves_by_account(conn, anchor_currency="USD",
     return dict(out)
 
 
+def trim_anomalous_leading(curve, min_ratio=0.01):
+    """Descarta snapshots iniciales con valor < min_ratio * max(curve).
+
+    Caso típico: el primer snapshot fue grabado antes de que estuvieran
+    cargados los precios o el FX, dando un PN parcial (o 0). Esos puntos
+    rompen TWR / MWR / total_return %, así que los filtramos antes de calcular
+    métricas. Mantenemos el resto intacto.
+
+    Si la curva entera está por debajo del umbral, devuelve la curva sin
+    cambios (no hay nada con qué comparar).
+    """
+    if not curve:
+        return curve
+    max_val = max((p["mv_anchor"] for p in curve if p.get("mv_anchor") is not None),
+                   default=0)
+    if max_val <= 0:
+        return curve
+    threshold = max_val * min_ratio
+    i = 0
+    while i < len(curve) - 1:
+        v = curve[i].get("mv_anchor")
+        if v is None or abs(v) < threshold:
+            i += 1
+        else:
+            break
+    return curve[i:]
+
+
 def _period_returns(curve):
     """Calcula retornos % entre puntos consecutivos. Skip puntos con valor 0."""
     rets = []
@@ -321,6 +356,9 @@ def calculate_returns(curve, risk_free_rate=0.0):
 
     risk_free_rate: tasa libre de riesgo anual (decimal). Default 0.
     """
+    # Filtrar snapshots iniciales degenerados (PN parcial / sin FX). Sin esto,
+    # un primer punto con valor ~0 produce total_return_pct gigantesco.
+    curve = trim_anomalous_leading(curve)
     if not curve:
         return {
             "first_value": 0.0, "last_value": 0.0,
