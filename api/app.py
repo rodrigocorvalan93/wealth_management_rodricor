@@ -640,6 +640,34 @@ def create_app() -> Flask:
             "import_stats": stats,
         })
 
+    @app.post("/api/backfill-snapshots")
+    def backfill_snapshots_endpoint():
+        """Reconstruye la equity curve desde precios históricos guardados.
+
+        Útil cuando se perdió historia (ej por purga de pn_snapshots) o
+        cuando se arranca con un master que tiene varios meses de trades.
+
+        Body opcional: {"from": "2026-01-01", "to": "2026-05-05"}
+        Si no se pasan fechas, usa el primer event_date hasta hoy.
+        """
+        _require_auth(); _block_if_switched_mutation()
+        from engine.snapshots import backfill_snapshots
+        body = request.get_json(silent=True) or {}
+        anchor = _parse_query_anchor()
+        with excel_write_lock():
+            conn = db_conn()
+            try:
+                stats = backfill_snapshots(
+                    conn,
+                    fecha_desde=body.get("from"),
+                    fecha_hasta=body.get("to"),
+                    anchor_currency=anchor,
+                )
+                conn.commit()
+            finally:
+                conn.close()
+        return jsonify({"backfilled": True, **stats})
+
     @app.post("/api/refresh")
     def refresh():
         _require_auth(); _block_if_switched_mutation()

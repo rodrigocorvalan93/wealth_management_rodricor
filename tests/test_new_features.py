@@ -299,6 +299,36 @@ def test_c2b_snapshot_uses_pn_net_of_liabilities():
         conn.close()
 
 
+def test_c2c_backfill_snapshots():
+    """backfill_snapshots reconstruye historia desde primer event_date."""
+    print("\n[C2c] backfill_snapshots reconstruye equity curve histórica:")
+    with tempfile.TemporaryDirectory() as tmp:
+        from engine.snapshots import backfill_snapshots
+        conn, _ = _setup_db(Path(tmp))
+        # 0 snapshots inicialmente
+        n_before = conn.execute('SELECT COUNT(*) FROM pn_snapshots').fetchone()[0]
+        assert n_before == 0
+        # Backfill con range explícito
+        stats = backfill_snapshots(
+            conn, fecha_desde="2026-04-25", fecha_hasta="2026-05-02",
+            anchor_currency="ARS",
+        )
+        assert stats["processed"] == 8  # 25 abr - 2 may inclusivo
+        # Cada día escribe N snapshots (al menos __TOTAL__ + __TOTAL_INVESTIBLE__ + cuentas)
+        assert stats["snapshots_written"] >= 16  # al menos 2 por día * 8 días
+        n_after = conn.execute('SELECT COUNT(*) FROM pn_snapshots').fetchone()[0]
+        assert n_after == stats["snapshots_written"]
+        # Idempotente: corre de nuevo, no duplica (INSERT OR REPLACE)
+        stats2 = backfill_snapshots(
+            conn, fecha_desde="2026-04-25", fecha_hasta="2026-05-02",
+            anchor_currency="ARS",
+        )
+        n_final = conn.execute('SELECT COUNT(*) FROM pn_snapshots').fetchone()[0]
+        assert n_final == n_after, "backfill no debe duplicar"
+        print(f"  ✓ {stats['processed']} días procesados, {stats['snapshots_written']} snapshots, idempotente")
+        conn.close()
+
+
 def test_c3_equity_curve_multiple_dates():
     """Snapshots en 3 fechas → equity curve con 3 puntos + métricas."""
     print("\n[C3] equity curve con 3 fechas:")
@@ -685,6 +715,7 @@ if __name__ == "__main__":
         test_c1_snapshot_record_and_query,
         test_c2_snapshot_idempotent,
         test_c2b_snapshot_uses_pn_net_of_liabilities,
+        test_c2c_backfill_snapshots,
         test_c3_equity_curve_multiple_dates,
         test_d1_aforos_loaded,
         test_d2_buying_power_byma_cocos,

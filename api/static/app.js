@@ -133,6 +133,11 @@
       const inv = investible ? "&investible=1" : "";
       return API.req(`/api/performance?anchor=${a}${inv}`);
     },
+    backfillSnapshots: (from_, to_) =>
+      API.req("/api/backfill-snapshots", {
+        method: "POST",
+        json: { from: from_ || null, to: to_ || null },
+      }),
     holdingsNearTarget: (anchor, bpsOverride) => {
       const a = anchor || API.anchor();
       const q = bpsOverride != null ? `&bps=${bpsOverride}` : "";
@@ -625,6 +630,21 @@
         navigate("/");
       } catch (e) {
         toast(e.message, "error");
+      }
+    },
+
+    async backfillSnapshots() {
+      if (!confirm("Reconstruir equity curve desde tu historia?\n\n" +
+                    "Calcula el PN día por día desde la primera fecha de eventos. " +
+                    "Puede tardar unos segundos. Idempotente (no duplica snapshots existentes).")) return;
+      const t = toast("Reconstruyendo... esto puede tardar", "info");
+      try {
+        const r = await API.backfillSnapshots();
+        toast(`✓ Backfill: ${r.processed} días procesados, ${r.snapshots_written} snapshots`, "success");
+        API._bustCache();
+        render();
+      } catch (e) {
+        toast("Error: " + e.message, "error");
       }
     },
 
@@ -2866,9 +2886,18 @@
             <b>⚠ Datos insuficientes</b>
             <div class="muted" style="font-size:12px; margin-top:4px;">
               Necesito ≥2 snapshots de PN para calcular returns.
-              Tenés ${perf.curve_points || 0}. Cada <code>refresh</code> graba un snapshot;
-              esperá unos días o forzá refrescos para tener historia.
+              Tenés ${perf.curve_points || 0}.
             </div>
+            <div style="font-size:13px; margin-top: 8px;">
+              💡 <b>Reconstruir desde tu historia</b>: si ya tenés
+              precios y trades cargados, podés backfillear los snapshots
+              día por día calculando el PN en cada fecha (usa los precios
+              guardados en <code>data/precios_*</code>).
+            </div>
+            <button class="btn primary full" style="margin-top:8px;"
+                    data-onclick="backfillSnapshots">
+              🔄 Reconstruir equity curve
+            </button>
           </div>
         ` : ""}
 

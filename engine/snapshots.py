@@ -98,6 +98,93 @@ def record_snapshots(conn, holdings, fecha, anchor_currency="USD"):
     return n
 
 
+def backfill_snapshots(conn, fecha_desde=None, fecha_hasta=None,
+                        anchor_currency="USD", limit_days=730):
+    """Reconstruye snapshots históricos del PN para cada día en el rango.
+
+    Útil cuando se perdió la historia (ej por DELETE FROM pn_snapshots) o
+    cuando se arranca con un master que ya tiene varios meses de trades:
+    en lugar de tener equity curve solo a partir de hoy, reconstruye toda
+    la historia desde la primera fecha de eventos.
+
+    Para cada día calcula holdings @ esa fecha (usando solo events <= fecha
+    y precios disponibles en o antes de esa fecha) y graba el snapshot.
+
+    Args:
+        conn: SQLite connection.
+        fecha_desde: ISO o date. Default: el event_date más temprano de events.
+        fecha_hasta: ISO o date. Default: hoy.
+        anchor_currency: moneda en la que se grafica la curva.
+        limit_days: máximo de días a backfillear (safety). Default 730 = 2 años.
+
+    Returns:
+        dict {processed: int, snapshots_written: int, from_date, to_date,
+              skipped_no_data: int}
+    """
+    from .holdings import calculate_holdings
+    from datetime import timedelta
+
+    today = date.today()
+    if fecha_hasta is None:
+        fecha_hasta = today
+    if isinstance(fecha_hasta, str):
+        fecha_hasta = date.fromisoformat(fecha_hasta)
+
+    if fecha_desde is None:
+        # Default: primer event_date de la table events
+        cur = conn.execute("SELECT MIN(event_date) FROM events")
+        row = cur.fetchone()
+        first = row[0] if row else None
+        if not first:
+            return {"processed": 0, "snapshots_written": 0,
+                    "from_date": None, "to_date": None,
+                    "skipped_no_data": 0,
+                    "error": "Sin events: nada que backfillear"}
+        fecha_desde = date.fromisoformat(first)
+    elif isinstance(fecha_desde, str):
+        fecha_desde = date.fromisoformat(fecha_desde)
+
+    # Safety: cap el rango
+    span_days = (fecha_hasta - fecha_desde).days
+    if span_days < 0:
+        return {"processed": 0, "snapshots_written": 0,
+                "from_date": fecha_desde.isoformat(),
+                "to_date": fecha_hasta.isoformat(),
+                "skipped_no_data": 0,
+                "error": "fecha_desde > fecha_hasta"}
+    if span_days > limit_days:
+        # Truncar al limit_days hacia atrás desde fecha_hasta
+        fecha_desde = fecha_hasta - timedelta(days=limit_days)
+
+    processed = 0
+    written = 0
+    skipped = 0
+    cur_date = fecha_desde
+    while cur_date <= fecha_hasta:
+        try:
+            holdings = calculate_holdings(conn, fecha=cur_date,
+                                           anchor_currency=anchor_currency)
+            if not holdings:
+                skipped += 1
+            else:
+                n = record_snapshots(conn, holdings, cur_date,
+                                       anchor_currency=anchor_currency)
+                written += n
+        except Exception as e:
+            print(f"[backfill] WARN {cur_date}: {e}")
+            skipped += 1
+        processed += 1
+        cur_date += timedelta(days=1)
+
+    return {
+        "processed": processed,
+        "snapshots_written": written,
+        "from_date": fecha_desde.isoformat(),
+        "to_date": fecha_hasta.isoformat(),
+        "skipped_no_data": skipped,
+    }
+
+
 def returns_by_period(conn, anchor_currency="USD", investible_only=False,
                        today=None):
     """Calcula returns simples del PN para varios períodos: 1d, 1w, 1m, 3m, ytd, 1y.
