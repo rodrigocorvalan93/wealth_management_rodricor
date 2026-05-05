@@ -247,3 +247,176 @@ hr { border: none; border-top: 1px solid var(--border); margin: 12px 0; }
 @media (display-mode: standalone) {
   /* App instalada — sin estilos extras por ahora */
 }
+
+/* === User name en topbar === */
+.topbar h1 .user-name {
+  font-size: 13px;
+  font-weight: 500;
+  opacity: 0.85;
+  margin-left: 4px;
+}
+
+/* === Performance chips (1d/1w/1m/...) en KPI primario === */
+.perf-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 10px;
+  margin-top: 10px;
+  padding-top: 10px;
+  border-top: 1px solid rgba(255,255,255,0.15);
+}
+.perf-chip {
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  display: inline-flex;
+  gap: 4px;
+  align-items: baseline;
+}
+.kpi.primary .perf-chip .muted {
+  color: rgba(255,255,255,0.55);
+}
+.kpi.primary .perf-chip .positive {
+  color: #6FE3A1;
+  font-weight: 600;
+}
+.kpi.primary .perf-chip .negative {
+  color: #FF8A8A;
+  font-weight: 600;
+}
+
+/* === KPI expandible (Activos / Pasivos drilldown) === */
+.kpi.expandable {
+  cursor: pointer;
+}
+.kpi.expandable summary {
+  list-style: none;
+  display: block;
+  cursor: pointer;
+  -webkit-tap-highlight-color: rgba(0,0,0,0.04);
+}
+.kpi.expandable summary::-webkit-details-marker { display: none; }
+.kpi.expandable[open] {
+  background: linear-gradient(180deg, var(--card) 0%, #FAFAFA 100%);
+  box-shadow: 0 1px 3px rgba(0,0,0,0.08);
+}
+.drilldown {
+  margin-top: 10px;
+  padding-top: 10px;
+  border-top: 1px solid var(--border);
+  font-size: 13px;
+  animation: slideDown 0.18s ease-out;
+}
+@keyframes slideDown {
+  from { opacity: 0; transform: translateY(-4px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+.drill-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 6px 0;
+  border-bottom: 1px solid var(--border);
+  gap: 8px;
+}
+.drill-row:last-of-type { border-bottom: none; }
+.drill-link {
+  display: block;
+  text-align: center;
+  margin-top: 6px;
+  padding: 6px 0;
+  font-size: 12px;
+  color: var(--navy-light);
+  text-decoration: none;
+  font-weight: 500;
+}
+.drill-link:hover { background: rgba(46, 91, 156, 0.05); border-radius: 4px; }
+
+/* === Bottom nav (tab bar) === */
+.bottom-nav {
+  position: fixed;
+  bottom: 0; left: 0; right: 0;
+  background: var(--card);
+  border-top: 1px solid var(--border);
+  padding-bottom: var(--safe-bottom);
+  display: flex;
+  z-index: 100;
+  box-shadow: 0 -2px 8px rgba(0,0,0,0.04);
+}
+.bnav-item {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  padding: 8px 4px 6px;
+  text-decoration: none;
+  color: var(--muted);
+  transition: color 0.15s, background 0.15s;
+  -webkit-tap-highlight-color: transparent;
+}
+.bnav-item.active {
+  color: var(--navy);
+}
+.bnav-item.active .bnav-icon {
+  transform: scale(1.1);
+}
+.bnav-icon {
+  font-size: 20px;
+  line-height: 1;
+  transition: transform 0.15s;
+}
+.bnav-label {
+  font-size: 10px;
+  margin-top: 3px;
+  font-weight: 500;
+  letter-spacing: 0.2px;
+}
+/* Reservar espacio cuando hay bottom nav */
+main.has-bottom-nav {
+  padding-bottom: calc(70px + var(--safe-bottom));
+}
+
+/* === FAB (floating action button) — para agregar items rápido === */
+.fab {
+  position: fixed;
+  right: 16px;
+  bottom: calc(80px + var(--safe-bottom));
+  width: 52px;
+  height: 52px;
+  border-radius: 50%;
+  background: var(--navy);
+  color: white;
+  font-size: 26px;
+  font-weight: 600;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  box-shadow: 0 4px 12px rgba(0,0,0,0.15);
+  text-decoration: none;
+  z-index: 90;
+  transition: transform 0.15s, box-shadow 0.15s;
+}
+.fab:active {
+  transform: scale(0.92);
+  box-shadow: 0 2px 6px rgba(0,0,0,0.2);
+}
+
+/* === Polish general === */
+.kpi {
+  transition: box-shadow 0.18s, transform 0.18s;
+}
+.kpi:not(.primary):active {
+  transform: scale(0.99);
+}
+.list-item {
+  transition: background 0.12s;
+}
+.list-item:active {
+  background: rgba(0,0,0,0.03);
+}
+.btn {
+  transition: opacity 0.15s, transform 0.1s;
+}
+.btn:active {
+  transform: scale(0.97);
+}

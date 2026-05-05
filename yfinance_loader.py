@@ -36,32 +36,25 @@ except ImportError:
 
 
 DEFAULT_OUTPUT = Path("data/precios_us.csv")
-# Tickers default: los que están en `especies` (con sufijo _ADR para distinguir de CEDEARs)
-DEFAULT_TICKERS = ["AMZN_ADR", "MSFT_ADR", "SPY_ADR", "MAGS_ADR", "NU_ADR", "AAPL_ADR"]
+# Convención: tickers US (mercado extranjero, vía Yahoo Finance) usan sufijo
+# _US para distinguirse del CEDEAR local (que usa _AR vía BYMA).
+DEFAULT_TICKERS = ["AMZN_US", "MSFT_US", "SPY_US", "MAGS_US", "NU_US", "AAPL_US"]
 
-# Mapping ticker (nuestro convenio en `especies`) → ticker yfinance
-# Para ADRs con sufijo, el ticker yfinance es el ticker base (sin _ADR)
-INTERNAL_TO_YFINANCE = {
-    # ADRs en IBKR (con sufijo _ADR en nuestro motor)
-    "AMZN_ADR": "AMZN",
-    "MSFT_ADR": "MSFT",
-    "SPY_ADR":  "SPY",
-    "MAGS_ADR": "MAGS",
-    "NU_ADR":   "NU",
-    "AAPL_ADR": "AAPL",
-    # ADRs latam (en NYSE)
-    "GGAL_ADR": "GGAL",
-    "BMA_ADR":  "BMA",
-    "YPF_ADR":  "YPF",
-    "VIST_ADR": "VIST",
-    # Sin sufijo (cuando quieras precios US directos para asset US sin sufijo)
-    "AMZN": "AMZN",
-    "MSFT": "MSFT",
-    "SPY":  "SPY",
-    "MAGS": "MAGS",
-    "NU":   "NU",
-    "AAPL": "AAPL",
-}
+
+def to_yahoo_symbol(internal_ticker: str) -> str:
+    """Convierte un ticker interno (con sufijo _US o _ADR legacy) al símbolo
+    Yahoo Finance. Strippea el sufijo de mercado para llamar a la API.
+
+    Ejemplos:
+        AAPL_US  → AAPL
+        AAPL_ADR → AAPL  (legacy, back-compat con masters viejos)
+        SPY      → SPY   (sin sufijo, pasa directo)
+    """
+    if internal_ticker.endswith("_US"):
+        return internal_ticker[:-3]
+    if internal_ticker.endswith("_ADR"):
+        return internal_ticker[:-4]
+    return internal_ticker
 
 
 CSV_HEADERS = ["fecha", "ticker", "price", "currency", "source"]
@@ -98,7 +91,7 @@ def get_current_prices(tickers):
     """Snapshot del día. Devuelve {ticker_internal: price}."""
     out = {}
     for t in tickers:
-        yf_ticker = INTERNAL_TO_YFINANCE.get(t.upper(), t.upper())
+        yf_ticker = to_yahoo_symbol(t.upper())
         try:
             tk = yf.Ticker(yf_ticker)
             # fast_info es más rápido que info, suficiente para precio
@@ -191,16 +184,33 @@ def main():
     p.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
     p.add_argument("--tickers", type=str, default=None,
                    help=f"Lista coma-separada (default: {','.join(DEFAULT_TICKERS)})")
+    p.add_argument("--tickers-file", type=Path, default=None,
+                   help="Path a un archivo con un ticker por línea. "
+                        "Solo se usan los que terminan en _US (los demás se "
+                        "ignoran). Útil para sync.py multi-tenant.")
     p.add_argument("--desde", type=str, default=None,
                    help="Histórico desde esta fecha (YYYY-MM-DD)")
     p.add_argument("--hasta", type=str, default=None, help="Hasta esta fecha")
     args = p.parse_args()
 
-    tickers = (
-        [t.strip() for t in args.tickers.split(",")] if args.tickers
-        else DEFAULT_TICKERS
-    )
-    tickers = [t.upper() for t in tickers]
+    if args.tickers_file:
+        if not args.tickers_file.is_file():
+            print(f"[yf] tickers-file no existe: {args.tickers_file}", file=sys.stderr)
+            sys.exit(1)
+        all_tickers = [
+            line.strip().upper()
+            for line in args.tickers_file.read_text(encoding="utf-8").splitlines()
+            if line.strip() and not line.strip().startswith("#")
+        ]
+        # Filtrar solo tickers de mercado US (sufijo _US o _ADR legacy)
+        tickers = [t for t in all_tickers if t.endswith("_US") or t.endswith("_ADR")]
+        if not tickers:
+            print(f"[yf] tickers-file no tiene tickers _US (de {len(all_tickers)} totales). Skip.")
+            return 0
+    elif args.tickers:
+        tickers = [t.strip().upper() for t in args.tickers.split(",")]
+    else:
+        tickers = [t.upper() for t in DEFAULT_TICKERS]
 
     print(f"[yf] tickers: {','.join(tickers)}")
     print(f"[yf] output: {args.output}")

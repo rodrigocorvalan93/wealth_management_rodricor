@@ -123,6 +123,16 @@
     reportHtml: (anchor) => API.req(`/api/report/html?anchor=${anchor || API.anchor()}`),
 
     // Target / settings
+    returns: (anchor, investible) => {
+      const a = anchor || API.anchor();
+      const inv = investible ? "&investible=1" : "";
+      return API.req(`/api/returns?anchor=${a}${inv}`);
+    },
+    performance: (anchor, investible) => {
+      const a = anchor || API.anchor();
+      const inv = investible ? "&investible=1" : "";
+      return API.req(`/api/performance?anchor=${a}${inv}`);
+    },
     holdingsNearTarget: (anchor, bpsOverride) => {
       const a = anchor || API.anchor();
       const q = bpsOverride != null ? `&bps=${bpsOverride}` : "";
@@ -664,14 +674,17 @@
   // /  Dashboard
   route("/", async () => {
     const view = API.view();  // 'all' | 'investible'
-    let s, fills, nearTarget, meta, cashData;
+    let s, fills, nearTarget, meta, cashData, holdingsData, retData, cfg;
     try {
-      [s, fills, nearTarget, meta, cashData] = await Promise.all([
+      [s, fills, nearTarget, meta, cashData, holdingsData, retData, cfg] = await Promise.all([
         API.summary(),
         API.realizedPnl(),
         API.holdingsNearTarget().catch(() => ({ alerts: [], n_alerts: 0, alert_distance_bps: 10 })),
         loadMeta().catch(() => ({ accountsRich: {} })),
         API.cash().catch(() => ({ items: [], by_currency: {}, total_anchor: 0 })),
+        API.holdings(API.anchor()).catch(() => ({ items: [] })),
+        API.returns(API.anchor(), view === "investible").catch(() => ({ returns: {} })),
+        API.config().catch(() => ({ auth_user_display_name: null })),
       ]);
     } catch (e) {
       // Si la DB está vacía o falla el summary, ofrecer setup wizard
@@ -710,14 +723,49 @@
     // Últimos PnL realizado
     const recentFills = (fills.fills || []).slice(0, 5);
 
+    // Performance chips (chico, al lado del PN)
+    const periods = retData?.returns || {};
+    const PERIOD_LABELS = [
+      ["1d", "1d"], ["1w", "1s"], ["1m", "1m"],
+      ["3m", "3m"], ["ytd", "YTD"], ["1y", "1a"],
+    ];
+    const perfChipsHtml = `
+      <div class="perf-chips">
+        ${PERIOD_LABELS.map(([key, label]) => {
+          const r = periods[key];
+          const pct = r?.return_pct;
+          if (pct == null) {
+            return `<span class="perf-chip"><span class="muted">${label}</span> <span class="muted">·</span></span>`;
+          }
+          const cls = pct > 0 ? "positive" : pct < 0 ? "negative" : "muted";
+          const sign = pct > 0 ? "+" : "";
+          return `<span class="perf-chip"><span class="muted">${label}</span> <span class="${cls}">${sign}${(pct * 100).toFixed(2)}%</span></span>`;
+        }).join("")}
+      </div>
+    `;
+
+    // Drilldowns: Activos por asset class + cuentas con saldo positivo, Pasivos por kind
+    const assetsItems = (holdingsData.items || [])
+      .filter(h => !h.is_liability && (h.mv_anchor || 0) > 0);
+    const assetsByClass = {};
+    for (const h of assetsItems) {
+      const k = h.asset_class || "?";
+      assetsByClass[k] = (assetsByClass[k] || 0) + (h.mv_anchor || 0);
+    }
+    const liabItems = (holdingsData.items || [])
+      .filter(h => h.is_liability && Math.abs(h.mv_anchor || 0) > 0);
+
+    // Display name del user (auth_user_display_name viene de /api/config)
+    const userName = cfg?.auth_user_display_name || "";
+
     return `
       <div class="topbar">
-        <h1>📊 Portfolio</h1>
+        <h1>📊 Portfolio${userName ? ` · <span class="user-name">${escapeHtml(userName)}</span>` : ""}</h1>
         <div class="actions">
           <button data-onclick="refreshAll" title="Refrescar">⟳</button>
         </div>
       </div>
-      <main>
+      <main class="has-bottom-nav">
         <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px;">
           <div class="toggle-pill">
             <button data-onclick="setView" data-arg="all" class="${view === "all" ? "active" : ""}">📦 Todo</button>
@@ -735,20 +783,48 @@
             <div class="kpi-label">Patrimonio Neto ${view === "investible" ? "(invertible)" : "(total)"}</div>
             <div class="kpi-value">${fmt.money(totalNet)}</div>
             <div class="kpi-currency">${API.anchor()}</div>
+            ${perfChipsHtml}
           </div>
         </div>
 
         <div class="kpi-grid">
-          <div class="kpi">
-            <div class="kpi-label">📈 Activos</div>
-            <div class="kpi-value positive">${fmt.money(s.total_assets || 0)}</div>
-            <div class="kpi-currency">${API.anchor()}</div>
-          </div>
-          <div class="kpi">
-            <div class="kpi-label">📉 Pasivos</div>
-            <div class="kpi-value negative">${fmt.money(s.total_liabilities || 0)}</div>
-            <div class="kpi-currency">cauciones, tarjetas...</div>
-          </div>
+          <details class="kpi expandable">
+            <summary>
+              <div class="kpi-label">📈 Activos <span class="muted" style="font-size: 11px; font-weight: normal;">▾</span></div>
+              <div class="kpi-value positive">${fmt.money(s.total_assets || 0)}</div>
+              <div class="kpi-currency">${escapeHtml(API.anchor())}</div>
+            </summary>
+            <div class="drilldown">
+              ${Object.entries(assetsByClass).sort((a,b) => b[1]-a[1]).map(([k, v]) => {
+                const pct = (v / (s.total_assets || 1)) * 100;
+                return `<div class="drill-row">
+                  <span>${escapeHtml(k)}</span>
+                  <span class="tabular">${fmt.money(v)} <span class="muted" style="font-size: 10px;">${pct.toFixed(0)}%</span></span>
+                </div>`;
+              }).join("")}
+              <a href="#/holdings" class="drill-link">Ver todos los holdings →</a>
+            </div>
+          </details>
+          <details class="kpi expandable">
+            <summary>
+              <div class="kpi-label">📉 Pasivos <span class="muted" style="font-size: 11px; font-weight: normal;">${liabItems.length > 0 ? "▾" : ""}</span></div>
+              <div class="kpi-value negative">${fmt.money(s.total_liabilities || 0)}</div>
+              <div class="kpi-currency">cauciones, tarjetas...</div>
+            </summary>
+            <div class="drilldown">
+              ${liabItems.length === 0 ? '<div class="muted" style="text-align: center; padding: 8px;">Sin deudas</div>' :
+                liabItems.sort((a,b) => Math.abs(b.mv_anchor||0) - Math.abs(a.mv_anchor||0)).map(h => `
+                  <div class="drill-row">
+                    <div style="display:flex; flex-direction: column;">
+                      <span>${accountLabel(h.account, meta?.accountsRich)}</span>
+                    </div>
+                    <span class="tabular negative">${fmt.money(Math.abs(h.mv_anchor||0))}</span>
+                  </div>
+                `).join("")
+              }
+              <a href="#/pasivos" class="drill-link">Detalle de pasivos →</a>
+            </div>
+          </details>
         </div>
         ${s.patrimonio_no_invertible && Math.abs(s.patrimonio_no_invertible) > 0.01 ? `
           <div class="card compact muted" style="margin-bottom: 16px; font-size: 12px;">
@@ -882,8 +958,10 @@
             <a href="#/journal" class="btn ghost full">📔 Journal</a>
             <a href="#/transferencias" class="btn ghost full">🔄 Transferencias</a>
           </div>
+          <a href="#/performance" class="btn ghost full" style="margin-top: 8px;">📊 Performance (TWR / MWR)</a>
         </section>
       </main>
+      ${bottomNav("/")}
     `;
   });
 
@@ -916,6 +994,7 @@
           `).join("")}</div>`
         }
       </main>
+      ${bottomNav("/trades")}
     `;
   });
 
@@ -1036,6 +1115,83 @@
   }
 
   // /gastos
+  // ====================================================================
+  // /flows — vista combinada de gastos + ingresos con toggle
+  // ====================================================================
+  route("/flows", async () => {
+    const tab = sessionStorage.getItem("flows_tab") || "gastos";  // 'gastos' | 'ingresos'
+    const [gastos, ingresos] = await Promise.all([
+      API.listSheet("gastos").catch(() => ({ items: [] })),
+      API.listSheet("ingresos").catch(() => ({ items: [] })),
+    ]);
+    const gastosItems = (gastos.items || []).filter(r => r.Concepto || r.Monto).reverse();
+    const ingresosItems = (ingresos.items || []).filter(r => r.Concepto || r.Monto).reverse();
+
+    const gastosTotal = gastosItems.reduce((s, r) => s + (parseFloat(r.Monto) || 0), 0);
+    const ingresosTotal = ingresosItems.reduce((s, r) => s + (parseFloat(r.Monto) || 0), 0);
+
+    const items = tab === "ingresos" ? ingresosItems : gastosItems;
+    const newRoute = tab === "ingresos" ? "/ingresos/new" : "/gastos/new";
+    const editPath = tab === "ingresos" ? "/ingresos" : "/gastos";
+
+    return `
+      <div class="topbar">
+        <button onclick="window.history.length>1 ? window.history.back() : window.location.hash='/'">‹ Atrás</button>
+        <h1>💸 Flujos</h1>
+        <div></div>
+      </div>
+      <main class="has-bottom-nav">
+        <div class="toggle-pill" style="margin-bottom: 14px; width: 100%;">
+          <button onclick="window._setFlowsTab('gastos')" class="${tab === 'gastos' ? 'active' : ''}" style="flex:1;">
+            💸 Gastos <span class="muted" style="font-size: 11px;">(${gastosItems.length})</span>
+          </button>
+          <button onclick="window._setFlowsTab('ingresos')" class="${tab === 'ingresos' ? 'active' : ''}" style="flex:1;">
+            💰 Ingresos <span class="muted" style="font-size: 11px;">(${ingresosItems.length})</span>
+          </button>
+        </div>
+
+        <div class="kpi-grid">
+          <div class="kpi">
+            <div class="kpi-label">${tab === 'ingresos' ? 'Total ingresos' : 'Total gastos'}</div>
+            <div class="kpi-value ${tab === 'ingresos' ? 'positive' : 'negative'}">
+              ${tab === 'ingresos' ? '+ ' : '- '}${fmt.money(tab === 'ingresos' ? ingresosTotal : gastosTotal)}
+            </div>
+            <div class="kpi-currency muted">${items.length > 0 ? 'todas las monedas, sin convertir' : ''}</div>
+          </div>
+        </div>
+
+        ${items.length === 0 ?
+          emptyState(`Sin ${tab}`, `Tocá + para agregar`) :
+          `<div class="list">${items.map(r => `
+            <a class="list-item" href="#${editPath}/${encodeURIComponent(r.row_id || '')}/edit">
+              <div class="meta">
+                <div class="meta-line1">${escapeHtml(r.Concepto || '(sin concepto)')}</div>
+                <div class="meta-line2">
+                  ${escapeHtml(fmt.date(r.Fecha))} · ${escapeHtml(r.Categoría || r.Categoria || '—')}
+                  ${r.Tipo ? ' · ' + escapeHtml(r.Tipo) : ''}
+                </div>
+              </div>
+              <div class="right">
+                <div class="amount ${tab === 'ingresos' ? 'positive' : 'negative'}">
+                  ${tab === 'ingresos' ? '+ ' : '- '}${fmt.money(r.Monto)}
+                </div>
+                <div class="sub">${escapeHtml(r.Moneda || '')} · ${escapeHtml(r['Cuenta Destino'] || '')}</div>
+              </div>
+            </a>
+          `).join('')}</div>`
+        }
+
+        <a href="#${newRoute}" class="fab" title="Nuevo ${tab === 'ingresos' ? 'ingreso' : 'gasto'}">+</a>
+      </main>
+      ${bottomNav('/flows')}
+    `;
+  });
+
+  window._setFlowsTab = function (tab) {
+    sessionStorage.setItem("flows_tab", tab);
+    render();
+  };
+
   route("/gastos", async () => {
     const data = await API.listSheet("gastos");
     const items = (data.items || []).filter(r => r.Concepto || r.Monto).reverse();
@@ -2062,6 +2218,7 @@
           fresca). Subí precios con <code>python sync.py --skip-loaders</code>.
         </div>
       </main>
+      ${bottomNav("/")}
     `;
   });
 
@@ -2382,6 +2539,7 @@
           }
         </section>
       </main>
+      ${bottomNav("/cash")}
     `;
   });
 
@@ -2671,6 +2829,143 @@
   // ====================================================================
   // /help — manualcitos
   // ====================================================================
+  // ====================================================================
+  // /performance — TWR + MWR + métricas completas
+  // ====================================================================
+  route("/performance", async () => {
+    const view = sessionStorage.getItem("perf_view") || "all";  // 'all' | 'investible'
+    const investible = view === "investible";
+    let perf;
+    try {
+      perf = await API.performance(API.anchor(), investible);
+    } catch (e) {
+      return `${headerWithBack("📊 Performance", "/settings")}
+        <main><div class="card danger">${escapeHtml(e.message)}</div></main>
+        ${bottomNav("/settings")}`;
+    }
+    const twr = perf.twr || {};
+    const mwr = perf.mwr || {};
+
+    const fmtPct = (p) => {
+      if (p == null) return '<span class="muted">·</span>';
+      const cls = p > 0 ? "positive" : p < 0 ? "negative" : "muted";
+      const sign = p > 0 ? "+" : "";
+      return `<span class="${cls}">${sign}${(p * 100).toFixed(2)}%</span>`;
+    };
+
+    return `
+      ${headerWithBack("📊 Performance", "/settings")}
+      <main class="has-bottom-nav">
+        <div class="toggle-pill" style="margin-bottom: 14px; width: 100%;">
+          <button onclick="sessionStorage.setItem('perf_view','all'); render();" class="${view === 'all' ? 'active' : ''}" style="flex:1;">📦 Todo</button>
+          <button onclick="sessionStorage.setItem('perf_view','investible'); render();" class="${view === 'investible' ? 'active' : ''}" style="flex:1;">💎 Invertible</button>
+        </div>
+
+        ${perf.curve_points < 2 ? `
+          <div class="card warn" style="background:#FFF8E1; border-left:4px solid var(--yellow);">
+            <b>⚠ Datos insuficientes</b>
+            <div class="muted" style="font-size:12px; margin-top:4px;">
+              Necesito ≥2 snapshots de PN para calcular returns.
+              Tenés ${perf.curve_points || 0}. Cada <code>refresh</code> graba un snapshot;
+              esperá unos días o forzá refrescos para tener historia.
+            </div>
+          </div>
+        ` : ""}
+
+        <section>
+          <h2>Time Weighted Return (TWR)</h2>
+          <div class="card compact muted" style="font-size:12px; margin-bottom: 8px;">
+            Aísla flujos: muestra cuánto rinde lo que tenés invertido,
+            independiente de cuándo metiste/sacaste plata.
+            <b>Es la métrica estándar de la industria</b> para comparar
+            portfolios o estrategias.
+          </div>
+          <div class="kpi-grid">
+            <div class="kpi">
+              <div class="kpi-label">Return total</div>
+              <div class="kpi-value tabular">${fmtPct(twr.twr_pct)}</div>
+              <div class="kpi-currency muted">${perf.from_date || "?"} → ${perf.to_date || "?"}</div>
+            </div>
+            <div class="kpi">
+              <div class="kpi-label">Anualizado</div>
+              <div class="kpi-value tabular">${fmtPct(twr.twr_annual)}</div>
+              <div class="kpi-currency muted">${twr.n_periods || 0} sub-periodos</div>
+            </div>
+          </div>
+        </section>
+
+        <section>
+          <h2>Money Weighted Return (MWR)</h2>
+          <div class="card compact muted" style="font-size:12px; margin-bottom: 8px;">
+            Ponderado por timing — refleja el éxito <b>real</b> tuyo.
+            Si metiste plata justo antes de un rally, el MWR sube; si metiste
+            antes de una caída, baja. Calculado como <i>Modified Dietz</i>
+            (proxy ≈ IRR).
+          </div>
+          <div class="kpi-grid">
+            <div class="kpi">
+              <div class="kpi-label">Return total</div>
+              <div class="kpi-value tabular">${fmtPct(mwr.mwr_pct)}</div>
+              <div class="kpi-currency muted">flujos = ${fmt.money(mwr.total_flow || 0, 0)} ${escapeHtml(perf.anchor_currency)}</div>
+            </div>
+            <div class="kpi">
+              <div class="kpi-label">Anualizado</div>
+              <div class="kpi-value tabular">${fmtPct(mwr.mwr_annual)}</div>
+              <div class="kpi-currency muted">${mwr.n_flows || 0} flujos</div>
+            </div>
+          </div>
+        </section>
+
+        <section>
+          <h2>Resumen del período</h2>
+          <div class="card">
+            <div style="display:flex; justify-content:space-between; padding:6px 0; border-bottom:1px solid var(--border);">
+              <span class="muted">PN inicial</span>
+              <span class="tabular">${fmt.money(perf.v_begin || 0)} ${escapeHtml(perf.anchor_currency)}</span>
+            </div>
+            <div style="display:flex; justify-content:space-between; padding:6px 0; border-bottom:1px solid var(--border);">
+              <span class="muted">PN final</span>
+              <span class="tabular">${fmt.money(perf.v_end || 0)} ${escapeHtml(perf.anchor_currency)}</span>
+            </div>
+            <div style="display:flex; justify-content:space-between; padding:6px 0; border-bottom:1px solid var(--border);">
+              <span class="muted">Cambio bruto</span>
+              <span class="tabular ${(perf.total_change_abs||0)>=0?'positive':'negative'}">${fmt.money(perf.total_change_abs || 0)} ${escapeHtml(perf.anchor_currency)}</span>
+            </div>
+            <div style="display:flex; justify-content:space-between; padding:6px 0;">
+              <span class="muted">Flujos netos (aportes - retiros)</span>
+              <span class="tabular">${fmt.money(perf.total_flows || 0)} ${escapeHtml(perf.anchor_currency)}</span>
+            </div>
+          </div>
+        </section>
+
+        ${(perf.flows || []).length > 0 ? `
+          <section>
+            <h2>Flujos detectados (${perf.flows.length})</h2>
+            <div class="card compact muted" style="font-size:12px; margin-bottom: 8px;">
+              Sueldos, gastos, opening_balance. Positivo = entró capital.
+            </div>
+            <div class="list" style="max-height: 240px; overflow-y: auto;">
+              ${perf.flows.slice(-30).reverse().map(f => `
+                <div class="list-item">
+                  <div class="meta">
+                    <div class="meta-line1">${escapeHtml(fmt.date(f.fecha))}</div>
+                  </div>
+                  <div class="right">
+                    <div class="amount tabular ${f.amount_anchor >= 0 ? 'positive' : 'negative'}">
+                      ${f.amount_anchor >= 0 ? '+' : ''}${fmt.money(f.amount_anchor)}
+                    </div>
+                    <div class="sub muted">${escapeHtml(perf.anchor_currency)}</div>
+                  </div>
+                </div>
+              `).join("")}
+            </div>
+          </section>
+        ` : ""}
+      </main>
+      ${bottomNav("/settings")}
+    `;
+  });
+
   route("/help", async () => {
     return `
       ${headerWithBack("❓ Ayuda", "/settings")}
@@ -2949,6 +3244,7 @@ python yfinance_loader.py</pre>
           </div>
         </section>
       </main>
+      ${bottomNav("/settings")}
     `;
   });
 
@@ -3225,6 +3521,29 @@ python yfinance_loader.py</pre>
   }
   function emptyState(title, msg) {
     return `<div class="empty"><div class="icon">📭</div><div><b>${escapeHtml(title)}</b></div><div class="muted" style="margin-top:4px">${escapeHtml(msg)}</div></div>`;
+  }
+
+  // Bottom nav: tab bar fija con accesos rápidos. Marcamos como activa la
+  // ruta que matchea el hash actual.
+  function bottomNav(activePath) {
+    const items = [
+      { href: "/",         label: "Home",   icon: "🏠" },
+      { href: "/trades",   label: "Trades", icon: "📈" },
+      { href: "/cash",     label: "Cash",   icon: "💵" },
+      { href: "/flows",    label: "Flujos", icon: "💸" },
+      { href: "/settings", label: "Setup",  icon: "⚙️" },
+    ];
+    return `
+      <nav class="bottom-nav">
+        ${items.map(it => {
+          const active = (activePath || "/") === it.href ? " active" : "";
+          return `<a href="#${it.href}" class="bnav-item${active}">
+            <span class="bnav-icon">${it.icon}</span>
+            <span class="bnav-label">${it.label}</span>
+          </a>`;
+        }).join("")}
+      </nav>
+    `;
   }
 
   // -------- Bootstrap --------

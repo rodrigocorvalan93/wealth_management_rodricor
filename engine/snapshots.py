@@ -34,6 +34,11 @@ TOTAL_INV_KEY = "__TOTAL_INVESTIBLE__"
 def record_snapshots(conn, holdings, fecha, anchor_currency="USD"):
     """Registra snapshots por cuenta + total + total invertible.
 
+    IMPORTANTE: usa `mv_pn_anchor` (signed: pasivos negativos), NO `mv_anchor`,
+    para que los totales reflejen el PATRIMONIO NETO (assets - liabilities).
+    Si usáramos mv_anchor crudo, los pasivos sumarían en vez de restar y
+    la equity curve quedaría inflada por el monto de las deudas.
+
     Si ya existen para (fecha, account, ancla), se sobreescriben.
     Devuelve cantidad de snapshots escritos.
     """
@@ -41,17 +46,21 @@ def record_snapshots(conn, holdings, fecha, anchor_currency="USD"):
 
     fecha_iso = fecha.isoformat() if isinstance(fecha, date) else str(fecha)
 
-    # Agregar mv_anchor por cuenta (incluye y excluye no-invertibles)
+    # Agregar mv_pn_anchor (signed) por cuenta (incluye y excluye no-invertibles)
     by_acc_all = defaultdict(float)
     by_acc_inv = defaultdict(float)
     total_all = 0.0
     total_inv = 0.0
 
     for h in holdings:
-        if not h.get("mv_anchor_ok") or h["mv_anchor"] is None:
+        if not h.get("mv_anchor_ok") or h.get("mv_anchor") is None:
             continue
         acc = h["account"]
-        mv = h["mv_anchor"]
+        # Usar mv_pn_anchor (signed: pasivos negativos). Fallback a mv_anchor
+        # si el holding no tiene la versión signada (compat con tests viejos).
+        mv = h.get("mv_pn_anchor")
+        if mv is None:
+            mv = h["mv_anchor"]
         by_acc_all[acc] += mv
         total_all += mv
         if h.get("investible", True):
@@ -87,6 +96,89 @@ def record_snapshots(conn, holdings, fecha, anchor_currency="USD"):
 
     conn.commit()
     return n
+
+
+def returns_by_period(conn, anchor_currency="USD", investible_only=False,
+                       today=None):
+    """Calcula returns simples del PN para varios períodos: 1d, 1w, 1m, 3m, ytd, 1y.
+
+    Para cada período, busca el snapshot más cercano a `today - período`
+    (con tolerancia de hasta 5 días hacia atrás) y devuelve:
+        return_pct = (mv_now / mv_then) - 1
+        return_abs = mv_now - mv_then
+        from_date  = fecha del snapshot inicial
+        n_days     = días entre los dos snapshots
+
+    Si no hay snapshot suficientemente viejo para un período, ese período
+    queda con return_pct=None.
+
+    NOTA: este es un return SIMPLE de equity (no separa flujos de capital
+    de retorno de inversión). Para TWR/MWR ver calculate_returns y futuro
+    /api/performance.
+    """
+    from datetime import date as _date, timedelta
+    today = today or _date.today()
+    today_iso = today.isoformat()
+
+    # Helper: encuentra el snapshot más cercano (hacia abajo) a target_date,
+    # con tolerancia hacia atrás de tolerance_days (porque puede no haber
+    # snapshot exacto del fin de semana o feriado).
+    account = TOTAL_INV_KEY if investible_only else TOTAL_KEY
+
+    def _snapshot_at(target_date, tolerance_days=5):
+        target_iso = target_date.isoformat()
+        floor_iso = (target_date - timedelta(days=tolerance_days)).isoformat()
+        cur = conn.execute(
+            """SELECT fecha, mv_anchor FROM pn_snapshots
+               WHERE anchor_currency = ? AND account = ?
+                 AND investible_only = ?
+                 AND fecha <= ? AND fecha >= ?
+               ORDER BY fecha DESC LIMIT 1""",
+            (anchor_currency, account, 1 if investible_only else 0,
+             target_iso, floor_iso),
+        )
+        row = cur.fetchone()
+        return (row["fecha"], row["mv_anchor"]) if row else (None, None)
+
+    # MV de hoy: snapshot más reciente <= today
+    now_fecha, mv_now = _snapshot_at(today, tolerance_days=30)
+    if mv_now is None:
+        # Sin snapshots: devolver todo None
+        return {p: {"from_date": None, "to_date": None,
+                    "return_abs": None, "return_pct": None,
+                    "n_days": None}
+                for p in ("1d", "1w", "1m", "3m", "ytd", "1y")}
+
+    PERIODS = [
+        ("1d", today - timedelta(days=1)),
+        ("1w", today - timedelta(days=7)),
+        ("1m", today - timedelta(days=30)),
+        ("3m", today - timedelta(days=90)),
+        ("ytd", _date(today.year, 1, 1) - timedelta(days=1)),  # baseline = último día del año anterior
+        ("1y", today - timedelta(days=365)),
+    ]
+    out = {}
+    for label, target_date in PERIODS:
+        from_fecha, mv_then = _snapshot_at(target_date, tolerance_days=15)
+        if mv_then is None or mv_then == 0:
+            out[label] = {"from_date": None, "to_date": now_fecha,
+                          "return_abs": None, "return_pct": None,
+                          "n_days": None}
+            continue
+        return_abs = mv_now - mv_then
+        return_pct = (mv_now / mv_then) - 1.0
+        # Días entre snapshots
+        try:
+            n_days = (_date.fromisoformat(now_fecha) -
+                       _date.fromisoformat(from_fecha)).days
+        except Exception:
+            n_days = None
+        out[label] = {
+            "from_date": from_fecha, "to_date": now_fecha,
+            "return_abs": return_abs, "return_pct": return_pct,
+            "n_days": n_days,
+        }
+    return out
 
 
 def get_equity_curve(conn, anchor_currency="USD",

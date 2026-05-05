@@ -235,16 +235,35 @@ def main():
     p.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
     p.add_argument("--tickers", type=str, default=None,
                    help=f"Lista coma-separada (default: {','.join(DEFAULT_TICKERS)})")
+    p.add_argument("--tickers-file", type=Path, default=None,
+                   help="Path a un archivo con un ticker por línea. Solo se "
+                        "usan los que están en el mapping cripto (BTC, ETH, "
+                        "SOL, USDT, USDC, BNB, etc); el resto se ignora. "
+                        "Útil para que sync.py pase tickers_union.txt.")
     p.add_argument("--desde", type=str, default=None,
                    help="Bajada histórica desde esta fecha (YYYY-MM-DD)")
     p.add_argument("--hasta", type=str, default=None, help="Hasta esta fecha")
     args = p.parse_args()
 
-    tickers = (
-        args.tickers.split(",") if args.tickers
-        else DEFAULT_TICKERS
-    )
-    tickers = [t.strip().upper() for t in tickers]
+    if args.tickers_file:
+        if not args.tickers_file.is_file():
+            print(f"[cripto] tickers-file no existe: {args.tickers_file}", file=sys.stderr)
+            sys.exit(1)
+        all_tickers = [
+            line.strip().upper()
+            for line in args.tickers_file.read_text(encoding="utf-8").splitlines()
+            if line.strip() and not line.strip().startswith("#")
+        ]
+        # Filtrar solo los que el loader sabe mapear (CoinGecko)
+        tickers = [t for t in all_tickers if t in TICKER_TO_COINGECKO]
+        if not tickers:
+            print(f"[cripto] tickers-file no tiene tickers conocidos "
+                  f"(de {len(all_tickers)} totales). Skip.")
+            return 0
+    elif args.tickers:
+        tickers = [t.strip().upper() for t in args.tickers.split(",")]
+    else:
+        tickers = [t.strip().upper() for t in DEFAULT_TICKERS]
 
     print(f"[cripto] tickers: {','.join(tickers)}")
     print(f"[cripto] output: {args.output}")

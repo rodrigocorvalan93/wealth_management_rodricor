@@ -1,17 +1,27 @@
-name: Daily PN snapshot
+name: Daily PN snapshot (safety net)
 
-# Trigger un /api/refresh cada día a las 23:00 UTC = 20:00 AR.
-# El refresh genera un snapshot del PN en pn_snapshots → equity curve continua.
+# Trigger /api/refresh diario a las 23:30 UTC = 20:30 AR.
+# Sirve como SAFETY NET: aunque sync-prices corra varias veces al día y ya
+# grabe snapshots, este job garantiza que haya AL MENOS un snapshot diario
+# aunque GitHub Actions falle todo el día.
+# Hoy /api/refresh ya graba snapshot automático, entonces este job es liviano:
+# solo dispara el refresh.
 
 on:
   schedule:
-    - cron: "0 23 * * *"
+    - cron: "30 23 * * *"
   workflow_dispatch:
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
   snapshot:
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    concurrency:
+      group: daily-snapshot
+      cancel-in-progress: false
 
     steps:
       - name: Trigger refresh on PythonAnywhere
@@ -23,14 +33,9 @@ jobs:
             echo "::error::Missing WM_API_TOKEN or WM_API_URL secrets"
             exit 1
           fi
-          # Pegar refresh
           echo "Calling refresh on $WM_API_URL/api/refresh ..."
           curl -fsS -X POST \
                -H "Authorization: Bearer $WM_API_TOKEN" \
                "$WM_API_URL/api/refresh" | tee refresh.json
           echo ""
-          # Pegar /api/report/html para forzar generación del snapshot
-          curl -fsS -H "Authorization: Bearer $WM_API_TOKEN" \
-               "$WM_API_URL/api/report/html?anchor=USD" \
-               -o /dev/null
           echo "Snapshot triggered OK"

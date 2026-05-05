@@ -88,6 +88,17 @@ def create_app() -> Flask:
                 template_folder="templates",
                 static_url_path="/static")
 
+    # Limite de tamaño de upload (50 MB). Flask aborta con 413 si se excede.
+    # Aplica a todos los endpoints. Excel masters reales pesan <500 KB y
+    # CSVs típicos <100 KB, así que 50 MB es generoso.
+    app.config["MAX_CONTENT_LENGTH"] = 50 * 1024 * 1024
+
+    @app.errorhandler(413)
+    def upload_too_large(_e):
+        from flask import jsonify
+        return jsonify({"error": True, "code": 413,
+                         "message": "Archivo demasiado grande (máx 50 MB)"}), 413
+
     # --- PWA: shell HTML ---
     @app.route("/")
     def root():
@@ -632,9 +643,67 @@ def create_app() -> Flask:
     @app.post("/api/refresh")
     def refresh():
         _require_auth(); _block_if_switched_mutation()
+        # Lock cubre TODO el flujo: re-import + record_snapshots. Sin esto,
+        # otra request podría leer la DB durante init_db(drop_existing=True)
+        # del reimport y obtener data parcial / corrupta.
         with excel_write_lock():
             stats = reimport_excel()
+            # Grabar snapshot del PN del día. Necesario para que la equity
+            # curve evolucione (antes solo ocurría al bajar un reporte).
+            try:
+                anchor = get_settings().anchor
+                today = date.today()
+                holdings, conn = _holdings(today, anchor)
+                try:
+                    n = record_snapshots(conn, holdings, today, anchor_currency=anchor)
+                    conn.commit()
+                finally:
+                    conn.close()
+                stats["snapshots"] = n
+            except Exception as e:
+                print(f"[refresh] WARN no pude grabar snapshot: {e}")
         return jsonify({"refreshed": True, "import_stats": stats})
+
+    @app.get("/api/performance")
+    def performance_endpoint():
+        """Métricas full de performance: TWR + MWR + flows + curve.
+
+        Query: ?anchor=USD&investible=1
+        """
+        _require_auth(); _block_if_switched_mutation()
+        from engine.performance import performance_summary
+        anchor = _parse_query_anchor()
+        investible = request.args.get("investible") == "1"
+        conn = db_conn()
+        try:
+            data = performance_summary(conn, anchor_currency=anchor,
+                                         investible_only=investible)
+            return jsonify(data)
+        finally:
+            conn.close()
+
+    @app.get("/api/returns")
+    def returns_endpoint():
+        """Returns simples del PN para 1d/1w/1m/3m/ytd/1y.
+
+        Query: ?anchor=USD&investible=1
+        """
+        _require_auth(); _block_if_switched_mutation()
+        from engine.snapshots import returns_by_period
+        anchor = _parse_query_anchor()
+        investible = request.args.get("investible") == "1"
+        conn = db_conn()
+        try:
+            data = returns_by_period(conn, anchor_currency=anchor,
+                                       investible_only=investible)
+            return jsonify({
+                "anchor": anchor,
+                "investible_only": investible,
+                "as_of": date.today().isoformat(),
+                "returns": data,
+            })
+        finally:
+            conn.close()
 
     @app.get("/api/backups")
     def backups():

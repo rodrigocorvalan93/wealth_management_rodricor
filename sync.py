@@ -43,6 +43,12 @@ except ImportError:
 
 HERE = Path(__file__).resolve().parent
 
+# Python interpreter para subprocesos. Usamos sys.executable para que en
+# Windows + venv los loaders se corran con el MISMO Python (con sus
+# packages instalados), no con el `python` del PATH del sistema que
+# probablemente NO tenga los packages.
+PYTHON_BIN = sys.executable
+
 PRICE_CSVS = [
     HERE / "data" / "fx_historico.csv",
     HERE / "data" / "precios_historico.csv",
@@ -96,7 +102,7 @@ def regenerate_tickers_union():
     """Corre tickers_union.py para generar data/tickers_union.txt."""
     step("Generating data/tickers_union.txt (union de tickers de todos los users)")
     try:
-        r = subprocess.run(["python", "tickers_union.py"],
+        r = subprocess.run([PYTHON_BIN, "tickers_union.py"],
                            cwd=HERE, capture_output=True, text=True,
                            encoding="utf-8", errors="replace",
                            env=_subprocess_env(), timeout=30)
@@ -111,22 +117,29 @@ def regenerate_tickers_union():
 
 
 def get_loaders():
-    """Devuelve los comandos de loaders, usando tickers_union.txt si existe."""
+    """Devuelve los comandos de loaders, usando tickers_union.txt si existe.
+
+    Cada loader filtra internamente los tickers que le interesan por sufijo:
+      - byma:     tickers sin sufijo, _AR, .BA → CEDEARs / equities AR / bonos
+      - yfinance: tickers _US / _ADR → mercado US (Yahoo)
+      - cripto / cafci: tienen sus propias listas / detección por nombre
+    """
     union_file = HERE / "data" / "tickers_union.txt"
     legacy_tickers_file = HERE / "mis_tickers.txt"
-    # Priorizar tickers_union.txt; back-compat con mis_tickers.txt
     if union_file.is_file():
-        byma_tickers = ["--tickers-file", str(union_file)]
+        tickers_arg = ["--tickers-file", str(union_file)]
     elif legacy_tickers_file.is_file():
-        byma_tickers = ["--tickers-file", str(legacy_tickers_file)]
+        tickers_arg = ["--tickers-file", str(legacy_tickers_file)]
     else:
-        byma_tickers = []
+        tickers_arg = []
+    # cafci NO recibe tickers_arg porque necesita un mapping ticker→CAFCI_name
+    # que no se puede inferir solo del ticker. Sigue usando fcis_cafci.txt manual.
     return [
-        ("fx",       ["python", "fx_loader.py"]),
-        ("byma",     ["python", "byma_loader.py", *byma_tickers]),
-        ("cafci",    ["python", "cafci_loader.py"]),
-        ("cripto",   ["python", "cripto_loader.py"]),
-        ("yfinance", ["python", "yfinance_loader.py"]),
+        ("fx",       [PYTHON_BIN, "fx_loader.py"]),
+        ("byma",     [PYTHON_BIN, "byma_loader.py", *tickers_arg]),
+        ("cafci",    [PYTHON_BIN, "cafci_loader.py"]),
+        ("cripto",   [PYTHON_BIN, "cripto_loader.py", *tickers_arg]),
+        ("yfinance", [PYTHON_BIN, "yfinance_loader.py", *tickers_arg]),
     ]
 
 
@@ -191,8 +204,16 @@ def run_loaders():
                 results[name] = "ok"
             else:
                 print(f"   ✗ {name} FALLÓ (exit {r.returncode}, {dt:.1f}s)")
+                # Mostrar stderr Y stdout para diagnosticar (algunos
+                # loaders printean errores a stdout en lugar de stderr).
                 if r.stderr:
-                    print(f"   stderr: {r.stderr[-500:]}")
+                    print(f"   stderr: {r.stderr[-500:].rstrip()}")
+                else:
+                    print(f"   stderr: (vacío)")
+                if r.stdout:
+                    print(f"   stdout: {r.stdout[-500:].rstrip()}")
+                else:
+                    print(f"   stdout: (vacío)")
                 results[name] = "fail"
         except subprocess.TimeoutExpired:
             print(f"   ⏱ {name} timeout (>3 min) — skipping")
@@ -335,8 +356,14 @@ def main():
     p = argparse.ArgumentParser(description="Sync local → PythonAnywhere")
     p.add_argument("--skip-loaders", action="store_true",
                    help="No correr loaders (usar CSVs ya generados)")
+    p.add_argument("--upload-excel", action="store_true",
+                   help="SUBIR el Excel master local al server, sobreescribiendo "
+                        "el del server. Usar solo si editaste el Excel local. "
+                        "Por defecto NO se sube para evitar pisar trades cargados "
+                        "desde la PWA.")
     p.add_argument("--skip-excel", action="store_true",
-                   help="No subir el Excel master")
+                   help="(Deprecated) No subir el Excel master. Ya es el default; "
+                        "se mantiene por compat con scripts viejos.")
     p.add_argument("--only-excel", action="store_true",
                    help="Solo subir Excel master + refresh")
     p.add_argument("--only-prices", action="store_true",
@@ -400,8 +427,17 @@ def main():
 
     upload_csvs(cfg)
 
-    if not args.skip_excel:
+    # Excel upload: por DEFAULT no se sube, para evitar sobreescribir
+    # cambios hechos desde la PWA del iPhone (trades, gastos, etc.).
+    # Solo se sube si --upload-excel se pasa explícitamente.
+    if args.upload_excel and not args.skip_excel:
         upload_excel(cfg, args.xlsx)
+    elif not args.skip_excel:
+        # Skip default — informar al usuario para que sepa que NO se sube
+        print("\n→ Excel master: NO se sube (default). Si editaste el Excel "
+              "local y querés sincronizarlo al server, usá --upload-excel.")
+        print("  ⚠ Si cargás trades/gastos desde la PWA, NO uses --upload-excel "
+              "después o vas a sobreescribir esos cambios.")
 
     trigger_refresh(cfg)
 
