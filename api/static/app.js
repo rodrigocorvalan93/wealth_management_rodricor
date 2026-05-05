@@ -113,6 +113,13 @@
         : "";
       return API.req(`/api/snapshots?${qs}`, { method: "DELETE" });
     },
+    backfillSnapshots: (opts) => {
+      const params = new URLSearchParams();
+      if (opts && opts.cadence) params.set("cadence", opts.cadence);
+      if (opts && opts.from) params.set("from", opts.from);
+      if (opts && opts.to) params.set("to", opts.to);
+      return API.req(`/api/snapshots/backfill?${params.toString()}`, { method: "POST" });
+    },
     refresh: () => API.req("/api/refresh", { method: "POST" }),
     backups: () => API.req("/api/backups"),
 
@@ -666,6 +673,28 @@
         const r = await API.deleteSnapshots({ all: true });
         toast(`Borrados ${r.deleted} snapshots ✓`, "success");
         await API.refresh();  // graba un snapshot limpio inmediatamente
+        render();
+      } catch (e) {
+        toast(`Error: ${e.message}`, "error");
+      }
+    },
+    async backfillSnapshots() {
+      const cadenceStr = prompt(
+        "Reconstruir equity curve histórica calculando el PN en fechas pasadas a partir de tu historial de movimientos.\n\n" +
+        "Cadencia (días entre snapshots, recomendado 7):", "7"
+      );
+      if (cadenceStr === null) return;
+      const cadence = parseInt(cadenceStr, 10) || 7;
+      const reset = confirm(
+        "¿Borrar snapshots existentes antes de reconstruir?\n" +
+        "OK = borrar y reconstruir desde cero (recomendado si está contaminado).\n" +
+        "Cancelar = preservar snapshots actuales y solo agregar los faltantes."
+      );
+      try {
+        toast("Reconstruyendo histórico...", "info");
+        if (reset) await API.deleteSnapshots({ all: true });
+        const r = await API.backfillSnapshots({ cadence });
+        toast(`Backfill: ${r.n_snapshots_written} snapshots en ${r.n_dates_tried} fechas (${r.fecha_desde} → ${r.fecha_hasta}) ✓`, "success");
         render();
       } catch (e) {
         toast(`Error: ${e.message}`, "error");
@@ -3024,10 +3053,15 @@
         <section>
           <h2>🧹 Mantenimiento de snapshots</h2>
           <div class="card compact muted" style="font-size:12px; margin-bottom: 8px;">
-            Si tu PN inicial está contaminado (ej. <b>0</b> o un parcial sin FX),
-            las métricas TWR/MWR salen irreales. Reseteá el histórico y arrancá limpio.
+            <b>Reconstruir histórico</b>: calcula el PN en cada fecha pasada
+            usando tu historial de movimientos — la curva arranca desde el
+            primer evento, no desde hoy. <br>
+            <b>Resetear</b>: borra todos los snapshots y arranca desde cero.
           </div>
-          <button class="btn ghost full" data-onclick="resetSnapshots">🗑 Resetear snapshots históricos</button>
+          <button class="btn primary full" data-onclick="backfillSnapshots" style="margin-bottom:6px;">
+            🔄 Reconstruir histórico desde movimientos
+          </button>
+          <button class="btn ghost full" data-onclick="resetSnapshots">🗑 Resetear snapshots</button>
         </section>
 
         <section>

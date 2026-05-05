@@ -105,6 +105,67 @@ def record_snapshots(conn, holdings, fecha, anchor_currency="USD"):
     return n
 
 
+def backfill_snapshots(conn, anchor_currency="USD", cadence_days=7,
+                        fecha_desde=None, fecha_hasta=None):
+    """Reconstruye la equity curve histórica computando holdings en cada fecha.
+
+    Walks desde `fecha_desde` (default: fecha del primer evento) hasta
+    `fecha_hasta` (default: hoy), grabando un snapshot cada `cadence_days`
+    días + una al final. Usa `calculate_holdings(fecha=...)` que respeta
+    historia de movements + precios + FX disponibles a esa fecha.
+
+    Snapshots con PN ~ 0 (FX faltante en fechas viejas, etc) se descartan
+    silenciosamente — `record_snapshots` ya tiene ese guard.
+
+    Returns: dict {n_dates_tried, n_snapshots_written, fecha_desde, fecha_hasta}.
+    """
+    from .holdings import calculate_holdings
+
+    today = date.today()
+    if fecha_hasta is None:
+        fecha_hasta = today
+    elif isinstance(fecha_hasta, str):
+        fecha_hasta = date.fromisoformat(fecha_hasta)
+
+    if fecha_desde is None:
+        # Primer evento del usuario
+        cur = conn.execute("SELECT MIN(event_date) AS d FROM events")
+        row = cur.fetchone()
+        first = row["d"] if row else None
+        if not first:
+            return {"n_dates_tried": 0, "n_snapshots_written": 0,
+                    "fecha_desde": None, "fecha_hasta": fecha_hasta.isoformat()}
+        fecha_desde = date.fromisoformat(first[:10])
+    elif isinstance(fecha_desde, str):
+        fecha_desde = date.fromisoformat(fecha_desde)
+
+    # Generar lista de fechas: desde, desde+cadence, ..., hasta (incluye hasta)
+    dates = []
+    d = fecha_desde
+    while d < fecha_hasta:
+        dates.append(d)
+        d = d + timedelta(days=cadence_days)
+    dates.append(fecha_hasta)
+
+    n_written = 0
+    for d in dates:
+        try:
+            holdings = calculate_holdings(conn, fecha=d,
+                                           anchor_currency=anchor_currency)
+        except Exception:
+            continue
+        n_written += record_snapshots(conn, holdings, d,
+                                       anchor_currency=anchor_currency)
+
+    return {
+        "n_dates_tried": len(dates),
+        "n_snapshots_written": n_written,
+        "fecha_desde": fecha_desde.isoformat(),
+        "fecha_hasta": fecha_hasta.isoformat(),
+        "cadence_days": cadence_days,
+    }
+
+
 def returns_by_period(conn, anchor_currency="USD", investible_only=False,
                        today=None):
     """Calcula returns simples del PN para varios períodos: 1d, 1w, 1m, 3m, ytd, 1y.

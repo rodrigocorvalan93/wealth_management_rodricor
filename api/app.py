@@ -705,6 +705,37 @@ def create_app() -> Flask:
         finally:
             conn.close()
 
+    @app.post("/api/snapshots/backfill")
+    def backfill_snapshots_endpoint():
+        """Reconstruye la equity curve histórica computando holdings a fechas
+        pasadas (semanal por default). Útil después de /api/snapshots DELETE
+        o cuando arrancás con un baseline contaminado.
+
+        Query:
+          ?cadence=7         — días entre snapshots (default 7)
+          ?from=YYYY-MM-DD   — fecha inicial (default: primer evento del user)
+          ?to=YYYY-MM-DD     — fecha final (default: hoy)
+        """
+        _require_auth(); _block_if_switched_mutation()
+        from engine.snapshots import backfill_snapshots
+        anchor = _parse_query_anchor()
+        try:
+            cadence = int(request.args.get("cadence") or 7)
+        except ValueError:
+            cadence = 7
+        cadence = max(1, min(cadence, 365))
+        fecha_desde = request.args.get("from")
+        fecha_hasta = request.args.get("to")
+        conn = db_conn()
+        try:
+            result = backfill_snapshots(
+                conn, anchor_currency=anchor, cadence_days=cadence,
+                fecha_desde=fecha_desde, fecha_hasta=fecha_hasta,
+            )
+            return jsonify(result)
+        finally:
+            conn.close()
+
     @app.delete("/api/snapshots")
     def delete_snapshots():
         """Borra snapshots del PN. Útil para limpiar baseline contaminado
