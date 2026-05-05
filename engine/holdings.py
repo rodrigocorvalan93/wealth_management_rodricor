@@ -320,6 +320,7 @@ def calculate_holdings(conn, fecha=None, anchor_currency="USD"):
             # Cash: no requiere precio (vale 1 por unidad de su moneda)
             native_ccy = asset
             mv_native = pos["qty"]
+            mv_native_currency = native_ccy
             market_price = 1.0
             price_source = "cash"
             price_date = fecha_iso
@@ -359,8 +360,12 @@ def calculate_holdings(conn, fecha=None, anchor_currency="USD"):
             price_fallback = mp["fallback_used"]
 
             # Si el precio viene en moneda distinta a la nativa, convertir.
-            # Si la conversión falla, marcamos price_fallback=True para que el
-            # usuario sepa que el precio puede no estar en la moneda esperada.
+            # Si la conversión falla, mantenemos `market_price` en su moneda
+            # original (mp["currency"]) y trackeamos esa moneda como "fuente"
+            # para la conversión a ancla — sin esto, mv_native quedaría
+            # numéricamente "en native_ccy" pero usando un valor de otra
+            # moneda, y la conversión a ancla aplicaría una tasa equivocada.
+            mv_native_currency = native_ccy
             if mp["currency"] != native_ccy:
                 try:
                     market_price = fx_convert(
@@ -368,12 +373,11 @@ def calculate_holdings(conn, fecha=None, anchor_currency="USD"):
                         fallback_days=14,
                     )
                 except FxError:
-                    # No tenemos rate para convertir: market_price queda en
-                    # mp["currency"] (NO en native_ccy). Esto es un bug data —
-                    # el price_source se anota y price_fallback queda True para
-                    # que el frontend pinte el holding como "px*".
                     price_fallback = True
                     price_source = (price_source or "?") + f" (sin FX {mp['currency']}→{native_ccy})"
+                    # market_price sigue en mp["currency"]; usamos esa moneda
+                    # como source de la conversión a ancla.
+                    mv_native_currency = mp["currency"]
 
             mv_native = pos["qty"] * market_price
             avg_cost = pos["avg_cost"] if pos["avg_cost"] else market_price
@@ -385,9 +389,11 @@ def calculate_holdings(conn, fecha=None, anchor_currency="USD"):
                 else 0.0
             )
 
-        # Convertir MV a moneda ancla
+        # Convertir MV a moneda ancla. Si la conversión price→native falló
+        # arriba, mv_native_currency != native_ccy y acá usamos la moneda
+        # real del precio para no aplicar la tasa equivocada.
         mv_anchor, mv_anchor_ok = _convert_to_anchor(
-            conn, mv_native, native_ccy, anchor_currency, fecha
+            conn, mv_native, mv_native_currency, anchor_currency, fecha
         )
 
         meta = account_meta.get(account, {
