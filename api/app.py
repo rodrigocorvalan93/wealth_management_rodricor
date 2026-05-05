@@ -698,6 +698,113 @@ def create_app() -> Flask:
         finally:
             conn.close()
 
+    @app.get("/api/cash-performance")
+    def cash_performance_endpoint():
+        """Retorno del cash en monedas no-anchor vs la moneda ancla.
+
+        Para cada (account, currency) de cash en una moneda distinta al
+        anchor, computa:
+          - avg_fx_in   = rate ponderada por las entradas de cash (qty>0)
+          - current_fx  = rate actual currency→anchor
+          - return_pct  = current_fx / avg_fx_in - 1
+          - mv_anchor   = qty actual * current_fx
+
+        El cash en la moneda ancla siempre tiene return=0 (1 unit = 1 unit).
+        El cash en monedas inestables (ARS si anchor=USD) tiene retorno
+        TÍPICAMENTE NEGATIVO porque ARS se devalúa contra USD.
+        """
+        _require_auth(); _block_if_switched_mutation()
+        from engine.holdings import (
+            calculate_holdings, _load_currencies, SYSTEM_ACCOUNTS,
+        )
+        from engine.fx import get_rate
+        anchor = _parse_query_anchor()
+        fecha = _parse_query_fecha()
+        conn = db_conn()
+        try:
+            holdings = calculate_holdings(conn, fecha=fecha,
+                                           anchor_currency=anchor)
+            currencies_set = _load_currencies(conn)
+            cash_holdings = [h for h in holdings
+                             if h.get("is_cash") and h.get("qty")
+                             and abs(h["qty"]) > 1e-6]
+
+            today_iso = fecha.isoformat()
+            rows = []
+            for h in cash_holdings:
+                ccy = h["native_currency"]
+                qty = h["qty"]
+                # Movimientos qty>0 (entradas) de ese (account, asset)
+                cur = conn.execute(
+                    """SELECT m.qty, e.event_date
+                       FROM movements m JOIN events e ON e.event_id = m.event_id
+                       WHERE m.account=? AND m.asset=? AND m.qty>0
+                       ORDER BY e.event_date ASC""",
+                    (h["account"], ccy),
+                )
+                inflows = [(r["event_date"][:10], r["qty"]) for r in cur.fetchall()]
+                if not inflows:
+                    continue
+                first_date = inflows[0][0]
+
+                # Para cada entrada, FX rate ccy→anchor en esa fecha.
+                # Skip si falta FX (sin warning bloqueante: ese inflow no
+                # entra en el promedio, los otros sí).
+                weighted_rate_num = 0.0
+                weighted_qty = 0.0
+                for d, q in inflows:
+                    if ccy == anchor:
+                        rate = 1.0
+                    else:
+                        try:
+                            rate = get_rate(conn, d, ccy, anchor, fallback_days=14)
+                        except Exception:
+                            rate = None
+                    if rate is None or rate <= 0:
+                        continue
+                    weighted_rate_num += rate * q
+                    weighted_qty += q
+                if weighted_qty <= 0:
+                    continue
+                avg_fx_in = weighted_rate_num / weighted_qty
+
+                # FX actual
+                if ccy == anchor:
+                    current_fx = 1.0
+                else:
+                    current_fx = get_rate(conn, today_iso, ccy, anchor,
+                                            fallback_days=14)
+                if current_fx is None or current_fx <= 0:
+                    continue
+
+                ret_pct = (current_fx / avg_fx_in) - 1.0
+                mv_anchor = qty * current_fx
+                cost_anchor = qty * avg_fx_in
+                pnl_anchor = mv_anchor - cost_anchor
+
+                rows.append({
+                    "account": h["account"],
+                    "currency": ccy,
+                    "qty": qty,
+                    "avg_fx_in": avg_fx_in,
+                    "current_fx": current_fx,
+                    "return_pct": ret_pct,
+                    "mv_anchor": mv_anchor,
+                    "cost_anchor": cost_anchor,
+                    "pnl_anchor": pnl_anchor,
+                    "first_inflow_date": first_date,
+                    "n_inflows": len([1 for d, q in inflows]),
+                })
+            rows.sort(key=lambda r: -(r["return_pct"] or -1e9))
+            return jsonify({
+                "fecha": fecha.isoformat(),
+                "anchor": anchor,
+                "n": len(rows),
+                "items": rows,
+            })
+        finally:
+            conn.close()
+
     @app.get("/api/realized-pnl")
     def realized_pnl_endpoint():
         _require_auth(); _block_if_switched_mutation()

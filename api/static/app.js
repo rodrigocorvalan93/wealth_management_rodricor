@@ -111,6 +111,9 @@
     assetPerformance: (anchor, investible) => API.req(
       `/api/asset-performance?anchor=${anchor || API.anchor()}&investible=${!!investible}`
     ),
+    cashPerformance: (anchor) => API.req(
+      `/api/cash-performance?anchor=${anchor || API.anchor()}`
+    ),
     equityCurve: (anchor, investible) => API.req(
       `/api/equity-curve?anchor=${anchor || API.anchor()}&investible=${!!investible}`
     ),
@@ -2510,14 +2513,19 @@
   route("/asset-performance", async () => {
     const view = sessionStorage.getItem("perf_view") || "all";
     const investible = view === "investible";
-    let data;
+    let data, cashData;
     try {
-      data = await API.assetPerformance(API.anchor(), investible);
+      [data, cashData] = await Promise.all([
+        API.assetPerformance(API.anchor(), investible),
+        API.cashPerformance(API.anchor()),
+      ]);
     } catch (e) {
       return `${headerWithBack("Performance por activo", "/")}
         <main><div class="card danger">${escapeHtml(e.message)}</div></main>`;
     }
     const items = data.items || [];
+    const cashItems = (cashData && cashData.items || [])
+      .filter(c => c.currency !== data.anchor);  // ocultar anchor (ret=0)
 
     return `
       ${headerWithBack("📊 Performance por activo", "/")}
@@ -2533,6 +2541,52 @@
           Anualizado = (1 + return)^(365/días) − 1.
         </div>
 
+        ${cashItems.length > 0 ? `
+          <section style="margin-bottom: 16px;">
+            <h2>💵 Cash vs ${escapeHtml(data.anchor)}</h2>
+            <div class="card compact muted" style="font-size:11px; margin-bottom:6px;">
+              Retorno del cash por evolución del FX desde que entró.
+              <b>avg fx</b> = rate ponderado por entradas. Cash en ${escapeHtml(data.anchor)} no aparece (siempre 0%).
+            </div>
+            <div class="list">
+              ${cashItems.map(c => {
+                const ret = c.return_pct;
+                const cls = ret == null ? "muted" : ret > 0 ? "positive" : "negative";
+                const sign = ret > 0 ? "+" : "";
+                return `
+                  <div class="list-item" style="align-items:flex-start;">
+                    <div class="meta">
+                      <div class="meta-line1">
+                        <span style="font-weight:700;">${escapeHtml(c.currency)}</span>
+                        <span class="muted" style="font-size:11px;">cash · ${escapeHtml(c.account)}</span>
+                      </div>
+                      <div class="meta-line2 tabular muted" style="font-size:11px;">
+                        ${fmt.money(c.qty, 2)} ${escapeHtml(c.currency)}
+                        · avg fx ${fmt.money(c.avg_fx_in, 4)} → hoy ${fmt.money(c.current_fx, 4)}
+                      </div>
+                      <div class="meta-line2 muted" style="font-size:11px;">
+                        desde ${escapeHtml(c.first_inflow_date || "?")} (${c.n_inflows} entradas)
+                      </div>
+                    </div>
+                    <div class="right">
+                      <div class="amount tabular ${cls}">
+                        ${ret != null ? sign + (ret * 100).toFixed(2) + "%" : "—"}
+                      </div>
+                      <div class="sub tabular ${(c.pnl_anchor || 0) > 0 ? 'positive' : (c.pnl_anchor || 0) < 0 ? 'negative' : 'muted'}">
+                        ${fmt.money(c.pnl_anchor, 0)} ${escapeHtml(data.anchor)}
+                      </div>
+                      <div class="sub muted tabular" style="font-size:11px;">
+                        MV ${fmt.money(c.mv_anchor, 0)} ${escapeHtml(data.anchor)}
+                      </div>
+                    </div>
+                  </div>
+                `;
+              }).join("")}
+            </div>
+          </section>
+        ` : ""}
+
+        <h2>🎯 Activos</h2>
         ${items.length === 0 ? `<div class="card muted">Sin holdings con retorno calculable.</div>` :
           `<div class="list">
             ${items.map((r, idx) => {
