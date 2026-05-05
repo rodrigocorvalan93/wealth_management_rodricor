@@ -272,6 +272,33 @@ def test_c2_snapshot_idempotent():
         conn.close()
 
 
+def test_c2b_snapshot_uses_pn_net_of_liabilities():
+    """record_snapshots debe usar mv_pn_anchor (signed): pasivos restan.
+    Si usa mv_anchor crudo, el __TOTAL__ queda inflado por las deudas."""
+    print("\n[C2b] snapshots usan PN net (pasivos restan):")
+    with tempfile.TemporaryDirectory() as tmp:
+        conn, _ = _setup_db(Path(tmp))
+        holdings = calculate_holdings(conn, fecha=date(2026, 5, 2),
+                                       anchor_currency="ARS")
+        from engine.holdings import total_pn
+        pn = total_pn(holdings)
+        record_snapshots(conn, holdings, date(2026, 5, 2), anchor_currency="ARS")
+        # __TOTAL__ snapshot debe igualar el PN total real (assets - liab),
+        # no la suma cruda de mv_anchor.
+        cur = conn.execute(
+            "SELECT mv_anchor FROM pn_snapshots WHERE account='__TOTAL__' AND anchor_currency='ARS'"
+        )
+        snap_total = cur.fetchone()["mv_anchor"]
+        # Tolerance de 1 ARS por rounding
+        assert abs(snap_total - pn["total_anchor"]) < 1, \
+            f"Snapshot {snap_total} ≠ PN real {pn['total_anchor']} (diff {snap_total - pn['total_anchor']})"
+        print(f"  ✓ __TOTAL__ snapshot = PN real = {pn['total_anchor']:,.2f} ARS")
+        # Si el master de test tiene pasivos, verificá que el fix los hace restar
+        if pn.get("total_liabilities", 0) > 0:
+            print(f"  ✓ pasivos restados correctamente ({pn['total_liabilities']:,.0f} de deuda)")
+        conn.close()
+
+
 def test_c3_equity_curve_multiple_dates():
     """Snapshots en 3 fechas → equity curve con 3 puntos + métricas."""
     print("\n[C3] equity curve con 3 fechas:")
@@ -657,6 +684,7 @@ if __name__ == "__main__":
         test_b3_total_pn_split,
         test_c1_snapshot_record_and_query,
         test_c2_snapshot_idempotent,
+        test_c2b_snapshot_uses_pn_net_of_liabilities,
         test_c3_equity_curve_multiple_dates,
         test_d1_aforos_loaded,
         test_d2_buying_power_byma_cocos,

@@ -634,7 +634,44 @@ def create_app() -> Flask:
         _require_auth(); _block_if_switched_mutation()
         with excel_write_lock():
             stats = reimport_excel()
+        # Después del reimport, grabar un snapshot del PN del día.
+        # Sin esto, la equity curve solo evoluciona cuando bajás un reporte
+        # (que era el único path que llamaba record_snapshots).
+        try:
+            anchor = get_settings().anchor
+            today = date.today()
+            holdings, conn = _holdings(today, anchor)
+            try:
+                n = record_snapshots(conn, holdings, today, anchor_currency=anchor)
+            finally:
+                conn.close()
+            stats["snapshots"] = n
+        except Exception as e:
+            print(f"[refresh] WARN no pude grabar snapshot: {e}")
         return jsonify({"refreshed": True, "import_stats": stats})
+
+    @app.get("/api/returns")
+    def returns_endpoint():
+        """Returns simples del PN para 1d/1w/1m/3m/ytd/1y.
+
+        Query: ?anchor=USD&investible=1
+        """
+        _require_auth(); _block_if_switched_mutation()
+        from engine.snapshots import returns_by_period
+        anchor = _parse_query_anchor()
+        investible = request.args.get("investible") == "1"
+        conn = db_conn()
+        try:
+            data = returns_by_period(conn, anchor_currency=anchor,
+                                       investible_only=investible)
+            return jsonify({
+                "anchor": anchor,
+                "investible_only": investible,
+                "as_of": date.today().isoformat(),
+                "returns": data,
+            })
+        finally:
+            conn.close()
 
     @app.get("/api/backups")
     def backups():
