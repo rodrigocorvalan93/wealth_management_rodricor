@@ -73,6 +73,7 @@ from .state import (
 )
 from . import credentials as creds
 from . import audit, ratelimit
+from . import auth as auth_mod
 from .users import (
     load_users, resolve_user_by_token, get_active_user,
     admin_switch_to, admin_switch_clear, is_switched,
@@ -130,42 +131,108 @@ def create_app() -> Flask:
 
     # --- Auth + user resolution (multi-tenant) ---
 
+    # Endpoints de auth que NO requieren auth previa
+    AUTH_PUBLIC_PATHS = {
+        "/api/auth/signup", "/api/auth/login",
+        "/api/auth/forgot-password", "/api/auth/reset-password",
+        "/api/auth/verify-email",
+    }
+
     @app.before_request
     def _resolve_user():
         """Resuelve el user activo desde el bearer token y lo setea en g.
 
-        - g.auth_user: el user dueño del token
-        - g.active_user_id: el user_id efectivamente activo (=auth_user, o
-          el target si el admin hizo switch)
+        Acepta dos tipos de token:
+          1. Session token de auth_db (preferido — emitido al login con
+             email/password). Resuelve via api/auth.resolve_session.
+          2. Legacy bearer token de WM_USERS_JSON / WM_API_TOKEN.
+
+        - g.auth_user: el user dueño del token (UserConfig-like)
+        - g.active_user_id: user_id efectivamente activo
         - g.is_admin: True si el auth_user es admin
+        - g.is_superadmin: True si el auth_user es superadmin
         - g.is_switched: True si el admin está viendo datos de otro
+        - g.auth_via: 'session' | 'legacy' | None
         """
-        # Endpoints públicos: no resolver user
+        # Defaults siempre presentes para evitar AttributeError
+        g.auth_user = None
+        g.active_user_id = None
+        g.is_admin = False
+        g.is_superadmin = False
+        g.is_switched = False
+        g.user_token = None
+        g.auth_via = None
+        g.auth_email = None
+
         if not request.path.startswith("/api/"):
             return
         if request.method == "OPTIONS":
             return
         if request.path == "/api/health":
             return
+        if request.path in AUTH_PUBLIC_PATHS:
+            return
 
         auth = request.headers.get("Authorization", "")
         if not auth.startswith("Bearer "):
-            return  # _require_auth abortará después
+            return
         token = auth[len("Bearer "):].strip()
+        g.user_token = token
 
+        # 1) Session token (auth_db)
+        try:
+            session_info = auth_mod.resolve_session(token)
+        except Exception:
+            session_info = None
+        if session_info:
+            class _U:
+                pass
+            u = _U()
+            u.user_id = session_info["user_id"]
+            u.display_name = session_info["display_name"]
+            u.is_admin = session_info["is_admin"] or session_info["is_superadmin"]
+            u.token = token
+            g.auth_user = u
+            g.active_user_id = session_info["user_id"]
+            g.is_admin = bool(session_info["is_admin"]
+                                or session_info["is_superadmin"])
+            g.is_superadmin = bool(session_info["is_superadmin"])
+            g.auth_email = session_info.get("email")
+            g.auth_email_verified = bool(session_info.get("email_verified"))
+            g.auth_via = "session"
+            # Switch state (compat) — superadmin puede usar el switch viejo
+            from .users import is_switched as _is_switched, _switched
+            if g.is_superadmin and token in _switched:
+                target_id = _switched[token]
+                # Validar que ese user_id realmente exista en alguno de los
+                # backends
+                target_legacy = next(
+                    (lu for lu in load_users() if lu.user_id == target_id), None
+                )
+                if target_legacy:
+                    g.active_user_id = target_legacy.user_id
+                    g.is_switched = True
+                else:
+                    # Switch a un user de auth_db
+                    p = auth_mod.get_user_profile(target_id)
+                    if p:
+                        g.active_user_id = p["user_id"]
+                        g.is_switched = True
+            return
+
+        # 2) Legacy bearer token (WM_USERS_JSON / WM_API_TOKEN)
         active = get_active_user(token)
         if active is None:
-            return  # _require_auth abortará
-
+            return
         auth_user, switched = active
-        # auth_user es el user dueño del token (puede ser admin con switch)
-        # Buscamos el user real al que apunta:
         actual_token_owner = resolve_user_by_token(token)
         g.auth_user = actual_token_owner
         g.active_user_id = auth_user.user_id
         g.is_admin = bool(actual_token_owner and actual_token_owner.is_admin)
+        # En legacy, admin es de facto superadmin (back-compat)
+        g.is_superadmin = bool(actual_token_owner and actual_token_owner.is_admin)
         g.is_switched = switched
-        g.user_token = token
+        g.auth_via = "legacy"
 
     @app.before_request
     def _rate_limit():
@@ -234,8 +301,6 @@ def create_app() -> Flask:
 
     def _require_auth():
         """Verifica que haya user resuelto en g."""
-        if not load_users():
-            abort(500, "Sin users configurados. Setea WM_USERS_JSON o WM_API_TOKEN.")
         if not getattr(g, "active_user_id", None):
             abort(401, "Token inválido o ausente")
 
@@ -244,6 +309,12 @@ def create_app() -> Flask:
         _require_auth()
         if not getattr(g, "is_admin", False):
             abort(403, "Acción solo para admin")
+
+    def _require_superadmin():
+        """Solo superadmins (o admin legacy)."""
+        _require_auth()
+        if not getattr(g, "is_superadmin", False):
+            abort(403, "Acción solo para superadmin")
 
     def _block_if_switched_mutation():
         """En vista 'switched', el admin no puede mutar datos del target user.
@@ -1717,6 +1788,241 @@ def create_app() -> Flask:
             f"os.environ['WM_USERS_JSON'] = '''{os.environ.get('WM_USERS_JSON', '{}')}'''\n"
             f"os.environ['WM_ADMIN_USER'] = '{os.environ.get('WM_ADMIN_USER', '')}'\n"
         )
+
+    # =========================================================================
+    # Auth: signup / login / forgot-password / verify-email / me
+    # =========================================================================
+
+    def _client_ctx() -> dict:
+        ip = (request.headers.get("X-Forwarded-For",
+                                    request.remote_addr or "")
+              .split(",")[0].strip())
+        return {"ip": ip,
+                "user_agent": request.headers.get("User-Agent", "")[:200]}
+
+    def _auth_err_response(e: auth_mod.AuthError):
+        return jsonify({"error": True, "code": e.code,
+                        "message": e.message}), e.http_status
+
+    @app.post("/api/auth/signup")
+    def auth_signup():
+        body = request.get_json(silent=True) or {}
+        email = body.get("email") or ""
+        password = body.get("password") or ""
+        display_name = body.get("display_name") or ""
+        ctx = _client_ctx()
+        try:
+            r = auth_mod.signup(email, password, display_name=display_name,
+                                ip=ctx["ip"], user_agent=ctx["user_agent"])
+        except auth_mod.AuthError as e:
+            return _auth_err_response(e)
+        # En modo dev sin SMTP, devolver el verify token para que el user
+        # pueda verificarse sin email funcional.
+        dev_token = r.verify_token_plain if (
+            r.verify_email_via != "smtp"
+            and os.environ.get("WM_AUTO_VERIFY_FIRST_SUPERADMIN") == "1"
+            and r.is_superadmin
+        ) else None
+        return jsonify({
+            "user_id": r.user_id,
+            "email": r.email,
+            "is_superadmin": r.is_superadmin,
+            "is_admin": r.is_admin,
+            "verify_email_sent_via": r.verify_email_via,
+            "verify_token_dev": dev_token,
+            "needs_verification": r.verify_token_plain is not None,
+        }), 201
+
+    @app.post("/api/auth/login")
+    def auth_login():
+        body = request.get_json(silent=True) or {}
+        email = body.get("email") or ""
+        password = body.get("password") or ""
+        ctx = _client_ctx()
+        try:
+            r = auth_mod.login(email, password, ip=ctx["ip"],
+                               user_agent=ctx["user_agent"])
+        except auth_mod.AuthError as e:
+            return _auth_err_response(e)
+        return jsonify({
+            "session_token": r.session_token,
+            "session_token_prefix": r.session_token_prefix,
+            "expires_at": r.expires_at,
+            "user": {
+                "user_id": r.user_id,
+                "email": r.email,
+                "display_name": r.display_name,
+                "is_admin": r.is_admin,
+                "is_superadmin": r.is_superadmin,
+                "email_verified": r.email_verified,
+            },
+        })
+
+    @app.post("/api/auth/logout")
+    def auth_logout():
+        token = (request.headers.get("Authorization", "")
+                 .replace("Bearer ", "").strip())
+        ok = auth_mod.logout(token)
+        return jsonify({"ok": ok})
+
+    @app.post("/api/auth/forgot-password")
+    def auth_forgot():
+        body = request.get_json(silent=True) or {}
+        email = body.get("email") or ""
+        ctx = _client_ctx()
+        # Siempre devolvemos OK aunque el email no exista (anti-enumeration)
+        result = auth_mod.request_password_reset(email, ip=ctx["ip"])
+        return jsonify({
+            "ok": True,
+            "message": "Si el email existe, te mandamos un link de "
+                        "recuperación. Revisá spam también.",
+            "delivery": result.get("via"),
+        })
+
+    @app.post("/api/auth/reset-password")
+    def auth_reset():
+        body = request.get_json(silent=True) or {}
+        token = body.get("token") or ""
+        new_password = body.get("new_password") or ""
+        ctx = _client_ctx()
+        try:
+            r = auth_mod.reset_password_with_token(token, new_password,
+                                                    ip=ctx["ip"])
+        except auth_mod.AuthError as e:
+            return _auth_err_response(e)
+        return jsonify(r)
+
+    @app.post("/api/auth/verify-email")
+    def auth_verify_email():
+        body = request.get_json(silent=True) or {}
+        token = body.get("token") or ""
+        try:
+            r = auth_mod.verify_email_with_token(token)
+        except auth_mod.AuthError as e:
+            return _auth_err_response(e)
+        return jsonify(r)
+
+    @app.post("/api/auth/resend-verify")
+    def auth_resend_verify():
+        _require_auth()
+        try:
+            r = auth_mod.resend_verification(g.active_user_id)
+        except auth_mod.AuthError as e:
+            return _auth_err_response(e)
+        return jsonify(r)
+
+    @app.post("/api/auth/change-password")
+    def auth_change_password():
+        _require_auth()
+        body = request.get_json(silent=True) or {}
+        try:
+            r = auth_mod.change_password(
+                g.active_user_id,
+                body.get("current_password") or "",
+                body.get("new_password") or "",
+                current_session_token=g.user_token,
+            )
+        except auth_mod.AuthError as e:
+            return _auth_err_response(e)
+        return jsonify(r)
+
+    @app.get("/api/auth/me")
+    def auth_me():
+        _require_auth()
+        # Si vino por session token, devolver el perfil del auth_users.
+        if getattr(g, "auth_via", None) == "session":
+            profile = auth_mod.get_user_profile(g.active_user_id)
+            sessions = auth_mod.list_user_sessions(g.active_user_id)
+            return jsonify({
+                "auth_via": "session",
+                "user": profile,
+                "active_sessions": len(sessions),
+                "sessions": sessions,
+                "is_switched": bool(g.is_switched),
+            })
+        # Legacy
+        return jsonify({
+            "auth_via": "legacy",
+            "user": {
+                "user_id": g.active_user_id,
+                "is_admin": g.is_admin,
+                "is_superadmin": g.is_superadmin,
+                "email": None,
+                "email_verified": None,
+                "display_name": (g.auth_user.display_name
+                                  if g.auth_user else g.active_user_id),
+            },
+            "is_switched": bool(g.is_switched),
+        })
+
+    @app.put("/api/auth/me")
+    def auth_update_me():
+        _require_auth()
+        body = request.get_json(silent=True) or {}
+        if "display_name" in body:
+            try:
+                r = auth_mod.update_display_name(g.active_user_id,
+                                                  body["display_name"])
+            except auth_mod.AuthError as e:
+                return _auth_err_response(e)
+            return jsonify(r)
+        return jsonify({"ok": True})
+
+    @app.delete("/api/auth/sessions/<prefix>")
+    def auth_revoke_session(prefix):
+        _require_auth()
+        ok = auth_mod.revoke_session(g.active_user_id, prefix)
+        return jsonify({"revoked": ok})
+
+    @app.delete("/api/auth/sessions")
+    def auth_revoke_all_sessions():
+        """Revoca todas las sesiones excepto la actual."""
+        _require_auth()
+        n = auth_mod.revoke_all_sessions(g.active_user_id,
+                                          except_token=g.user_token)
+        return jsonify({"revoked": n})
+
+    # =========================================================================
+    # Superadmin: gestión de auth_users
+    # =========================================================================
+
+    @app.get("/api/superadmin/users")
+    def superadmin_list_users():
+        _require_superadmin()
+        return jsonify({
+            "users": auth_mod.list_all_auth_users(),
+            "self": g.active_user_id,
+        })
+
+    @app.put("/api/superadmin/users/<user_id>/admin")
+    def superadmin_set_admin(user_id):
+        _require_superadmin()
+        body = request.get_json(silent=True) or {}
+        is_admin = bool(body.get("is_admin", True))
+        return jsonify(auth_mod.set_admin_flag(user_id, is_admin,
+                                                 g.active_user_id))
+
+    @app.put("/api/superadmin/users/<user_id>/superadmin")
+    def superadmin_set_superadmin(user_id):
+        _require_superadmin()
+        body = request.get_json(silent=True) or {}
+        is_super = bool(body.get("is_superadmin", True))
+        if user_id == g.active_user_id and not is_super:
+            abort(400, "No podés removerte a vos mismo el superadmin "
+                       "(promové a otro user antes).")
+        return jsonify(auth_mod.set_superadmin_flag(user_id, is_super,
+                                                     g.active_user_id))
+
+    @app.delete("/api/superadmin/users/<user_id>")
+    def superadmin_delete_user(user_id):
+        _require_superadmin()
+        if user_id == g.active_user_id:
+            abort(400, "No podés borrar tu propia cuenta desde acá. "
+                       "Usá /api/account.")
+        try:
+            return jsonify(auth_mod.delete_auth_user(user_id, g.active_user_id))
+        except auth_mod.AuthError as e:
+            return _auth_err_response(e)
 
     # =========================================================================
     # Credenciales del user (BYMA, CAFCI, etc.) — encriptadas en disk

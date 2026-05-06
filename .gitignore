@@ -14,6 +14,9 @@ data/
 *.xls
 audit.log
 audit.log.*
+auth.db
+auth.db-*
+_outbox/
 
 # Python
 __pycache__/
