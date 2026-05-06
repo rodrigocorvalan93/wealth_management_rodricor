@@ -170,13 +170,20 @@ def _get_active_target(conn, account, asset, _cache=None):
     }
 
 
-def _calc_position(conn, account, asset, fecha_iso):
+def _calc_position(conn, account, asset, fecha_iso, native_ccy=None):
     """Calcula posición agregada para (account, asset) hasta fecha_iso.
 
-    Devuelve dict {qty, cost_basis_total, avg_cost} o None si saldo cero.
+    Devuelve dict {qty, cost_basis_total, avg_cost, has_fx_fallback}
+    o None si saldo cero.
 
     Para avg_cost usa weighted average de COMPRAS (no FIFO estricto;
     para FIFO realizado/no-realizado se usa engine/pnl.py).
+
+    Si `native_ccy` se pasa y un movement tiene `price_currency` distinto
+    (típicamente porque el FX falló al importar), intenta reconvertir el
+    unit_price a la moneda nativa del activo en la fecha del trade. Si la
+    reconversión también falla, usa el valor crudo y marca
+    `has_fx_fallback=True`.
     """
     cur = conn.execute(
         """
@@ -193,15 +200,30 @@ def _calc_position(conn, account, asset, fecha_iso):
         return None
 
     qty_neto = 0.0
-    cost_total_acum = 0.0  # suma de qty_compra * unit_price
+    cost_total_acum = 0.0  # suma de qty_compra * unit_price (en native_ccy)
     qty_compra_acum = 0.0  # qty positiva acumulada (para WAC)
+    has_fx_fallback = False
 
     for r in rows:
         qty = r["qty"]
         unit_price = r["unit_price"]
+        price_ccy = r["price_currency"]
         qty_neto += qty
         if qty > 0 and unit_price is not None:
-            cost_total_acum += qty * unit_price
+            up = unit_price
+            # Si el unit_price quedó guardado en moneda distinta a la nativa
+            # (FX falló al importar), reintentar la conversión ahora — la
+            # tabla fx_rates puede haberse populado después.
+            if native_ccy and price_ccy and price_ccy != native_ccy:
+                try:
+                    up = fx_convert(
+                        conn, unit_price, price_ccy, native_ccy,
+                        r["event_date"][:10], fallback_days=14,
+                    )
+                except FxError:
+                    has_fx_fallback = True
+                    # up = unit_price (sin conversión, cost_basis aproximado)
+            cost_total_acum += qty * up
             qty_compra_acum += qty
 
     if abs(qty_neto) < 1e-9:
@@ -214,6 +236,7 @@ def _calc_position(conn, account, asset, fecha_iso):
         "qty": qty_neto,
         "avg_cost": avg_cost,
         "cost_basis_total": cost_basis_total,
+        "has_fx_fallback": has_fx_fallback,
     }
 
 
@@ -308,13 +331,24 @@ def calculate_holdings(conn, fecha=None, anchor_currency="USD"):
 
     holdings = []
     for account, asset in pairs:
-        pos = _calc_position(conn, account, asset, fecha_iso)
+        # Resolver moneda nativa del activo antes de calcular posición —
+        # _calc_position usa native_ccy para reconvertir unit_price si los
+        # movimientos quedaron guardados en otra moneda (FX missing al import).
+        is_cash_pre = asset in currencies_set and asset not in assets_set
+        if is_cash_pre:
+            native_ccy_for_pos = asset
+        else:
+            ai = asset_map.get(asset)
+            native_ccy_for_pos = ai["currency"] if ai else None
+
+        pos = _calc_position(conn, account, asset, fecha_iso,
+                              native_ccy=native_ccy_for_pos)
         if pos is None:
             continue
 
         # Cash = está en currencies Y NO en assets (ej ARS, USB, USD, EUR)
         # Activos cripto (BTC, ETH, USDT, USDC) están en AMBOS — son activos
-        is_cash = asset in currencies_set and asset not in assets_set
+        is_cash = is_cash_pre
 
         if is_cash:
             # Cash: no requiere precio (vale 1 por unidad de su moneda)

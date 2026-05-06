@@ -449,8 +449,10 @@ def test_11_blotter_with_fx_conversion():
 
 
 def test_12_blotter_without_fx_skips():
-    """Trade en moneda distinta sin FX cargado: skipea fila con warning."""
-    print("\nTest 12 (blotter sin FX → skip con warning):")
+    """Trade en moneda distinta sin FX cargado: registra el trade con
+    price_currency = moneda Trade (cash igual va correcto) y reporta el
+    fallback en stats['blotter_fx_failed']."""
+    print("\nTest 12 (blotter sin FX → fallback con warning):")
     with tempfile.TemporaryDirectory() as tmp:
         tmp = Path(tmp)
         xlsx = tmp / "test.xlsx"
@@ -482,10 +484,17 @@ def test_12_blotter_without_fx_skips():
         # Importar sin FX disponible
         stats = import_all(db, xlsx, fecha_corte=date(2026, 5, 2),
                            fx_csv_path=tmp / "noexiste.csv")
-        # blotter debería tener solo 2 (los originales TXMJ9), no 3
-        # porque T_NOFX se skipea por falta de FX
-        assert stats["blotter"] == 2, f"blotter trades: {stats['blotter']}"
-        print(f"  ✓ Trade sin FX: skipped (blotter cargados = 2, esperado 2)")
+        # Nuevo behavior: el trade se registra igual (cash leg correcto)
+        # con price_currency = moneda Trade. El fallback queda flagueado en
+        # stats['blotter_fx_failed'] para que la UI lo muestre.
+        assert stats["blotter"] == 3, f"blotter trades: {stats['blotter']}"
+        assert stats.get("blotter_fx_failed"), (
+            "Esperaba blotter_fx_failed con la fila sin FX"
+        )
+        assert any(f["ticker"] == "AL30D"
+                   for f in stats["blotter_fx_failed"])
+        print(f"  ✓ Trade sin FX: registrado con fallback "
+              f"({len(stats['blotter_fx_failed'])} fila(s) flagueada(s))")
 
         conn = sqlite3.connect(str(db))
         conn.row_factory = sqlite3.Row
@@ -493,8 +502,30 @@ def test_12_blotter_without_fx_skips():
             "SELECT COUNT(*) AS n FROM events WHERE external_id='T_NOFX'"
         )
         n = cur.fetchone()["n"]
-        assert n == 0, f"T_NOFX no debería estar (n={n})"
-        print(f"  ✓ T_NOFX no creó evento (correcto)")
+        assert n == 1, f"T_NOFX debería existir como evento (n={n})"
+        # El movement del activo debe quedar en moneda del trade (USDT),
+        # no en la moneda nativa (USB) porque el FX falló.
+        cur = conn.execute(
+            """SELECT m.price_currency, m.qty FROM movements m
+               JOIN events e ON e.event_id = m.event_id
+               WHERE e.external_id='T_NOFX' AND m.asset='AL30D'"""
+        )
+        row = cur.fetchone()
+        assert row["price_currency"] == "USDT", (
+            f"price_currency debe ser USDT (sin convertir), got {row['price_currency']}"
+        )
+        # Cash leg: cuenta binance perdió USDT
+        cur = conn.execute(
+            """SELECT m.qty, m.asset FROM movements m
+               JOIN events e ON e.event_id = m.event_id
+               WHERE e.external_id='T_NOFX' AND m.asset='USDT'"""
+        )
+        cash = cur.fetchone()
+        assert cash is not None and cash["qty"] < 0, (
+            "Cash leg debe existir y restarle USDT a la cuenta"
+        )
+        print(f"  ✓ T_NOFX: evento creado, cash leg correcto, "
+              f"price_currency=USDT (fallback)")
         conn.close()
 
 
