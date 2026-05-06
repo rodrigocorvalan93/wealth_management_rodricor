@@ -504,8 +504,13 @@ def import_blotter(conn, ws):
     moneda real del trade. Esto mantiene:
       - inventario en moneda nativa del bono (USB para AL30, USD para AAPL)
       - cash en la moneda real que se intercambió (ARS, USB, USDT, etc)
+
+    Si el FX falla, NO se descarta el trade. Se registra con
+    `price_currency = moneda Trade` y holdings.py se encarga de convertir
+    a la moneda nativa al calcular avg_cost (con re-intento de FX).
     """
     n = 0
+    fx_failed = []  # rows que tuvieron que caer al fallback (sin FX)
     for r, row in _read_rows(ws):
         ticker = _to_str(row.get("Ticker"))
         side = _to_str(row.get("Side"))
@@ -542,6 +547,12 @@ def import_blotter(conn, ws):
             # Asset no existe en `assets` — usar moneda del trade como fallback
             asset_ccy = moneda
 
+        # Moneda en la que se almacena el unit_price del activo (para el
+        # cálculo del avg_cost en holdings).
+        # - Por default, asset_ccy (la nativa del activo)
+        # - Si el FX falla, fallback a moneda Trade y holdings re-intenta
+        #   la conversión al calcular tenencias.
+        price_storage_ccy = asset_ccy
         if asset_ccy != moneda:
             try:
                 # Convertir el precio unitario: precio (en moneda) → precio en asset_ccy
@@ -549,9 +560,15 @@ def import_blotter(conn, ws):
                     conn, precio, moneda, asset_ccy, trade_date,
                 )
             except FxError as e:
-                # Falla limpia: log y skip esta fila
-                print(f"[importer] WARN blotter row {r}: {e} — skipping")
-                continue
+                # Fallback robusto: registrar el trade con price_currency =
+                # moneda Trade. El cash se mueve correctamente y el avg_cost
+                # se reconvierte al calcular holdings.
+                print(f"[importer] WARN blotter row {r} ({ticker}): {e} — "
+                      f"guardando precio en {moneda} (sin conversión)")
+                precio_native = precio
+                price_storage_ccy = moneda
+                fx_failed.append({"row": r, "ticker": ticker,
+                                   "from": moneda, "to": asset_ccy})
         else:
             precio_native = precio
 
@@ -577,16 +594,22 @@ def import_blotter(conn, ws):
         # Cash en moneda real del trade
         cash_total = qty * precio  # siempre positivo
 
-        # Movement 1: el activo (precio en moneda nativa)
+        # Movement 1: el activo (precio en moneda nativa o, si FX falla,
+        # en la moneda del trade — holdings.py re-convierte si puede).
+        notes_asset = None
+        if price_storage_ccy != asset_ccy:
+            notes_asset = (f"⚠ Sin FX {moneda}→{asset_ccy} en {trade_date}, "
+                           f"precio en {moneda}")
+        elif asset_ccy != moneda:
+            notes_asset = f"FX: {moneda}→{asset_ccy} en {trade_date}"
         insert_movement(
             conn, eid,
             account=cuenta, asset=ticker,
             qty=sign * qty,
             unit_price=precio_native,
-            price_currency=asset_ccy,
+            price_currency=price_storage_ccy,
             cost_basis=sign * cost_basis_native,
-            notes=(f"FX: {moneda}→{asset_ccy} en {trade_date}"
-                   if asset_ccy != moneda else None),
+            notes=notes_asset,
         )
         # Movement 2: el cash (en moneda del trade)
         insert_movement(
@@ -613,7 +636,7 @@ def import_blotter(conn, ws):
             )
 
         n += 1
-    return n
+    return {"n": n, "fx_failed": fx_failed}
 
 
 def import_transferencias_cash(conn, ws):
@@ -1043,7 +1066,16 @@ def import_all(db_path: str | Path, xlsx_path: str | Path,
 
     # 2. Eventos
     if "blotter" in wb.sheetnames:
-        stats["blotter"] = import_blotter(conn, wb["blotter"])
+        bl = import_blotter(conn, wb["blotter"])
+        # Compat: import_blotter ahora devuelve dict {n, fx_failed}; tests
+        # viejos pueden esperar un int — exponemos n en stats["blotter"]
+        # y la lista de fallas en stats["blotter_fx_failed"].
+        if isinstance(bl, dict):
+            stats["blotter"] = bl["n"]
+            if bl.get("fx_failed"):
+                stats["blotter_fx_failed"] = bl["fx_failed"]
+        else:
+            stats["blotter"] = bl
     if "transferencias_cash" in wb.sheetnames:
         stats["transferencias_cash"] = import_transferencias_cash(conn, wb["transferencias_cash"])
     if "transferencias_activos" in wb.sheetnames:

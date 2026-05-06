@@ -434,8 +434,10 @@ def hoja_especies(wb):
                 cell.font = FONT_NORMAL
 
     # Validación Asset Class
-    classes = ("CASH,BOND_AR,EQUITY_AR,EQUITY_US,FCI,CRYPTO,STABLECOIN,"
-               "DERIVATIVE,OTHER")
+    classes = ("CASH,BOND_AR,BOND_CORP_AR,BOND_US,"
+               "EQUITY_AR,EQUITY_US,EQUITY_GLOBAL,ETF,REIT,"
+               "FCI,CRYPTO,STABLECOIN,"
+               "DERIVATIVE,COMMODITY,REAL_ESTATE,PRIVATE,OTHER")
     dv = DataValidation(type="list", formula1=f'"{classes}"', allow_blank=False)
     dv.add("C5:C500")
     ws.add_data_validation(dv)

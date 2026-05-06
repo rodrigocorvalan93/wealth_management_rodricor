@@ -91,17 +91,26 @@ class AccountKind:
 class AssetClass:
     """Clase de activo. Para reportes y agregaciones."""
     CASH = "CASH"                       # Efectivo / saldos en banco / wallet
-    BOND_AR = "BOND_AR"                 # Bonos AR (AL30, GD30, TX26, BPC...)
+    BOND_AR = "BOND_AR"                 # Bonos AR soberanos (AL30, GD30, TX26, BPC...)
+    BOND_CORP_AR = "BOND_CORP_AR"       # Obligaciones Negociables AR (YPF, IRSA, PAMP...)
+    BOND_US = "BOND_US"                 # Treasuries / corporates USD
     EQUITY_AR = "EQUITY_AR"             # Acciones AR (GGAL, BMA, YPFD...)
-    EQUITY_US = "EQUITY_US"             # CEDEARs y ADRs
+    EQUITY_US = "EQUITY_US"             # CEDEARs y ADRs USA
+    EQUITY_GLOBAL = "EQUITY_GLOBAL"     # Acciones non-US/non-AR (UK/EU/Asia)
+    ETF = "ETF"                         # ETFs (SPY, QQQ, EWZ, IBIT, etc)
+    REIT = "REIT"                       # Real Estate Investment Trust
     FCI = "FCI"                         # Fondos comunes de inversión
     CRYPTO = "CRYPTO"                   # BTC, ETH, ALT
     STABLECOIN = "STABLECOIN"           # USDT, USDC, DAI
     DERIVATIVE = "DERIVATIVE"           # Futuros, opciones
+    COMMODITY = "COMMODITY"             # Oro, plata, soja
+    REAL_ESTATE = "REAL_ESTATE"         # Inmuebles, departamentos
+    PRIVATE = "PRIVATE"                 # Private equity, ventures, ilíquidos
     OTHER = "OTHER"
 
-    ALL = (CASH, BOND_AR, EQUITY_AR, EQUITY_US, FCI, CRYPTO, STABLECOIN,
-           DERIVATIVE, OTHER)
+    ALL = (CASH, BOND_AR, BOND_CORP_AR, BOND_US, EQUITY_AR, EQUITY_US,
+           EQUITY_GLOBAL, ETF, REIT, FCI, CRYPTO, STABLECOIN, DERIVATIVE,
+           COMMODITY, REAL_ESTATE, PRIVATE, OTHER)
 
 
 class CardCycle:
@@ -188,8 +197,10 @@ CREATE TABLE IF NOT EXISTS assets (
     -- Notes
     notes        TEXT,
     FOREIGN KEY (currency) REFERENCES currencies(code),
-    CHECK (asset_class IN ('CASH','BOND_AR','EQUITY_AR','EQUITY_US','FCI',
-                           'CRYPTO','STABLECOIN','DERIVATIVE','OTHER'))
+    CHECK (asset_class IN ('CASH','BOND_AR','BOND_CORP_AR','BOND_US',
+                           'EQUITY_AR','EQUITY_US','EQUITY_GLOBAL','ETF','REIT',
+                           'FCI','CRYPTO','STABLECOIN','DERIVATIVE',
+                           'COMMODITY','REAL_ESTATE','PRIVATE','OTHER'))
 );
 
 -- =============================================================================

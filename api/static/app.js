@@ -220,6 +220,70 @@
     }[c]));
   }
 
+  // Asset class → label "humano" para mostrar al lado del ticker.
+  function assetClassLabel(cls) {
+    const map = {
+      "BOND_AR":      "Bonos AR",
+      "BOND_CORP_AR": "ON Argentina",
+      "BOND_US":      "Bonos US",
+      "EQUITY_AR":    "Acciones AR",
+      "EQUITY_US":    "Acciones US",
+      "EQUITY_GLOBAL":"Acciones globales",
+      "ETF":          "ETF",
+      "REIT":         "REIT",
+      "FCI":          "FCI",
+      "CRYPTO":       "Cripto",
+      "STABLECOIN":   "Stablecoin",
+      "DERIVATIVE":   "Derivado",
+      "COMMODITY":    "Commodity",
+      "REAL_ESTATE":  "Inmueble",
+      "PRIVATE":      "Privado",
+      "CASH":         "Cash",
+      "OTHER":        "Otro",
+    };
+    return map[cls] || (cls || "?");
+  }
+
+  // Render de ticker "limpio" para listas/holdings.
+  // - "AAPL_AR" → AAPL  [AR]
+  // - "AAPL_US" → AAPL  [US]
+  // - FCI (asset_class='FCI'): usa el name del CAFCI (ej "Delta Ahorro Plus - Clase A")
+  // - "BTC"     → BTC                (cuando asset_class='CRYPTO')
+  // - resto     → ticker tal cual (sin badge)
+  // Devuelve HTML con ticker-code + ticker-suffix.
+  function tickerHtml(ticker, assetClass, name) {
+    if (!ticker) return "";
+    const t = String(ticker);
+    // FCIs: priorizar el nombre largo de CAFCI si existe.
+    if (assetClass === "FCI" && name && String(name).trim()) {
+      return `<span class="ticker-code" style="font-weight:600;">${escapeHtml(name)}</span>`;
+    }
+    let base = t;
+    let suffix = null;
+    let suffixClass = "";
+    if (/_AR$/i.test(t)) {
+      base = t.replace(/_AR$/i, "");
+      suffix = "AR";
+      suffixClass = "ar";
+    } else if (/_US$/i.test(t)) {
+      base = t.replace(/_US$/i, "");
+      suffix = "US";
+      suffixClass = "us";
+    } else if (assetClass === "EQUITY_AR") {
+      suffix = "AR"; suffixClass = "ar";
+    } else if (assetClass === "EQUITY_US") {
+      suffix = "US"; suffixClass = "us";
+    } else if (assetClass === "CRYPTO" || assetClass === "STABLECOIN") {
+      // No mostramos badge — el ticker (BTC, ETH, USDT) es self-explanatory
+      suffix = null;
+    }
+    let html = `<span class="ticker-code">${escapeHtml(base)}</span>`;
+    if (suffix) {
+      html += `<span class="ticker-suffix ${suffixClass}">${suffix}</span>`;
+    }
+    return html;
+  }
+
   // -------- Cache de cuentas/especies/monedas --------
   let _meta = null;
   async function loadMeta() {
@@ -373,16 +437,61 @@
     });
   }
 
+  // -------- Theme (dark / light) --------
+  const THEME_KEY = "wm_theme";
+  function getTheme() {
+    const saved = localStorage.getItem(THEME_KEY);
+    if (saved === "dark" || saved === "light") return saved;
+    return window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches
+      ? "dark" : "light";
+  }
+  function applyTheme(t) {
+    const html = document.documentElement;
+    html.setAttribute("data-theme", t);
+    // Sync theme-color meta para iOS standalone status bar
+    const meta = document.querySelector('meta[name="theme-color"]');
+    if (meta) meta.setAttribute("content", t === "dark" ? "#0E1628" : "#1F3864");
+  }
+  function themeIcon() {
+    return getTheme() === "dark" ? "☀" : "☾";
+  }
+  // Aplicar inmediato (antes de que el usuario vea el shell)
+  applyTheme(getTheme());
+
+  // Reaccionar a cambios del sistema cuando no hay override del user
+  if (window.matchMedia) {
+    try {
+      window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change", (e) => {
+        if (!localStorage.getItem(THEME_KEY)) {
+          applyTheme(e.matches ? "dark" : "light");
+        }
+      });
+    } catch (_) {}
+  }
+
   // -------- Actions --------
   window._actions = {
+    toggleTheme() {
+      const next = getTheme() === "dark" ? "light" : "dark";
+      localStorage.setItem(THEME_KEY, next);
+      applyTheme(next);
+      // Re-render para refrescar el ícono del toggle
+      try { render(); } catch (_) {}
+    },
     async createTrade(data) {
       // Convertir tipos numéricos
       ["Qty", "Precio", "Comisión"].forEach(k => {
         if (data[k] !== null) data[k] = parseFloat(data[k]);
       });
-      await API.createRow("blotter", data);
+      const res = await API.createRow("blotter", data);
       invalidateMeta();
-      toast("Trade agregado ✓", "success");
+      const fxFailed = res?.import_stats?.blotter_fx_failed;
+      if (fxFailed && fxFailed.length) {
+        const sample = fxFailed.slice(0, 3).map(f => `${f.ticker} (${f.from}→${f.to})`).join(", ");
+        toast(`Trade agregado, pero faltó FX para ${fxFailed.length} fila(s): ${sample}. Cargá FX y refrescá.`, "error");
+      } else {
+        toast("Trade agregado ✓", "success");
+      }
       navigate("/trades");
     },
     async updateTrade(data, form) {
@@ -390,9 +499,15 @@
         if (data[k] !== null && data[k] !== undefined) data[k] = parseFloat(data[k]);
       });
       const id = form.dataset.rowId;
-      await API.updateRow("blotter", id, data);
+      const res = await API.updateRow("blotter", id, data);
       invalidateMeta();
-      toast("Trade actualizado ✓", "success");
+      const fxFailed = res?.import_stats?.blotter_fx_failed;
+      if (fxFailed && fxFailed.length) {
+        const sample = fxFailed.slice(0, 3).map(f => `${f.ticker} (${f.from}→${f.to})`).join(", ");
+        toast(`Trade actualizado, pero faltó FX para ${fxFailed.length} fila(s): ${sample}.`, "error");
+      } else {
+        toast("Trade actualizado ✓", "success");
+      }
       navigate("/trades");
     },
     async deleteTrade(id) {
@@ -826,6 +941,7 @@
       <div class="topbar">
         <h1>📊 Portfolio${userName ? ` · <span class="user-name">${escapeHtml(userName)}</span>` : ""}</h1>
         <div class="actions">
+          <button class="theme-toggle" data-onclick="toggleTheme" title="Cambiar tema">${themeIcon()}</button>
           <button data-onclick="refreshAll" title="Refrescar">⟳</button>
         </div>
       </div>
@@ -2304,13 +2420,13 @@
                 <div class="meta">
                   <div class="meta-line1">
                     <span style="font-weight: 700;">#${idx + 1}</span>
-                    ${escapeHtml(h.asset)}
+                    ${tickerHtml(h.asset, h.asset_class, h.name)}
                     ${tagBits.join(" ")}
                     ${isClickable ? '<span class="muted" style="font-size:11px;">›</span>' : ""}
                   </div>
                   <div class="meta-line2" style="display: flex; align-items: center; gap: 6px; flex-wrap: wrap;">
                     <span style="display: inline-block;">${accountLabel(h.account, meta.accountsRich)}</span>
-                    <span class="muted">· ${escapeHtml(h.asset_class || "?")}${h.name && h.name !== h.asset ? ' · ' + escapeHtml(h.name) : ""}</span>
+                    <span class="muted">· ${escapeHtml(assetClassLabel(h.asset_class))}${(h.asset_class !== "FCI" && h.name && h.name !== h.asset) ? ' · ' + escapeHtml(h.name) : ""}</span>
                   </div>
                   <div class="meta-line2 tabular" style="margin-top: 4px;">
                     ${fmt.money(h.qty, 4)} ${escapeHtml(h.native_currency)}
@@ -2413,9 +2529,9 @@
         <div class="card" style="margin-bottom:12px;">
           <div style="display:flex; justify-content:space-between; align-items:baseline;">
             <div>
-              <div style="font-weight:700; font-size:18px;">${escapeHtml(data.ticker)}</div>
+              <div style="font-weight:700; font-size:18px;">${tickerHtml(data.ticker, data.asset_class)}</div>
               <div class="muted" style="font-size:12px;">
-                ${escapeHtml(data.name || "")} ${data.asset_class ? "· " + escapeHtml(data.asset_class) : ""}
+                ${escapeHtml(data.name || "")} ${data.asset_class ? "· " + escapeHtml(assetClassLabel(data.asset_class)) : ""}
               </div>
             </div>
             <div class="tabular ${retCls}" style="text-align:right;">
@@ -2599,11 +2715,11 @@
                   <div class="meta">
                     <div class="meta-line1">
                       <span style="font-weight:700;">#${idx + 1}</span>
-                      ${escapeHtml(r.asset)}
+                      ${tickerHtml(r.asset, r.asset_class, r.name)}
                       <span class="muted" style="font-size:11px;">›</span>
                     </div>
                     <div class="meta-line2 muted" style="font-size:12px;">
-                      ${escapeHtml(r.account)} · ${escapeHtml(r.asset_class || "")}
+                      ${escapeHtml(r.account)} · ${escapeHtml(assetClassLabel(r.asset_class))}
                     </div>
                     <div class="meta-line2 tabular muted" style="font-size:11px; margin-top:2px;">
                       desde ${escapeHtml(r.first_purchase_date || "?")}
@@ -3985,8 +4101,15 @@ python yfinance_loader.py</pre>
   }
 
   // -------- Form helpers para maestros --------
-  const ASSET_CLASSES = ["CASH", "BOND_AR", "EQUITY_AR", "EQUITY_US", "FCI",
-                          "CRYPTO", "STABLECOIN", "DERIVATIVE", "OTHER"];
+  const ASSET_CLASSES = [
+    "CASH",
+    "BOND_AR", "BOND_CORP_AR", "BOND_US",
+    "EQUITY_AR", "EQUITY_US", "EQUITY_GLOBAL",
+    "ETF", "REIT", "FCI",
+    "CRYPTO", "STABLECOIN",
+    "DERIVATIVE", "COMMODITY", "REAL_ESTATE", "PRIVATE",
+    "OTHER",
+  ];
   const ACCOUNT_KINDS = ["CASH_BANK", "CASH_BROKER", "CASH_WALLET", "CASH_PHYSICAL",
                           "CARD_CREDIT", "LIABILITY", "EXTERNAL", "OPENING_BALANCE",
                           "INTEREST_EXPENSE", "INTEREST_INCOME"];
@@ -4070,7 +4193,9 @@ python yfinance_loader.py</pre>
       <div class="topbar">
         <button onclick="window.history.length>1 ? window.history.back() : window.location.hash='${backHref}'">‹ Atrás</button>
         <h1>${escapeHtml(title)}</h1>
-        <div></div>
+        <div class="actions">
+          <button class="theme-toggle" data-onclick="toggleTheme" title="Cambiar tema">${themeIcon()}</button>
+        </div>
       </div>
     `;
   }

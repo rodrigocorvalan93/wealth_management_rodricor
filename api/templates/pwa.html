@@ -3,24 +3,44 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
-<meta name="theme-color" content="#1F3864">
+<meta name="theme-color" content="#1F3864" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#0E1628" media="(prefers-color-scheme: dark)">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 <meta name="apple-mobile-web-app-title" content="WM">
 <meta name="format-detection" content="telephone=no">
+<meta name="color-scheme" content="light dark">
 <title>WM — Portfolio</title>
 <link rel="manifest" href="/static/manifest.json">
 <link rel="icon" type="image/svg+xml" href="/static/icon.svg">
 <link rel="apple-touch-icon" href="/static/icon.svg">
 <link rel="mask-icon" href="/static/icon.svg" color="#1F3864">
 <link rel="stylesheet" href="/static/style.css">
+<script>
+  // Aplicar tema antes de pintar (evita flash de claro a oscuro).
+  (function () {
+    try {
+      var saved = localStorage.getItem("wm_theme");
+      var t = (saved === "dark" || saved === "light")
+        ? saved
+        : (window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light");
+      document.documentElement.setAttribute("data-theme", t);
+    } catch (e) { /* localStorage puede fallar en private mode */ }
+  })();
+</script>
 <style>
-  /* Loading inicial */
+  /* Loading inicial — usa tokens de tema (dark/light) ya aplicados */
   #boot { display: flex; height: 100vh; align-items: center; justify-content: center;
-          background: #1F3864; color: white; font-family: sans-serif; flex-direction: column; gap: 16px; }
-  #boot .logo { font-size: 64px; font-weight: 800; letter-spacing: -3px; }
+          background: linear-gradient(135deg, #1F3864 0%, #2E5B9C 100%);
+          color: white; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+          flex-direction: column; gap: 16px; }
+  [data-theme="dark"] #boot {
+    background: linear-gradient(135deg, #0E1628 0%, #243A66 100%);
+  }
+  #boot .logo { font-size: 64px; font-weight: 800; letter-spacing: -0.04em; }
+  #boot .tag { font-size: 11px; opacity: 0.65; letter-spacing: 0.12em; text-transform: uppercase; }
   #boot .spinner-init {
-    width: 24px; height: 24px; border: 3px solid rgba(255,255,255,0.3);
+    width: 24px; height: 24px; border: 3px solid rgba(255,255,255,0.25);
     border-top-color: white; border-radius: 50%;
     animation: spin 0.8s linear infinite;
   }
@@ -30,6 +50,7 @@
 <body>
 <div id="boot">
   <div class="logo">WM</div>
+  <div class="tag">Wealth Management</div>
   <div class="spinner-init"></div>
 </div>
 <script src="/static/app.js" defer></script>
