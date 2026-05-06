@@ -14,3 +14,6 @@ yfinance>=0.2.40
 
 # API backend (Fase 2: Flask wrapper para PythonAnywhere)
 flask>=3.0
+
+# Encriptación de credenciales per-user (api/credentials.py)
+cryptography>=41.0

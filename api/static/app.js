@@ -165,6 +165,28 @@
     setSetting: (key, value) =>
       API.req("/api/settings", { method: "PUT", json: { key, value } }),
 
+    // Credenciales del user (BYMA, CAFCI). Los valores secretos no se devuelven.
+    getCredentials: () => API.req("/api/credentials", { noCache: true }),
+    updateCredentials: (data) => API.req("/api/credentials", { method: "PUT", json: data }),
+    deleteCredentials: () => API.req("/api/credentials", { method: "DELETE" }),
+
+    // Disparar loaders desde la app
+    runByma: (tickers) => API.req("/api/loaders/byma", {
+      method: "POST", json: tickers ? { tickers } : {},
+    }),
+
+    // Audit log
+    auditLog: (n = 100) => API.req(`/api/audit-log?n=${n}`, { noCache: true }),
+
+    // Account management
+    deleteAccount: () => fetch(`${API.base}/api/account`, {
+      method: "DELETE",
+      headers: {
+        "Authorization": `Bearer ${API.token()}`,
+        "X-Confirm-Delete": "yes",
+      },
+    }).then(r => r.ok ? r.json() : r.json().then(j => Promise.reject(new Error(j.message || "delete failed")))),
+
     // Admin endpoints
     listUsers: () => API.req("/api/admin/users"),
     createUser: (data) => API.req("/api/admin/users", { method: "POST", json: data }),
@@ -800,6 +822,74 @@
         toast(`Error: ${e.message}`, "error");
       }
     },
+
+    async saveCredentials(data) {
+      // Filtrar fields vacíos: si el user dejó un campo en blanco, NO mandamos
+      // null (eso borraría). Solo mandamos los que tienen valor nuevo.
+      const payload = {};
+      for (const [k, v] of Object.entries(data)) {
+        if (v !== null && v !== undefined && String(v).trim() !== "") {
+          payload[k] = v;
+        }
+      }
+      if (Object.keys(payload).length === 0) {
+        toast("No hay cambios para guardar", "info");
+        return;
+      }
+      try {
+        await API.updateCredentials(payload);
+        toast("Credenciales guardadas ✓", "success");
+        navigate("/credentials");
+      } catch (e) {
+        toast(`Error: ${e.message}`, "error");
+      }
+    },
+    async deleteCredentials() {
+      if (!confirm("¿Borrar todas las credenciales del broker? Vas a tener que volver a cargarlas.")) return;
+      try {
+        await API.deleteCredentials();
+        toast("Credenciales borradas", "success");
+        navigate("/credentials");
+      } catch (e) {
+        toast(`Error: ${e.message}`, "error");
+      }
+    },
+    async runByma() {
+      try {
+        toast("Bajando precios BYMA... (puede tardar 10-20s)", "info");
+        const res = await API.runByma();
+        toast(`✓ ${res.n_tickers} tickers refrescados`, "success");
+        API._bustCache();
+        render();
+      } catch (e) {
+        if (e.message.toLowerCase().includes("credenciales")) {
+          if (confirm("Faltan credenciales BYMA. ¿Configurarlas ahora?")) {
+            navigate("/credentials");
+          }
+        } else {
+          toast(`Error: ${e.message}`, "error");
+        }
+      }
+    },
+    async deleteMyAccount() {
+      const phrase = "BORRAR";
+      const got = prompt(
+        `Esto borra TODOS tus datos: Excel master, DB, credenciales, audit log y backups. ` +
+        `Tu user_id queda libre (el admin puede reasignarlo).\n\n` +
+        `Para confirmar, escribí "${phrase}":`
+      );
+      if (got !== phrase) {
+        toast("Cancelado", "info");
+        return;
+      }
+      try {
+        const res = await API.deleteAccount();
+        toast(`Borrado: ${(res.deleted || []).join(", ")}`, "success");
+        setTimeout(() => API.logout(), 1500);
+      } catch (e) {
+        toast(`Error: ${e.message}`, "error");
+      }
+    },
     async resetSnapshots() {
       if (!confirm("¿Borrar TODOS los snapshots históricos? La equity curve arranca de cero. Hacelo si tu PN inicial está contaminado (ej. 0 o un parcial sin FX). El próximo refresh graba un snapshot limpio.")) return;
       try {
@@ -870,8 +960,8 @@
       const cfg = await API.config().catch(() => null);
       if (cfg && !cfg.xlsx_present) {
         // Sin Excel — redirigir al wizard
-        setTimeout(() => navigate("/setup"), 100);
-        return `${headerWithBack("Setup", "/")}<main><div class="loading"><div class="spinner"></div>Redirigiendo al wizard...</div></main>`;
+        setTimeout(() => navigate("/welcome"), 100);
+        return `${headerWithBack("Bienvenido", "/")}<main><div class="loading"><div class="spinner"></div>Te llevo al onboarding...</div></main>`;
       }
       throw e;
     }
@@ -881,8 +971,8 @@
       if (cfg && cfg.xlsx_present) {
         // Tiene Excel pero está vacío — mostrar tip al wizard
       } else {
-        setTimeout(() => navigate("/setup"), 100);
-        return `${headerWithBack("Setup", "/")}<main><div class="loading"><div class="spinner"></div>Redirigiendo al wizard...</div></main>`;
+        setTimeout(() => navigate("/welcome"), 100);
+        return `${headerWithBack("Bienvenido", "/")}<main><div class="loading"><div class="spinner"></div>Te llevo al onboarding...</div></main>`;
       }
     }
 
@@ -1202,12 +1292,25 @@
     return `
       ${headerWithBack("📈 Trades", "/")}
       <main>
-        ${items.length === 0 ? emptyState("Aún no cargaste trades", "Tocá el + para agregar uno") :
-          `<div class="list">${items.map(r => `
+        ${items.length === 0 ? `
+          <div class="cta-card">
+            <div class="cta-icon">📈</div>
+            <div class="cta-title">Aún no cargaste trades</div>
+            <div class="cta-desc">
+              Cargá tu primera operación de compra/venta. Después la app
+              mantiene tus tenencias, costo promedio y PnL realizado.
+            </div>
+            <div class="cta-actions">
+              <a href="#/trades/new" class="btn primary">+ Nuevo trade</a>
+              <a href="#/welcome" class="btn ghost">¿Cómo arranco?</a>
+            </div>
+          </div>
+        ` : `<div class="list">${items.map(r => `
             <a class="list-item" href="#/trades/${encodeURIComponent(r.row_id || "")}/edit">
               <div class="meta">
                 <div class="meta-line1">
-                  ${r.Side === "BUY" ? "🟢" : "🔴"} ${escapeHtml(r.Side || "")} ${escapeHtml(r.Ticker || "")}
+                  ${r.Side === "BUY" ? "🟢" : "🔴"} ${escapeHtml(r.Side || "")}
+                  ${tickerHtml(r.Ticker, "")}
                 </div>
                 <div class="meta-line2">
                   ${escapeHtml(fmt.date(r["Trade Date"]))} · ${escapeHtml(r.Cuenta || "")}
@@ -3865,14 +3968,36 @@ python yfinance_loader.py</pre>
         ` : ""}
 
         <section>
+          <h2>🔐 Credenciales del broker</h2>
+          <a href="#/credentials" class="btn ghost full" style="margin-bottom:8px">
+            🔑 Configurar BYMA / CAFCI
+          </a>
+          <button class="btn ghost full" data-onclick="runByma" style="margin-bottom:8px">
+            🔄 Refrescar precios BYMA
+          </button>
+        </section>
+
+        <section>
           <h2>Acciones</h2>
           <button class="btn primary full" data-onclick="refreshAll" style="margin-bottom:8px">⟳ Refrescar DB desde Excel</button>
           <a class="btn ghost full" href="${API.base}/api/download/excel"
              style="margin-bottom:8px"
              onclick="event.preventDefault(); downloadExcel();">⬇ Descargar Excel</a>
           <a class="btn ghost full" href="#/setup" style="margin-bottom:8px">🎉 Wizard inicial</a>
+          <a class="btn ghost full" href="#/welcome" style="margin-bottom:8px">🚀 Onboarding paso a paso</a>
           <a class="btn ghost full" href="#/help" style="margin-bottom:8px">❓ Ayuda y manualcitos</a>
+          <a class="btn ghost full" href="#/audit" style="margin-bottom:8px">📜 Audit log (últimas 100)</a>
           <button class="btn danger full" data-onclick="logout">🔓 Cerrar sesión</button>
+        </section>
+
+        <section>
+          <h2>📜 Privacidad y datos</h2>
+          <a class="btn ghost full" style="margin-bottom:8px"
+             onclick="event.preventDefault(); downloadAccountExport();"
+             href="${API.base}/api/account/export">⬇ Exportar todos mis datos (ZIP)</a>
+          <a class="btn ghost full" href="#/privacy" style="margin-bottom:8px">📄 Política de privacidad</a>
+          <a class="btn ghost full" href="#/terms" style="margin-bottom:8px">📄 Términos y condiciones</a>
+          <button class="btn danger full" data-onclick="deleteMyAccount">🗑 Borrar mis datos</button>
         </section>
 
         <section>
@@ -3918,6 +4043,293 @@ python yfinance_loader.py</pre>
       ${bottomNav("/settings")}
     `;
   });
+
+  // ====================================================================
+  // /credentials — Configurar credenciales BYMA / CAFCI
+  // ====================================================================
+  route("/credentials", async () => {
+    let data;
+    try {
+      data = await API.getCredentials();
+    } catch (e) {
+      return `${headerWithBack("🔑 Credenciales", "/settings")}
+        <main><div class="card">Error: ${escapeHtml(e.message)}</div></main>`;
+    }
+    const fields = data.fields || [];
+    const configured = data.configured || {};
+
+    return `
+      ${headerWithBack("🔑 Credenciales del broker", "/settings")}
+      <main>
+        <section>
+          <div class="card compact" style="background: var(--green-soft); border-color: var(--green); color: var(--text);">
+            <div style="font-size:13px;">
+              🔒 Las credenciales se guardan <b>encriptadas</b> en el server.
+              Nunca se devuelven por la API ni viajan en URLs ni se loguean en
+              audit logs (solo el hash). Borralas en cualquier momento.
+            </div>
+          </div>
+        </section>
+
+        <section>
+          <h2>BYMA / OMS (Cocos, LatinSecurities)</h2>
+          <form data-action="saveCredentials">
+            ${fields.map(f => `
+              <div class="field">
+                <label>
+                  ${escapeHtml(f.label)}
+                  ${configured[f.key] ? '<span class="tag success" style="font-size:9px; margin-left:4px;">configurado</span>' : ''}
+                </label>
+                <input type="${f.secret ? "password" : "text"}"
+                       name="${escapeHtml(f.key)}"
+                       autocomplete="off"
+                       placeholder="${configured[f.key] ? "(ya configurado — dejá vacío para no cambiar)" : ""}">
+                <div class="muted" style="font-size:11px; margin-top:4px;">
+                  ${escapeHtml(f.help)}
+                </div>
+              </div>
+            `).join("")}
+            <button type="submit" class="btn primary full" style="margin-top:12px;">
+              Guardar credenciales
+            </button>
+          </form>
+        </section>
+
+        <section>
+          <button class="btn danger full" data-onclick="deleteCredentials">
+            🗑 Borrar todas las credenciales
+          </button>
+        </section>
+
+        <section>
+          <h2>Probar</h2>
+          <button class="btn ghost full" data-onclick="runByma">
+            🔄 Bajar precios BYMA ahora
+          </button>
+          <div class="muted" style="font-size:12px; margin-top:6px;">
+            Usa los tickers del archivo <code>tickers_byma.txt</code> del repo.
+            Pronto: configurarlos desde la app.
+          </div>
+        </section>
+      </main>
+      ${bottomNav("/settings")}
+    `;
+  });
+
+  // ====================================================================
+  // /audit — Audit log read-only
+  // ====================================================================
+  route("/audit", async () => {
+    let data;
+    try {
+      data = await API.auditLog(200);
+    } catch (e) {
+      return `${headerWithBack("📜 Audit log", "/settings")}
+        <main><div class="card">Error: ${escapeHtml(e.message)}</div></main>`;
+    }
+    const entries = (data.entries || []).slice().reverse();
+    return `
+      ${headerWithBack("📜 Audit log", "/settings")}
+      <main>
+        <section>
+          <div class="muted" style="font-size:13px; margin-bottom:8px;">
+            Últimas ${entries.length} operaciones que mutaron tu cuenta.
+            Solo POST / PUT / DELETE. Body queda hasheado por privacidad.
+          </div>
+          ${entries.length === 0
+            ? `<div class="card muted">Sin entradas todavía.</div>`
+            : `<div class="list">${entries.map(e => `
+              <div class="list-item" style="align-items: flex-start;">
+                <div class="meta">
+                  <div class="meta-line1">
+                    <span class="tag ${e.status >= 400 ? 'danger' : 'success'}" style="font-size:9px;">${e.method}</span>
+                    <span class="tabular" style="font-size:13px;">${escapeHtml(e.path)}</span>
+                  </div>
+                  <div class="meta-line2 muted" style="font-size:11px;">
+                    ${escapeHtml(e.ts || "")} · ${escapeHtml(e.ip || "")}
+                    ${e.is_switched ? " · <span class='tag warn'>switched</span>" : ""}
+                    ${e.body_hash ? " · body=" + escapeHtml(e.body_hash) : ""}
+                  </div>
+                </div>
+                <div class="right">
+                  <span class="tabular" style="font-size:13px;">${e.status}</span>
+                </div>
+              </div>
+            `).join("")}</div>`
+          }
+        </section>
+      </main>
+      ${bottomNav("/settings")}
+    `;
+  });
+
+  // ====================================================================
+  // /privacy + /terms — páginas estáticas
+  // ====================================================================
+  route("/privacy", async () => `
+    ${headerWithBack("🔒 Privacidad", "/settings")}
+    <main>
+      <section><div class="card" style="line-height:1.55;">
+        <h2 style="margin-bottom:8px;">Política de privacidad</h2>
+        <p><b>Datos que guardamos</b><br/>
+        Tu portfolio (cuentas, trades, gastos, ingresos), credenciales del
+        broker (encriptadas), tu user_id y preferencias de la app.</p>
+        <p style="margin-top:8px;"><b>Datos que NO guardamos</b><br/>
+        No tocamos tu broker. Las credenciales se usan solo para que el
+        loader baje precios — no realizamos órdenes ni transferencias.
+        No compartimos data con terceros, no usamos analytics ni trackers
+        externos.</p>
+        <p style="margin-top:8px;"><b>Tus derechos (Ley 25.326 Argentina)</b><br/>
+        Acceso, rectificación, supresión y portabilidad. Para portar:
+        <i>Settings → Exportar todos mis datos</i>. Para borrar:
+        <i>Settings → Borrar mis datos</i>.</p>
+        <p style="margin-top:8px;"><b>Encriptación</b><br/>
+        Las credenciales se encriptan con Fernet (AES-128 + HMAC) antes de
+        escribirse a disk, usando una key derivada per-user.</p>
+        <p style="margin-top:8px;"><b>Backups</b><br/>
+        Cada modificación del Excel master genera un backup local
+        (server-side). Se mantienen los últimos 30. No se replican fuera
+        del server.</p>
+        <p style="margin-top:8px;"><b>Audit log</b><br/>
+        Toda mutación queda registrada en tu audit log (solo metadata,
+        no body). Visible en <i>Settings → Audit log</i>.</p>
+      </div></section>
+    </main>
+    ${bottomNav("/settings")}
+  `);
+
+  route("/terms", async () => `
+    ${headerWithBack("📄 Términos", "/settings")}
+    <main>
+      <section><div class="card" style="line-height:1.55;">
+        <h2 style="margin-bottom:8px;">Términos y condiciones</h2>
+        <p><b>Naturaleza del servicio</b><br/>
+        WM es una herramienta de seguimiento personal de portfolio. NO
+        somos broker, NO somos asesor financiero, NO somos custodio de
+        activos. Los datos se ingresan manualmente o vía API de tu broker.</p>
+        <p style="margin-top:8px;"><b>Información indicativa</b><br/>
+        Precios, FX, retornos y cualquier valoración es <i>indicativa</i> y
+        puede tener delay. Para órdenes reales usá tu broker.</p>
+        <p style="margin-top:8px;"><b>Sin garantías</b><br/>
+        El servicio se provee "as-is". No garantizamos disponibilidad,
+        precisión ni completitud. No nos hacemos responsables de pérdidas
+        por errores de cálculo, datos faltantes o caídas del servicio.</p>
+        <p style="margin-top:8px;"><b>Tu responsabilidad</b><br/>
+        Vos sos responsable de la veracidad de los datos que cargás y de
+        cumplir con tus obligaciones impositivas. WM NO te asesora.</p>
+        <p style="margin-top:8px;"><b>Uso aceptable</b><br/>
+        Una cuenta = un usuario humano. Prohibido scraping masivo,
+        ingeniería inversa o reventa.</p>
+        <p style="margin-top:8px;"><b>Cambios</b><br/>
+        Estos términos pueden actualizarse. Si hacemos cambios materiales,
+        avisamos vía la app antes del próximo login.</p>
+      </div></section>
+    </main>
+    ${bottomNav("/settings")}
+  `);
+
+  // ====================================================================
+  // /welcome — Onboarding wizard
+  // ====================================================================
+  route("/welcome", async () => {
+    const meta = await loadMeta();
+    let blotter = [];
+    try {
+      const r = await API.listSheet("blotter");
+      blotter = r.items || [];
+    } catch (_) {}
+    let cuentasReales = (meta.accounts || [])
+      .filter(c => !["caucion_pasivo", "caucion_activo"].some(p => c.startsWith(p)))
+      .filter(c => !["external_income", "external_expense", "interest_income",
+                     "interest_expense", "opening_balance"].includes(c));
+    const hasAccounts = cuentasReales.length > 0;
+    const hasTrades = (blotter || []).length > 0;
+    const hasCreds = (await API.getCredentials().catch(() => ({}))).configured || {};
+    const hasBymaCreds = !!hasCreds.byma_user;
+
+    function step(n, title, desc, ctaLabel, ctaHref, done) {
+      return `
+        <div class="card" style="display:flex; gap:12px; align-items:flex-start; ${done ? 'opacity:0.55;' : ''}">
+          <div style="font-size:24px; ${done ? "" : "filter: drop-shadow(0 0 4px var(--accent));"}">
+            ${done ? "✅" : `<span class="ticker-suffix" style="font-size:14px; padding: 4px 10px;">${n}</span>`}
+          </div>
+          <div style="flex:1;">
+            <div style="font-weight:700; margin-bottom:2px;">${escapeHtml(title)}</div>
+            <div class="muted" style="font-size:13px; margin-bottom:8px;">${desc}</div>
+            ${ctaHref && !done
+              ? `<a href="${ctaHref}" class="btn primary" style="padding:8px 14px;">${escapeHtml(ctaLabel)}</a>`
+              : ""}
+            ${done ? `<span class="tag success">Listo</span>` : ""}
+          </div>
+        </div>
+      `;
+    }
+    return `
+      ${headerWithBack("🚀 Bienvenido", "/settings")}
+      <main>
+        <section>
+          <div class="kpi primary" style="margin-bottom:14px;">
+            <div class="kpi-label">Antes de arrancar</div>
+            <div style="font-size:18px; font-weight:700; margin-top:4px;">
+              Vamos a configurar tu portfolio en 4 pasos.
+            </div>
+            <div style="opacity:0.85; font-size:13px; margin-top:4px;">
+              Si ya cargaste algo, los pasos completados aparecen tildados.
+            </div>
+          </div>
+
+          ${step(1, "Crear cuentas",
+            "Banco, broker (Cocos), wallet cripto, cash físico. Todo lo que tenga saldo.",
+            "Ir a cuentas", "#/cuentas",
+            hasAccounts)}
+
+          ${step(2, "Cargar credenciales del broker",
+            "Para que la app baje precios automáticamente desde BYMA. Opcional pero recomendado.",
+            "Configurar", "#/credentials",
+            hasBymaCreds)}
+
+          ${step(3, "Cargar tu primer trade o saldo inicial",
+            "Si ya tenías posiciones, agregalas como saldo inicial en la hoja '_carga_inicial' del Excel. Si arrancás de cero, cargá un trade.",
+            "Cargar trade", "#/trades/new",
+            hasTrades)}
+
+          ${step(4, "Refrescar precios y ver tu portfolio",
+            "Apretá el botón de actualizar para que el motor recalcule todo.",
+            "Ir al dashboard", "#/",
+            hasAccounts && hasTrades)}
+        </section>
+
+        <section>
+          <div class="card compact muted" style="font-size:12px;">
+            ¿Algo no anda? Mirá <a href="#/help">Ayuda</a> o
+            <a href="#/audit">el audit log</a>. Para soporte puntual el
+            admin puede ver tu cuenta (read-only) si lo autorizás.
+          </div>
+        </section>
+      </main>
+      ${bottomNav("/settings")}
+    `;
+  });
+
+  window.downloadAccountExport = async function () {
+    try {
+      toast("Generando export...", "info");
+      const res = await fetch(`${API.base}/api/account/export`, {
+        headers: { Authorization: `Bearer ${API.token()}` }
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const blob = await res.blob();
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `wm-export-${new Date().toISOString().slice(0, 10)}.zip`;
+      document.body.appendChild(a); a.click(); a.remove();
+      URL.revokeObjectURL(url);
+      toast("Export descargado ✓", "success");
+    } catch (e) {
+      toast(`Error: ${e.message}`, "error");
+    }
+  };
 
   window.downloadExcel = async function () {
     try {

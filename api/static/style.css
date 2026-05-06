@@ -366,6 +366,41 @@ form { display: flex; flex-direction: column; gap: 12px; }
 }
 .empty .icon { font-size: 48px; margin-bottom: 8px; }
 
+/* Skeleton loaders — placeholders animados mientras se cargan los datos */
+.skeleton {
+  background: linear-gradient(
+    90deg,
+    var(--card) 0%,
+    var(--card-hover) 50%,
+    var(--card) 100%
+  );
+  background-size: 200% 100%;
+  animation: skeleton-shimmer 1.4s ease-in-out infinite;
+  border-radius: 8px;
+}
+@keyframes skeleton-shimmer {
+  0%   { background-position: 200% 0; }
+  100% { background-position: -200% 0; }
+}
+.skeleton-line { height: 14px; margin-bottom: 8px; }
+.skeleton-line.short { width: 40%; }
+.skeleton-line.medium { width: 65%; }
+.skeleton-block { height: 64px; margin-bottom: 12px; }
+
+/* CTA pill — para empty states con acción */
+.cta-card {
+  background: var(--card);
+  border: 1px dashed var(--border-strong);
+  border-radius: 14px;
+  padding: 24px 16px;
+  text-align: center;
+  transition: border-color 0.18s ease, background-color 0.18s ease;
+}
+.cta-card .cta-icon { font-size: 36px; margin-bottom: 8px; opacity: 0.8; }
+.cta-card .cta-title { font-weight: 700; margin-bottom: 4px; color: var(--text-strong); }
+.cta-card .cta-desc { font-size: 13px; color: var(--muted); margin-bottom: 14px; }
+.cta-card .cta-actions { display: flex; gap: 8px; justify-content: center; flex-wrap: wrap; }
+
 /* === Misc === */
 .muted { color: var(--muted); }
 .positive { color: var(--green); }

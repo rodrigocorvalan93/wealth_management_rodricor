@@ -36,6 +36,7 @@ USO LOCAL:
 from __future__ import annotations
 
 import io
+import os
 import sqlite3
 import sys
 from datetime import date, datetime
@@ -70,6 +71,8 @@ from .state import (
     list_backups, prune_backups, reimport_excel,
     DEFAULT_USER_ID,
 )
+from . import credentials as creds
+from . import audit, ratelimit
 from .users import (
     load_users, resolve_user_by_token, get_active_user,
     admin_switch_to, admin_switch_clear, is_switched,
@@ -163,6 +166,71 @@ def create_app() -> Flask:
         g.is_admin = bool(actual_token_owner and actual_token_owner.is_admin)
         g.is_switched = switched
         g.user_token = token
+
+    @app.before_request
+    def _rate_limit():
+        """Rate limit simple por token. Mutations: 60/min. Reads: 240/min.
+        Sin token: 30/min por IP (anti-bruteforce de login).
+
+        Disable con WM_DISABLE_RATELIMIT=1 (útil en tests).
+        """
+        if os.environ.get("WM_DISABLE_RATELIMIT") == "1":
+            return
+        if not request.path.startswith("/api/"):
+            return
+        if request.method == "OPTIONS":
+            return
+        if request.path == "/api/health":
+            return
+        token = getattr(g, "user_token", None) or ""
+        ip = request.headers.get("X-Forwarded-For", request.remote_addr or "").split(",")[0].strip()
+        key = token if token else f"ip:{ip}"
+        is_mutation = request.method in ("POST", "PUT", "DELETE", "PATCH")
+        if not token:
+            limit, window = 30, 60   # anti-bruteforce
+            action = "anon"
+        elif is_mutation:
+            limit, window = 60, 60
+            action = "write"
+        else:
+            limit, window = 240, 60
+            action = "read"
+        ok, remaining = ratelimit.check(key, action, limit, window)
+        if not ok:
+            abort(429, f"Rate limit excedido ({limit} {action}/{window}s). "
+                       f"Esperá un momento.")
+
+    @app.after_request
+    def _audit_request(resp):
+        """Audit log para mutations. Best-effort, no rompe la response."""
+        try:
+            if (request.method in ("POST", "PUT", "DELETE", "PATCH")
+                    and request.path.startswith("/api/")
+                    and request.path != "/api/health"):
+                user_id = getattr(g, "active_user_id", None)
+                if user_id:
+                    body = None
+                    if request.is_json:
+                        try:
+                            body = request.get_json(silent=True)
+                        except Exception:
+                            body = None
+                    audit.log(user_id, {
+                        "ts": datetime.now().isoformat(timespec="seconds"),
+                        "ip": request.headers.get("X-Forwarded-For",
+                                                   request.remote_addr or ""),
+                        "user_id": user_id,
+                        "auth_user_id": (g.auth_user.user_id if g.auth_user
+                                          else None),
+                        "is_switched": bool(getattr(g, "is_switched", False)),
+                        "method": request.method,
+                        "path": request.path,
+                        "status": resp.status_code,
+                        "body_hash": audit.hash_body(body),
+                    })
+        except Exception as e:
+            print(f"[audit] WARN: {e}")
+        return resp
 
     def _require_auth():
         """Verifica que haya user resuelto en g."""
@@ -1649,6 +1717,200 @@ def create_app() -> Flask:
             f"os.environ['WM_USERS_JSON'] = '''{os.environ.get('WM_USERS_JSON', '{}')}'''\n"
             f"os.environ['WM_ADMIN_USER'] = '{os.environ.get('WM_ADMIN_USER', '')}'\n"
         )
+
+    # =========================================================================
+    # Credenciales del user (BYMA, CAFCI, etc.) — encriptadas en disk
+    # =========================================================================
+
+    @app.get("/api/credentials")
+    def get_credentials_endpoint():
+        """Devuelve qué credenciales tiene seteadas el user (sin valores).
+
+        El response es {"fields": [...], "configured": {key: True}}.
+        Los valores secretos NUNCA se devuelven via API.
+        """
+        _require_auth(); _block_if_switched_mutation()
+        existing = creds.get_credentials(g.active_user_id)
+        return jsonify({
+            "fields": creds.list_supported_fields(),
+            "configured": {k: True for k, v in existing.items() if v},
+        })
+
+    @app.put("/api/credentials")
+    def update_credentials_endpoint():
+        """Actualiza credenciales. Body: {key: value, ...}.
+
+        - Pasar value="" o null borra esa credencial.
+        - Solo se aceptan keys de creds.CRED_FIELDS.
+        """
+        _require_auth(); _block_if_switched_mutation()
+        body = request.get_json(silent=True) or {}
+        if not isinstance(body, dict):
+            abort(400, "Body debe ser JSON object")
+        result = creds.set_credentials(g.active_user_id, body)
+        return jsonify({"updated": True, "configured": result})
+
+    @app.delete("/api/credentials")
+    def delete_credentials_endpoint():
+        """Borra TODAS las credenciales del user."""
+        _require_auth(); _block_if_switched_mutation()
+        ok = creds.delete_credentials(g.active_user_id)
+        return jsonify({"deleted": ok})
+
+    # =========================================================================
+    # Loaders (precios) — disparables desde la app, usando credenciales del user
+    # =========================================================================
+
+    @app.post("/api/loaders/byma")
+    def loader_byma_endpoint():
+        """Corre el byma_loader.run() con las credenciales del user.
+
+        Body opcional:
+          {"tickers": ["AL30D","GD30D"]}   — override de tickers a pedir.
+                                              Default: tickers_byma.txt si existe.
+
+        El CSV resultante se escribe en data/precios_historico.csv (compartido).
+        Después se hace re-import del Excel del user para que tome los precios
+        nuevos.
+        """
+        _require_auth(); _block_if_switched_mutation()
+        c = creds.get_credentials(g.active_user_id)
+        if not c.get("byma_user") or not c.get("byma_pass"):
+            abort(400, "Faltan credenciales BYMA. Cargalas en /settings.")
+
+        # Override de la URL si la pusieron en credenciales
+        if c.get("byma_api_url"):
+            os.environ["BYMA_API_URL"] = c["byma_api_url"]
+
+        body = request.get_json(silent=True) or {}
+        tickers = body.get("tickers")
+        if not tickers:
+            tf = Path(__file__).resolve().parent.parent / "tickers_byma.txt"
+            if tf.is_file():
+                from byma_loader import parse_tickers_file
+                try:
+                    tickers = parse_tickers_file(tf)
+                except Exception as e:
+                    abort(400, f"No pude leer tickers_byma.txt: {e}")
+        if not tickers:
+            abort(400, "Lista de tickers vacía. Pasá 'tickers' en el body.")
+
+        s = get_settings()
+        try:
+            from byma_loader import run as byma_run
+            rc = byma_run(
+                tickers=tickers,
+                output_dir=s.data_dir,
+                username=c["byma_user"],
+                password=c["byma_pass"],
+            )
+        except Exception as e:
+            abort(500, f"BYMA loader falló: {type(e).__name__}: {e}")
+        if rc != 0:
+            abort(500, "BYMA loader devolvió error (revisá logs)")
+
+        # Re-importar para refrescar precios
+        with excel_write_lock():
+            stats = reimport_excel()
+        return jsonify({"loader_rc": rc, "n_tickers": len(tickers),
+                        "import_stats": stats})
+
+    # =========================================================================
+    # Audit log per-user (read-only)
+    # =========================================================================
+
+    @app.get("/api/audit-log")
+    def audit_log_endpoint():
+        """Devuelve las últimas 100 entradas del audit log del user."""
+        _require_auth()
+        try:
+            n = int(request.args.get("n", "100"))
+        except ValueError:
+            n = 100
+        n = max(1, min(n, 1000))
+        return jsonify({
+            "user_id": g.active_user_id,
+            "entries": audit.tail(g.active_user_id, n=n),
+        })
+
+    # =========================================================================
+    # Account self-service: export + delete (Ley 25.326 / GDPR-equivalent)
+    # =========================================================================
+
+    @app.get("/api/account/export")
+    def account_export_endpoint():
+        """Devuelve un ZIP con los datos del user:
+          - wealth_management.xlsx (Excel master)
+          - wealth.db              (DB sqlite derivada)
+          - audit.log              (log de mutations)
+          - credentials.enc        NO se incluye por seguridad (cliente las re-setea)
+
+        Útil para: backup local, migrar a otro deploy, cumplir derecho de
+        portabilidad (Ley 25.326).
+        """
+        _require_auth(); _block_if_switched_mutation()
+        import io as _io
+        import zipfile as _zip
+        s = get_settings()
+        buf = _io.BytesIO()
+        with _zip.ZipFile(buf, "w", _zip.ZIP_DEFLATED) as zf:
+            if s.xlsx_path.is_file():
+                zf.write(s.xlsx_path, "wealth_management.xlsx")
+            if s.db_path.is_file():
+                zf.write(s.db_path, "wealth.db")
+            audit_path = s.user_data_dir / "audit.log"
+            if audit_path.is_file():
+                zf.write(audit_path, "audit.log")
+            # README explicativo
+            zf.writestr(
+                "README.txt",
+                "Export de tu cuenta WM Wealth Management.\n"
+                f"User ID: {g.active_user_id}\n"
+                f"Generado: {datetime.now().isoformat()}\n\n"
+                "Archivos:\n"
+                "  wealth_management.xlsx  — tus inputs (cuentas, trades, gastos, ...)\n"
+                "  wealth.db               — vista derivada en sqlite\n"
+                "  audit.log               — log de mutations vía API\n\n"
+                "NO se incluye credentials.enc por seguridad.\n",
+            )
+        buf.seek(0)
+        from flask import Response as _Resp
+        fname = f"wm-export-{g.active_user_id}-{date.today().isoformat()}.zip"
+        return _Resp(
+            buf.read(), mimetype="application/zip",
+            headers={"Content-Disposition": f'attachment; filename="{fname}"'},
+        )
+
+    @app.delete("/api/account")
+    def account_delete_endpoint():
+        """Borra TODOS los datos del user actual (excepto la entrada de
+        users.json — eso lo maneja el admin si quiere reusar el user_id).
+
+        Requiere header `X-Confirm-Delete: yes` para evitar accidentes.
+        Borra: xlsx, db, backups, credentials.enc, audit.log.
+        """
+        _require_auth(); _block_if_switched_mutation()
+        if request.headers.get("X-Confirm-Delete") != "yes":
+            abort(400, "Falta header X-Confirm-Delete: yes")
+        import shutil as _sh
+        s = get_settings()
+        deleted = []
+        for path in (s.xlsx_path, s.db_path,
+                     s.user_data_dir / "credentials.enc",
+                     s.user_data_dir / "audit.log"):
+            try:
+                if path.is_file():
+                    path.unlink(); deleted.append(str(path.name))
+            except OSError:
+                pass
+        try:
+            if s.backups_dir.is_dir():
+                _sh.rmtree(s.backups_dir); deleted.append("excel_backups/")
+        except OSError:
+            pass
+        return jsonify({"deleted": deleted, "user_id": g.active_user_id,
+                        "warning": "Tu user sigue existiendo. Pedile al admin"
+                                    " que lo elimine para liberar el user_id."})
 
     # =========================================================================
     # Reports

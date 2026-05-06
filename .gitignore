@@ -3,12 +3,17 @@ secrets.txt
 .env
 .env.local
 users.json
+.encryption_key
+credentials.enc
+*.encryption_key
 
 # Datos generados (privados)
 data/
 *.csv
 *.xlsx
 *.xls
+audit.log
+audit.log.*
 
 # Python
 __pycache__/
