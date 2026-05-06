@@ -399,15 +399,20 @@
           <div class="cta-icon">📂</div>
           <div class="cta-title">Tu portfolio todavía está vacío</div>
           <div class="cta-desc">
-            Te creo un Excel master en blanco para que arranques.
-            Después podés cargar cuentas, importar tenencias del broker
-            y subir tus trades.
+            Empezá de cero o subí un Excel master que ya tengas
+            (de un backup o de otra instalación).
           </div>
           <div class="cta-actions">
             <button class="btn primary" data-onclick="bootstrapMaster">
-              ✨ Crear mi portfolio
+              ✨ Crear desde cero
+            </button>
+            <button class="btn ghost"
+                    onclick="document.getElementById('xlsxUploadCta').click();">
+              ⬆ Subir un Excel viejo
             </button>
           </div>
+          <input type="file" id="xlsxUploadCta" accept=".xlsx,.xls"
+                 style="display:none" onchange="window.uploadInitialExcel(event);">
         </div>
       ` : `<div class="empty"><div class="icon">⚠️</div><div>${escapeHtml(msg)}</div></div>`;
       attachListeners(root);
@@ -4170,7 +4175,13 @@ python yfinance_loader.py</pre>
           <button class="btn primary full" data-onclick="refreshAll" style="margin-bottom:8px">⟳ Refrescar DB desde Excel</button>
           <a class="btn ghost full" href="${API.base}/api/download/excel"
              style="margin-bottom:8px"
-             onclick="event.preventDefault(); downloadExcel();">⬇ Descargar Excel</a>
+             onclick="event.preventDefault(); downloadExcel();">⬇ Descargar Excel master</a>
+          <button class="btn ghost full" style="margin-bottom:8px"
+                  onclick="document.getElementById('xlsxUploadSettings').click();">
+            ⬆ Subir / reemplazar Excel master
+          </button>
+          <input type="file" id="xlsxUploadSettings" accept=".xlsx,.xls"
+                 style="display:none" onchange="window.uploadInitialExcel(event);">
           <a class="btn ghost full" href="#/setup" style="margin-bottom:8px">🎉 Wizard inicial</a>
           <a class="btn ghost full" href="#/welcome" style="margin-bottom:8px">🚀 Onboarding paso a paso</a>
           <a class="btn ghost full" href="#/help" style="margin-bottom:8px">❓ Ayuda y manualcitos</a>
