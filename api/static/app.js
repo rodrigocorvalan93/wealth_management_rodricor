@@ -391,7 +391,26 @@
       attachListeners(root);
       updateNav();
     } catch (e) {
-      root.innerHTML = `<div class="empty"><div class="icon">⚠️</div><div>${escapeHtml(e.message)}</div></div>`;
+      const msg = String(e.message || "");
+      // Detectar el caso "Excel master no presente" y ofrecer bootstrap
+      const isMissingMaster = /master no presente|no hay excel master/i.test(msg);
+      root.innerHTML = isMissingMaster ? `
+        <div class="cta-card" style="margin: 20px 16px;">
+          <div class="cta-icon">📂</div>
+          <div class="cta-title">Tu portfolio todavía está vacío</div>
+          <div class="cta-desc">
+            Te creo un Excel master en blanco para que arranques.
+            Después podés cargar cuentas, importar tenencias del broker
+            y subir tus trades.
+          </div>
+          <div class="cta-actions">
+            <button class="btn primary" data-onclick="bootstrapMaster">
+              ✨ Crear mi portfolio
+            </button>
+          </div>
+        </div>
+      ` : `<div class="empty"><div class="icon">⚠️</div><div>${escapeHtml(msg)}</div></div>`;
+      attachListeners(root);
     }
   }
 
@@ -810,6 +829,22 @@
       } catch (e) { toast(e.message, "error"); }
     },
 
+    async bootstrapMaster() {
+      try {
+        toast("Creando tu portfolio...", "info");
+        const r = await API.req("/api/account/bootstrap", { method: "POST" });
+        if (r.already) {
+          toast("Ya tenías master — refrescando", "info");
+        } else {
+          toast("✓ Portfolio creado. Empezá cargando cuentas.", "success");
+        }
+        invalidateMeta();
+        API._bustCache();
+        navigate("/welcome");
+      } catch (e) {
+        toast(`Error: ${e.message}`, "error");
+      }
+    },
     async refreshAll() {
       try {
         toast("Refrescando...", "info");

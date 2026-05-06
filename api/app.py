@@ -1816,6 +1816,42 @@ def create_app() -> Flask:
                                 ip=ctx["ip"], user_agent=ctx["user_agent"])
         except auth_mod.AuthError as e:
             return _auth_err_response(e)
+
+        # Bootstrap del Excel master para el user nuevo. Sin esto, todas
+        # las páginas tiran "Excel master no presente". Mismo flow que
+        # /api/admin/users: build_master + add_carga_inicial + blank
+        # event sheets + auto-import.
+        bootstrap_warnings = []
+        try:
+            new_settings = get_user_settings(r.user_id)
+            new_settings.inputs_dir.mkdir(parents=True, exist_ok=True)
+            new_settings.user_data_dir.mkdir(parents=True, exist_ok=True)
+            new_settings.backups_dir.mkdir(parents=True, exist_ok=True)
+            if not new_settings.xlsx_path.is_file():
+                from build_master import build_master
+                try:
+                    from add_carga_inicial_sheet import add_carga_inicial_sheet
+                except ImportError:
+                    add_carga_inicial_sheet = None
+                build_master(new_settings.xlsx_path)
+                if add_carga_inicial_sheet:
+                    add_carga_inicial_sheet(new_settings.xlsx_path)
+                _blank_event_sheets(new_settings.xlsx_path)
+                # Auto-import para crear la DB
+                try:
+                    reimport_excel(settings=new_settings)
+                except Exception as e:
+                    bootstrap_warnings.append(
+                        f"Auto-import falló: {e}. Hacé refresh manual."
+                    )
+        except Exception as e:
+            print(f"[signup] WARN bootstrap del master falló para "
+                  f"{r.user_id}: {e}")
+            bootstrap_warnings.append(
+                f"No pude crear el Excel master automáticamente: {e}. "
+                f"Subí uno manualmente desde Settings."
+            )
+
         # En modo dev sin SMTP, devolver el verify token para que el user
         # pueda verificarse sin email funcional.
         dev_token = r.verify_token_plain if (
@@ -1831,6 +1867,7 @@ def create_app() -> Flask:
             "verify_email_sent_via": r.verify_email_via,
             "verify_token_dev": dev_token,
             "needs_verification": r.verify_token_plain is not None,
+            "bootstrap_warnings": bootstrap_warnings,
         }), 201
 
     @app.post("/api/auth/login")
@@ -2419,6 +2456,46 @@ def create_app() -> Flask:
             buf.read(), mimetype="application/zip",
             headers={"Content-Disposition": f'attachment; filename="{fname}"'},
         )
+
+    @app.post("/api/account/bootstrap")
+    def account_bootstrap_endpoint():
+        """Crea el Excel master inicial para el user actual si no existe.
+
+        Útil para users registrados antes de que el signup hiciera
+        bootstrap automático. Idempotente: si el Excel ya existe, no
+        toca nada y devuelve already=True.
+        """
+        _require_auth(); _block_if_switched_mutation()
+        s = get_settings()
+        if s.xlsx_path.is_file():
+            return jsonify({"already": True, "xlsx_path": str(s.xlsx_path)})
+        s.inputs_dir.mkdir(parents=True, exist_ok=True)
+        s.user_data_dir.mkdir(parents=True, exist_ok=True)
+        s.backups_dir.mkdir(parents=True, exist_ok=True)
+        warnings = []
+        try:
+            from build_master import build_master
+            try:
+                from add_carga_inicial_sheet import add_carga_inicial_sheet
+            except ImportError:
+                add_carga_inicial_sheet = None
+            build_master(s.xlsx_path)
+            if add_carga_inicial_sheet:
+                add_carga_inicial_sheet(s.xlsx_path)
+            _blank_event_sheets(s.xlsx_path)
+            try:
+                stats = reimport_excel()
+            except Exception as e:
+                warnings.append(f"Auto-import falló: {e}")
+                stats = None
+        except Exception as e:
+            abort(500, f"No pude generar el master: {type(e).__name__}: {e}")
+        return jsonify({
+            "ok": True,
+            "xlsx_path": str(s.xlsx_path),
+            "import_stats": stats,
+            "warnings": warnings,
+        })
 
     @app.delete("/api/account")
     def account_delete_endpoint():
