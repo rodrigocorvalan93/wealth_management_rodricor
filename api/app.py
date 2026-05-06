@@ -2122,6 +2122,239 @@ def create_app() -> Flask:
                         "import_stats": stats})
 
     # =========================================================================
+    # Auto-import de tenencias desde brokers (Cocos / Binance / IBKR)
+    # =========================================================================
+
+    @app.get("/api/import/brokers")
+    def import_list_brokers():
+        """Devuelve los brokers soportados + qué credenciales tiene el user."""
+        _require_auth()
+        from engine import brokers
+        brokers_meta = brokers.list_brokers()
+        configured = creds.get_credentials(g.active_user_id)
+        for b in brokers_meta:
+            b["ready"] = all(configured.get(k) for k in b["needs"])
+        return jsonify({"brokers": brokers_meta})
+
+    @app.post("/api/import/<broker>/test")
+    def import_test_credentials(broker):
+        """Hace un ping a las credenciales del broker para validarlas
+        SIN bajar todo el historial. Útil para feedback rápido al user."""
+        _require_auth(); _block_if_switched_mutation()
+        from engine import brokers
+        mod = brokers.get(broker)
+        if mod is None:
+            abort(404, f"Broker '{broker}' no soportado")
+        c = creds.get_credentials(g.active_user_id)
+        # Algunos brokers exponen test_credentials, otros no
+        test_fn = getattr(mod, "test_credentials", None)
+        if test_fn is None:
+            # Fallback: hacer fetch_positions y reportar
+            try:
+                r = mod.fetch_positions(c)
+                return jsonify({"ok": True, "n_positions": len(r["positions"])})
+            except Exception as e:
+                return jsonify({"ok": False,
+                                 "error": f"{type(e).__name__}: {e}"}), 200
+        return jsonify(test_fn(c))
+
+    @app.post("/api/import/<broker>/preview")
+    def import_preview(broker):
+        """Trae las posiciones del broker y las devuelve SIN escribir nada.
+
+        Body opcional:
+          {"match_assets": true}  → si True, marca cuáles tickers ya
+                                    existen en `especies` del Excel
+                                    para que la UI los pueda diferenciar
+                                    de los nuevos.
+        """
+        _require_auth(); _block_if_switched_mutation()
+        from engine import brokers
+        mod = brokers.get(broker)
+        if mod is None:
+            abort(404, f"Broker '{broker}' no soportado")
+        c = creds.get_credentials(g.active_user_id)
+        try:
+            result = mod.fetch_positions(c)
+        except (ValueError, PermissionError) as e:
+            abort(400, str(e))
+        except Exception as e:
+            abort(502, f"Error del broker: {type(e).__name__}: {e}")
+
+        # Match contra `especies` para flagear assets desconocidos
+        s = get_settings()
+        existing_tickers = set()
+        existing_currencies = set()
+        try:
+            from .excel_io import list_rows
+            for row in list_rows(s.xlsx_path, "especies"):
+                t = row.get("Ticker")
+                if t:
+                    existing_tickers.add(str(t).strip())
+            for row in list_rows(s.xlsx_path, "monedas"):
+                code = row.get("Code")
+                if code:
+                    existing_currencies.add(str(code).strip())
+        except Exception:
+            pass
+        for p in result["positions"]:
+            t = p["ticker"]
+            if p["is_cash"]:
+                p["known"] = t in existing_currencies
+            else:
+                p["known"] = t in existing_tickers
+        return jsonify(result)
+
+    @app.post("/api/import/<broker>/apply")
+    def import_apply(broker):
+        """Aplica una preview al Excel master.
+
+        Body:
+          {
+            "account": "cocos",                     # cuenta destino (debe existir)
+            "fecha": "2026-05-06",                   # fecha del saldo inicial (default hoy)
+            "positions": [                           # subset que el user confirmó
+              {"ticker":"AL30D","qty":1000,"avg_price":65.5,"currency":"USB",
+               "asset_class":"BOND_AR","name":"Bonar 2030",
+               "is_cash":false,"register_asset":true},
+              ...
+            ],
+            "create_missing_assets": true            # crear assets nuevos en `especies`
+          }
+
+        Crea filas en la hoja `_carga_inicial` del Excel master (que
+        el motor procesa via cli.cargar_iniciales para generar asientos
+        de OPENING_BALANCE). Devuelve cuántas filas escribió.
+        """
+        _require_auth(); _block_if_switched_mutation()
+        body = request.get_json(silent=True) or {}
+        account = (body.get("account") or "").strip()
+        fecha = body.get("fecha") or date.today().isoformat()
+        positions = body.get("positions") or []
+        create_missing = bool(body.get("create_missing_assets", True))
+        if not account or not positions:
+            abort(400, "account y positions son requeridos")
+
+        s = get_settings()
+        if not s.xlsx_path.is_file():
+            abort(400, "No hay Excel master cargado todavía")
+
+        from .excel_io import list_rows, append_row
+        # Validar cuenta existe
+        accounts = {r.get("Code"): r
+                     for r in list_rows(s.xlsx_path, "cuentas")
+                     if r.get("Code")}
+        if account not in accounts:
+            abort(400, f"Cuenta '{account}' no existe en `cuentas`")
+
+        # Assets / monedas existentes
+        existing_assets = {r.get("Ticker"): r
+                            for r in list_rows(s.xlsx_path, "especies")
+                            if r.get("Ticker")}
+        existing_ccy = set(r.get("Code") for r in list_rows(s.xlsx_path, "monedas")
+                            if r.get("Code"))
+
+        with excel_write_lock():
+            backup_excel()
+            n_assets = 0
+            n_initial = 0
+            warnings = []
+            for p in positions:
+                ticker = (p.get("ticker") or "").strip()
+                qty = float(p.get("qty") or 0)
+                ccy = (p.get("currency") or "ARS").strip().upper()
+                avg = p.get("avg_price")
+                is_cash = bool(p.get("is_cash"))
+                cls = p.get("asset_class") or "OTHER"
+                name = p.get("name") or ticker
+
+                if not ticker or abs(qty) < 1e-9:
+                    continue
+
+                # Crear asset si no existe (solo no-cash)
+                if not is_cash and ticker not in existing_assets:
+                    if create_missing:
+                        try:
+                            append_row(s.xlsx_path, "especies", {
+                                "Ticker": ticker,
+                                "Name": name or ticker,
+                                "Asset Class": cls,
+                                "Currency": ccy,
+                                "Notes": f"Auto-importado de {broker}",
+                            })
+                            existing_assets[ticker] = True
+                            n_assets += 1
+                        except Exception as e:
+                            warnings.append(
+                                f"No pude crear asset {ticker}: {e}"
+                            )
+                            continue
+                    else:
+                        warnings.append(
+                            f"Asset {ticker} no existe — skipped"
+                        )
+                        continue
+
+                # Cash: validar que la moneda exista
+                if is_cash and ticker not in existing_ccy:
+                    warnings.append(
+                        f"Moneda {ticker} no existe en `monedas` — skipped"
+                    )
+                    continue
+
+                # Append a `_carga_inicial`. La hoja tiene columnas:
+                #   Fecha | Cuenta | Activo | Qty | Unit Price | Currency | Notes
+                try:
+                    payload = {
+                        "Fecha": fecha,
+                        "Cuenta": account,
+                        "Activo": ticker,
+                        "Qty": qty,
+                        "Unit Price": avg if avg else (1.0 if is_cash else None),
+                        "Price Currency": ccy,
+                        "Description": (f"Saldo inicial {ticker} "
+                                         f"(auto-import {broker})"),
+                    }
+                    # _carga_inicial puede no estar en ALLOWED_SHEETS;
+                    # escribimos directo al workbook si hace falta.
+                    try:
+                        append_row(s.xlsx_path, "_carga_inicial", payload)
+                    except Exception:
+                        # Fallback: escribir en asientos_contables como
+                        # OPENING_BALANCE (compat con el flow viejo).
+                        from openpyxl import load_workbook
+                        wb = load_workbook(filename=str(s.xlsx_path))
+                        if "_carga_inicial" in wb.sheetnames:
+                            ws = wb["_carga_inicial"]
+                            ws.append([
+                                fecha, account, ticker, qty,
+                                avg if avg else (1.0 if is_cash else None),
+                                ccy, payload["Description"],
+                            ])
+                            wb.save(str(s.xlsx_path))
+                        else:
+                            raise
+                    n_initial += 1
+                except Exception as e:
+                    warnings.append(f"No pude escribir saldo {ticker}: {e}")
+                    continue
+
+            # Re-importar para que el motor procese la carga inicial
+            stats = reimport_excel()
+            prune_backups(keep_last=50)
+
+        return jsonify({
+            "ok": True,
+            "broker": broker,
+            "account": account,
+            "fecha": fecha,
+            "n_assets_created": n_assets,
+            "n_positions_written": n_initial,
+            "warnings": warnings,
+            "import_stats": stats,
+        })
+
+    # =========================================================================
     # Audit log per-user (read-only)
     # =========================================================================
 

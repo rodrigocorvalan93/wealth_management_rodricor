@@ -854,6 +854,61 @@
         toast(`Error: ${e.message}`, "error");
       }
     },
+    async testBroker(brokerId) {
+      try {
+        toast(`Probando ${brokerId}...`, "info");
+        const r = await API.req(`/api/import/${brokerId}/test`,
+                                  { method: "POST" });
+        if (r.ok === false) {
+          toast(`✗ ${r.error || 'Falló'}`, "error");
+        } else {
+          const detail = r.n_positions != null
+            ? `${r.n_positions} posiciones detectadas`
+            : (r.account_type || "OK");
+          toast(`✓ ${brokerId}: ${detail}`, "success");
+        }
+      } catch (e) { toast(e.message, "error"); }
+    },
+    async applyImport(_data, form) {
+      const fd = new FormData(form);
+      const broker = fd.get("broker");
+      const account = fd.get("account");
+      const fecha = fd.get("fecha");
+      const create_missing = fd.get("create_missing_assets") === "on";
+      const checked = form.querySelectorAll("input[name=imp]:checked");
+      const positions = [];
+      for (const cb of checked) {
+        const i = cb.value;
+        const dataInput = form.querySelector(`input[name="data_${i}"]`);
+        if (!dataInput) continue;
+        try {
+          positions.push(JSON.parse(dataInput.value));
+        } catch (_) {}
+      }
+      if (positions.length === 0) {
+        toast("Seleccioná al menos una posición", "error"); return;
+      }
+      try {
+        toast(`Importando ${positions.length} posiciones...`, "info");
+        const r = await API.req(`/api/import/${broker}/apply`, {
+          method: "POST",
+          json: { account, fecha, positions,
+                  create_missing_assets: create_missing },
+        });
+        let msg = `✓ ${r.n_positions_written} posiciones importadas`;
+        if (r.n_assets_created) msg += `, ${r.n_assets_created} assets creados`;
+        toast(msg, "success");
+        if ((r.warnings || []).length > 0) {
+          setTimeout(() => toast(
+            `${r.warnings.length} warnings — revisá audit log`, "info"
+          ), 1500);
+        }
+        invalidateMeta();
+        navigate("/");
+      } catch (e) {
+        toast(e.message, "error");
+      }
+    },
     async runByma() {
       try {
         toast("Bajando precios BYMA... (puede tardar 10-20s)", "info");
@@ -4063,9 +4118,12 @@ python yfinance_loader.py</pre>
         ` : ""}
 
         <section>
-          <h2>🔐 Credenciales del broker</h2>
+          <h2>🔐 Brokers y credenciales</h2>
           <a href="#/credentials" class="btn ghost full" style="margin-bottom:8px">
-            🔑 Configurar BYMA / CAFCI
+            🔑 Configurar credenciales (BYMA, Binance, IBKR, CAFCI)
+          </a>
+          <a href="#/import" class="btn primary full" style="margin-bottom:8px">
+            📥 Auto-importar tenencias
           </a>
           <button class="btn ghost full" data-onclick="runByma" style="margin-bottom:8px">
             🔄 Refrescar precios BYMA
@@ -4332,6 +4390,187 @@ python yfinance_loader.py</pre>
   });
 
   // ====================================================================
+  // /import — Auto-import de tenencias desde brokers
+  // ====================================================================
+  route("/import", async () => {
+    let data;
+    try { data = await API.req("/api/import/brokers", { noCache: true }); }
+    catch (e) {
+      return `${headerWithBack("📥 Auto-import", "/settings")}
+        <main><div class="card">${escapeHtml(e.message)}</div></main>`;
+    }
+    const brokers = data.brokers || [];
+    return `
+      ${headerWithBack("📥 Auto-import", "/settings")}
+      <main>
+        <section>
+          <div class="card compact muted" style="font-size:13px;">
+            Conectá tu broker para importar tus tenencias automáticamente.
+            Las credenciales se guardan encriptadas y son <b>read-only</b> —
+            esta app NUNCA opera por vos. Si el broker pide permisos,
+            elegí solo "Reading"/"View".
+          </div>
+        </section>
+        <section>
+          <h2>Brokers disponibles</h2>
+          ${brokers.map(b => `
+            <div class="card" style="margin-bottom:12px;">
+              <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px;">
+                <div>
+                  <div style="font-weight:700; font-size:16px;">
+                    ${b.icon} ${escapeHtml(b.name)}
+                  </div>
+                  <div class="muted" style="font-size:12px;">
+                    ${b.ready
+                      ? '<span class="tag success">credenciales listas</span>'
+                      : '<span class="tag warn">faltan credenciales</span>'}
+                  </div>
+                </div>
+                <div style="display:flex; gap:6px;">
+                  ${b.ready ? `
+                    <button class="btn ghost" data-onclick="testBroker"
+                            data-arg="${escapeHtml(b.id)}"
+                            style="padding:6px 10px; font-size:12px;">
+                      Probar
+                    </button>
+                    <a class="btn primary" href="#/import/${escapeHtml(b.id)}"
+                       style="padding:6px 14px; font-size:13px;">
+                      Importar →
+                    </a>
+                  ` : `
+                    <a class="btn primary" href="#/credentials"
+                       style="padding:6px 14px; font-size:13px;">
+                      Configurar
+                    </a>
+                  `}
+                </div>
+              </div>
+              <div class="muted" style="font-size:12px; line-height:1.4;">
+                ${escapeHtml(b.help)}
+              </div>
+            </div>
+          `).join("")}
+        </section>
+      </main>
+      ${bottomNav("/settings")}
+    `;
+  });
+
+  // ====================================================================
+  // /import/:broker — Preview + apply de un broker específico
+  // ====================================================================
+  route("/import/:broker", async ({ broker }) => {
+    let preview, meta;
+    try {
+      [preview, meta] = await Promise.all([
+        API.req(`/api/import/${broker}/preview`, { method: "POST", json: {} }),
+        loadMeta(),
+      ]);
+    } catch (e) {
+      return `${headerWithBack("📥 Importar", "/import")}
+        <main>
+          <div class="card">
+            <div style="font-weight:700; margin-bottom:8px;">No pude bajar las posiciones.</div>
+            <div class="muted" style="font-size:13px;">${escapeHtml(e.message)}</div>
+            <a href="#/credentials" class="btn ghost full" style="margin-top:12px;">Revisar credenciales</a>
+          </div>
+        </main>`;
+    }
+    const positions = preview.positions || [];
+    const asOf = preview.as_of || "";
+    const accounts = meta.accounts || [];
+
+    return `
+      ${headerWithBack(`📥 Importar de ${escapeHtml(broker)}`, "/import")}
+      <main>
+        <section>
+          <div class="card compact" style="margin-bottom:8px;">
+            <div style="display:flex; justify-content:space-between;">
+              <div>
+                <b>${positions.length}</b> posiciones · al <b>${escapeHtml(asOf)}</b>
+              </div>
+              <button class="btn ghost" onclick="document.querySelectorAll('input[name=imp]').forEach(c => c.checked = !c.checked)"
+                      style="padding:4px 10px; font-size:11px;">Toggle todos</button>
+            </div>
+            ${(preview.warnings || []).length > 0 ? `
+              <div class="muted" style="font-size:12px; margin-top:6px;">
+                ⚠ ${preview.warnings.map(escapeHtml).join("; ")}
+              </div>
+            ` : ""}
+          </div>
+        </section>
+
+        <form data-action="applyImport" id="import-form">
+          <input type="hidden" name="broker" value="${escapeHtml(broker)}">
+
+          <section>
+            <h2>Configuración</h2>
+            <div class="field">
+              <label>Cuenta destino *</label>
+              <select name="account" required>
+                ${accounts.map(a =>
+                  `<option value="${escapeHtml(a)}">${escapeHtml(a)}</option>`
+                ).join("")}
+              </select>
+            </div>
+            <div class="field">
+              <label>Fecha del saldo</label>
+              <input type="date" name="fecha" value="${fmt.today()}">
+            </div>
+            <div class="field" style="display:flex; align-items:center; gap:8px;">
+              <input type="checkbox" name="create_missing_assets" id="create-missing" checked
+                     style="width:auto;">
+              <label for="create-missing" style="margin:0;">
+                Crear assets nuevos automáticamente en <code>especies</code>
+              </label>
+            </div>
+          </section>
+
+          <section>
+            <h2>Posiciones a importar</h2>
+            <div class="list">
+              ${positions.length === 0 ? `<div class="card muted">Sin posiciones.</div>` :
+                positions.map((p, i) => `
+                <label class="list-item" style="cursor:pointer; align-items:flex-start;">
+                  <input type="checkbox" name="imp" value="${i}" checked
+                         style="width:auto; margin-right:8px; margin-top:4px;">
+                  <div class="meta" style="flex:1;">
+                    <div class="meta-line1">
+                      ${tickerHtml(p.ticker, p.asset_class)}
+                      ${p.is_cash ? '<span class="tag" style="font-size:9px;">cash</span>' : ''}
+                      ${p.known === false ? '<span class="tag warn" style="font-size:9px;">nuevo</span>' :
+                        p.known === true ? '<span class="tag success" style="font-size:9px;">existe</span>' : ''}
+                    </div>
+                    <div class="meta-line2 muted" style="font-size:11px;">
+                      ${escapeHtml(p.name || '')} · ${escapeHtml(p.asset_class)}
+                      ${p.avg_price != null ? '· avg ' + fmt.money(p.avg_price, 4) : ''}
+                    </div>
+                  </div>
+                  <div class="right">
+                    <div class="amount tabular">${fmt.money(p.qty, 6)}</div>
+                    <div class="sub muted">${escapeHtml(p.currency)}</div>
+                  </div>
+                  <input type="hidden" name="data_${i}"
+                         value='${escapeHtml(JSON.stringify(p))}'>
+                </label>
+              `).join("")}
+            </div>
+          </section>
+
+          ${positions.length > 0 ? `
+            <button type="submit" class="btn primary full" style="margin-top:14px;">
+              Importar seleccionadas
+            </button>
+            <div class="muted" style="font-size:12px; text-align:center; margin-top:8px;">
+              Se escribe al sheet <code>_carga_inicial</code> y se re-importa el master.
+            </div>
+          ` : ""}
+        </form>
+      </main>
+    `;
+  });
+
+  // ====================================================================
   // /credentials — Configurar credenciales BYMA / CAFCI
   // ====================================================================
   route("/credentials", async () => {
@@ -4575,9 +4814,9 @@ python yfinance_loader.py</pre>
             "Configurar", "#/credentials",
             hasBymaCreds)}
 
-          ${step(3, "Cargar tu primer trade o saldo inicial",
-            "Si ya tenías posiciones, agregalas como saldo inicial en la hoja '_carga_inicial' del Excel. Si arrancás de cero, cargá un trade.",
-            "Cargar trade", "#/trades/new",
+          ${step(3, "Cargar tus tenencias",
+            "Si ya tenías posiciones, podés <b>auto-importarlas</b> desde tu broker. Si arrancás de cero, cargá tu primer trade manualmente.",
+            "Auto-importar", "#/import",
             hasTrades)}
 
           ${step(4, "Refrescar precios y ver tu portfolio",

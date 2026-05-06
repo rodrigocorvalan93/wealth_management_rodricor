@@ -44,6 +44,8 @@ from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 CRED_FIELDS = (
     "byma_user", "byma_pass", "byma_api_url",
     "cafci_token",
+    "binance_api_key", "binance_api_secret",
+    "ibkr_flex_token", "ibkr_flex_query_id",
 )
 
 
@@ -206,5 +208,33 @@ def list_supported_fields() -> list[dict]:
             "type": "password",
             "secret": True,
             "help": "Token del API de CAFCI para precios de FCIs. Incluí 'Bearer ' al principio.",
+        },
+        {
+            "key": "binance_api_key",
+            "label": "Binance API key",
+            "type": "text",
+            "secret": False,
+            "help": "API key de Binance (read-only). Crealo en Account → API Management con permiso 'Enable Reading' SOLAMENTE — sin trading ni withdrawals.",
+        },
+        {
+            "key": "binance_api_secret",
+            "label": "Binance API secret",
+            "type": "password",
+            "secret": True,
+            "help": "Secret de Binance. Encriptado en disk.",
+        },
+        {
+            "key": "ibkr_flex_token",
+            "label": "IBKR Flex token",
+            "type": "password",
+            "secret": True,
+            "help": "Token de Flex Web Service de IBKR. Generalo en Reports → Settings → Flex Web Service. Es un read-only token (no permite trading).",
+        },
+        {
+            "key": "ibkr_flex_query_id",
+            "label": "IBKR Flex query ID",
+            "type": "text",
+            "secret": False,
+            "help": "ID numérico de tu Flex Query. Configurá una query con secciones 'Open Positions' y 'Trades' en IBKR → Reports → Flex Queries.",
         },
     ]
