@@ -39,24 +39,110 @@ DEFAULT_GET_URL = ("https://gdcdyn.interactivebrokers.com/"
                     "Universal/servlet/FlexStatementService.GetStatement")
 
 
+# Error codes documentados de IBKR Flex. Mapping → mensaje útil.
+# Source: IBKR Flex Web Service API Reference.
+_IBKR_ERROR_HINTS = {
+    "1003": ("Statement is not available. Verifica que tu Flex Query "
+              "esté guardada y configurada con el período correcto."),
+    "1004": "No records found for the specified period.",
+    "1005": "Service unavailable — re-intentá en unos minutos.",
+    "1006": ("Too many requests. IBKR limita los reportes por minuto; "
+              "esperá 1-2 minutos."),
+    "1007": "Statement could not be generated.",
+    "1008": "Statement still being processed (esperar y reintentar).",
+    "1009": "Statement could not be retrieved.",
+    "1010": ("Bad token: el token de Flex Web Service es inválido o "
+              "expiró (los tokens caducan al año). Generá uno nuevo en "
+              "IBKR → Settings → User Settings → Flex Web Service → "
+              "Token Configuration."),
+    "1011": ("Account is in 'simulated' mode — no se generan reports."),
+    "1012": ("Token expired. Generá uno nuevo en IBKR → Settings → "
+              "Flex Web Service."),
+    "1013": ("Invalid query ID. Verificá que el Query ID matchee con "
+              "una Flex Query existente en tu cuenta IBKR (Reports → "
+              "Flex Queries). El ID es un número de 6-9 dígitos."),
+    "1014": "User has too many requests in queue.",
+    "1015": "Statement is too large.",
+    "1016": "Account is restricted.",
+    "1017": "Statement contains no data.",
+    "1018": "API not enabled for this user.",
+    "1019": "Statement is being prepared (esperar).",
+    "1020": "Invalid IP address — verificá la IP whitelist en IBKR.",
+    "1021": "Reporting feature is not enabled for this account.",
+}
+
+
+def _parse_ibkr_error(text: str) -> tuple[str | None, str | None]:
+    """Devuelve (error_code, error_message) si el XML es un error response."""
+    try:
+        root = ET.fromstring(text)
+    except ET.ParseError:
+        return (None, None)
+    code = (root.findtext("ErrorCode") or "").strip()
+    msg = (root.findtext("ErrorMessage") or "").strip()
+    return (code or None, msg or None)
+
+
 def _request_report(token: str, query_id: str, timeout: int = 20) -> str:
-    """Inicia el flex report. Devuelve reference_code."""
+    """Inicia el flex report. Devuelve reference_code.
+
+    Lanza RuntimeError con mensaje contextual si falla.
+    """
     import requests
+    # Trim defensivo — copy-paste suele agregar whitespace
+    token = (token or "").strip()
+    query_id = (query_id or "").strip()
+    if not token or not query_id:
+        raise ValueError("token y query_id requeridos")
+    # Validación temprana de formato
+    if not query_id.isdigit():
+        raise ValueError(
+            f"Query ID '{query_id}' no es numérico. Tiene que ser un "
+            f"número de 6-9 dígitos (lo encontrás en Reports → Flex "
+            f"Queries en tu cuenta IBKR)."
+        )
+
     r = requests.get(
         SEND_URL,
         params={"t": token, "q": query_id, "v": "3"},
         timeout=timeout,
     )
     r.raise_for_status()
-    root = ET.fromstring(r.text)
+    code, msg = _parse_ibkr_error(r.text)
+    # Si llegó el ReferenceCode → OK
+    try:
+        root = ET.fromstring(r.text)
+    except ET.ParseError:
+        raise RuntimeError(
+            f"IBKR devolvió un response no-XML inesperado "
+            f"(primeros 200 chars: {r.text[:200]!r})"
+        )
     status = (root.findtext("Status") or "").strip()
-    if status != "Success":
-        msg = root.findtext("ErrorMessage") or root.findtext("ErrorCode") or "?"
-        raise RuntimeError(f"IBKR Flex SendRequest falló: {msg}")
-    ref = root.findtext("ReferenceCode")
-    if not ref:
-        raise RuntimeError("IBKR Flex no devolvió ReferenceCode")
-    return ref
+    if status == "Success":
+        ref = root.findtext("ReferenceCode")
+        if ref:
+            return ref
+        raise RuntimeError("IBKR Status=Success pero sin ReferenceCode")
+
+    # Status != Success → mapear el code a un mensaje útil
+    hint = _IBKR_ERROR_HINTS.get(code, "")
+    if not hint and msg:
+        hint = msg
+    detail = f"code={code}" if code else "sin código"
+    if msg:
+        detail += f", msg='{msg}'"
+    raise RuntimeError(
+        f"IBKR Flex SendRequest falló ({detail}).\n\n"
+        f"💡 {hint}\n\n"
+        f"Setup de IBKR Flex:\n"
+        f"  1. Reports → Flex Queries → New (Custom)\n"
+        f"  2. Sections: 'Open Positions' (mandatorio) + 'Trades' "
+        f"(opcional)\n"
+        f"  3. Format: XML, Period: 'Last Business Day' (o ajustá)\n"
+        f"  4. Save → guardá el Query ID (número de 6-9 dígitos)\n"
+        f"  5. Settings → User Settings → Flex Web Service → Generate "
+        f"Token (válido 1 año)\n"
+    )
 
 
 def _get_report(token: str, reference_code: str, max_attempts: int = 8,

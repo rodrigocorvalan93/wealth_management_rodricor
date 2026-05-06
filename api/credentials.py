@@ -135,6 +135,7 @@ def set_credentials(user_id: str, data: dict) -> dict:
 
     - Solo se persisten campos en CRED_FIELDS.
     - Pasar value=None o "" BORRA esa credencial.
+    - Trimea whitespace y CRLF para evitar errores de copy-paste.
     - Devuelve el dict final (con keys, sin valores) para confirmar.
     """
     current = get_credentials(user_id)
@@ -144,7 +145,10 @@ def set_credentials(user_id: str, data: dict) -> dict:
         if v is None or (isinstance(v, str) and not v.strip()):
             current.pop(k, None)
         else:
-            current[k] = str(v).strip()
+            # Trim whitespace + newlines (los password managers a veces
+            # los agregan al copiar) + saltos de linea internos en tokens
+            cleaned = str(v).strip().replace("\r", "").replace("\n", "")
+            current[k] = cleaned
 
     path = _cred_path(user_id)
     if current:
