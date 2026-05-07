@@ -1,24 +1,32 @@
 # fly.toml — deploy a Fly.io
 #
+# CONFIG ACTUAL: free tier (1 machine shared-cpu-1x, 256MB RAM, 1GB volume).
+# Costo real: ~$0.15/mes (solo el volumen). El compute entra dentro del
+# free allowance mientras la app esté pausada >50% del tiempo. La config
+# `auto_stop_machines = "stop"` la duerme cuando nadie la usa, así no
+# quemás horas de compute gratuitas.
+#
 # Setup (UNA SOLA VEZ):
 #   1) Instalar flyctl: https://fly.io/docs/hands-on/install-flyctl/
-#   2) fly auth signup        # o fly auth login si ya tenés cuenta
-#   3) fly launch --no-deploy --copy-config   # genera la app + region
-#   4) fly volumes create wm_data --size 1 --region eze    # 1GB en EZE (Bs As)
+#      Windows PowerShell: iwr https://fly.io/install.ps1 -useb | iex
+#   2) fly auth signup        # o fly auth login
+#   3) fly launch --no-deploy --copy-config
+#         → te pregunta nombre + region. Sugerencia: 'eze' (Buenos Aires).
+#   4) fly volumes create wm_data --size 1 --region eze
 #   5) fly secrets set \
 #        WM_BOOTSTRAP_SUPERADMIN_EMAIL=tu@email.com \
 #        WM_ENCRYPTION_KEY=$(python -c 'from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())') \
 #        WM_AUTO_VERIFY_FIRST_SUPERADMIN=1 \
-#        WM_APP_URL=https://wm-wealth-management.fly.dev
-#   6) (opcional SMTP) fly secrets set \
-#        WM_SMTP_HOST=smtp.gmail.com WM_SMTP_PORT=587 \
-#        WM_SMTP_USER=tu@email.com WM_SMTP_PASS=tu_app_password
-#   7) fly deploy
+#        WM_APP_URL=https://<NOMBRE_APP>.fly.dev
+#   6) fly deploy
 #
-# Costo: ~$2/mes con la config actual (1 shared CPU, 256MB, 1GB volumen).
+# Para ESCALAR si crece tu uso:
+#   fly scale memory 512                  # +RAM (~$1.50/mes extra)
+#   fly scale count 2                     # +1 machine (HA)
+#   fly volumes extend wm_data --size 5   # más disco
 
-app = "wm-wealth-management"   # cambiá esto al fly launch (debe ser único)
-primary_region = "eze"         # Buenos Aires. Otras: scl, gru, mia
+app = "wm-wealth-management"   # cambialo en fly launch (debe ser único global)
+primary_region = "eze"         # Buenos Aires. Otras: scl/gru/mia/iad
 kill_signal = "SIGINT"
 kill_timeout = 30
 
@@ -38,6 +46,10 @@ kill_timeout = 30
 [http_service]
   internal_port = 8000
   force_https = true
+  # Free tier sweet spot: la machine se DUERME cuando no hay tráfico
+  # (cold start de ~1s al primer hit, después instantáneo).
+  # Si te molesta el cold start, poné min_machines_running = 1 — paga
+  # ~$2-3/mes pero siempre lista.
   auto_stop_machines = "stop"
   auto_start_machines = true
   min_machines_running = 0
@@ -51,7 +63,8 @@ kill_timeout = 30
     path = "/api/health"
 
 [[vm]]
-  size = "shared-cpu-1x"
-  memory = "256mb"
+  size = "shared-cpu-1x"     # más chico que existe (free tier)
+  memory = "256mb"           # mínimo viable. Subí a 512mb si tira OOM.
   cpu_kind = "shared"
   cpus = 1
+

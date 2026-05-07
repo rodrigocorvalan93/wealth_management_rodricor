@@ -1,16 +1,22 @@
 # Deploy a producción
 
-3 caminos según presupuesto + control. **Recomiendo Render** (más simple).
+5 caminos según presupuesto + esfuerzo. **TLDR**: para cheapest+powerful,
+Hetzner CX22 ($5/mes con 4GB RAM). Para cero-mantenimiento, Render
+($7/mes). Para cero-costo, Oracle Always Free ($0/mes para siempre,
+más setup) o Fly.io free (~$0.15/mes).
 
-| Plataforma | Costo | Persistencia | HTTPS | Esfuerzo |
+| Plataforma | Costo/mes | Specs | Esfuerzo | Para |
 |---|---|---|---|---|
-| **Render.com** ⭐ | $7/mes (Starter) | sí (disco) | auto | 15 min |
-| **Fly.io** | ~$2/mes | sí (volumen) | auto | 30 min |
-| **PythonAnywhere** | gratis o $5/mes | sí | sí | 20 min |
+| **Oracle Always Free** | **$0** | 4 CPU + 24 GB RAM + 200 GB | alto | el más loco — gratis con specs server-grade. [Guía](deploy/ORACLE.md) |
+| **Fly.io free** | ~$0.15 | 256 MB + 1 GB | bajo | hobby / personal. La machine duerme cuando no la usás. |
+| **Hetzner CX22** ⭐ | **$5** | **2 CPU + 4 GB + 40 GB** | medio | mejor potencia/precio (8× Render specs). [Guía](deploy/HETZNER.md) |
+| **Render Starter** | $7 | 0.5 CPU + 512 MB + 1 GB | mínimo | si valorás cero-mantenimiento más que ahorro |
+| **PythonAnywhere** | gratis o $5 | limitado en free | medio | NO recomendado — free bloquea APIs externas |
 
-> **Nota**: La app guarda passwords + datos financieros — **siempre usá HTTPS**.
-> Render y Fly te lo dan automáticamente; en PA viene incluido en el dominio.
-> Si vas a un VPS (Hetzner / DigitalOcean), montá Caddy o Nginx + Let's Encrypt.
+> **Nota crítica**: La app guarda passwords + datos financieros —
+> **siempre usá HTTPS**. Render y Fly te lo dan automáticamente; PA
+> también; en VPS (Hetzner/Oracle) el script de install monta Caddy +
+> Let's Encrypt automático.
 
 ---
 
