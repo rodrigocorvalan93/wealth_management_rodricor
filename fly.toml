@@ -1,0 +1,57 @@
+# fly.toml — deploy a Fly.io
+#
+# Setup (UNA SOLA VEZ):
+#   1) Instalar flyctl: https://fly.io/docs/hands-on/install-flyctl/
+#   2) fly auth signup        # o fly auth login si ya tenés cuenta
+#   3) fly launch --no-deploy --copy-config   # genera la app + region
+#   4) fly volumes create wm_data --size 1 --region eze    # 1GB en EZE (Bs As)
+#   5) fly secrets set \
+#        WM_BOOTSTRAP_SUPERADMIN_EMAIL=tu@email.com \
+#        WM_ENCRYPTION_KEY=$(python -c 'from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())') \
+#        WM_AUTO_VERIFY_FIRST_SUPERADMIN=1 \
+#        WM_APP_URL=https://wm-wealth-management.fly.dev
+#   6) (opcional SMTP) fly secrets set \
+#        WM_SMTP_HOST=smtp.gmail.com WM_SMTP_PORT=587 \
+#        WM_SMTP_USER=tu@email.com WM_SMTP_PASS=tu_app_password
+#   7) fly deploy
+#
+# Costo: ~$2/mes con la config actual (1 shared CPU, 256MB, 1GB volumen).
+
+app = "wm-wealth-management"   # cambiá esto al fly launch (debe ser único)
+primary_region = "eze"         # Buenos Aires. Otras: scl, gru, mia
+kill_signal = "SIGINT"
+kill_timeout = 30
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  PORT = "8000"
+  WM_BASE_DIR = "/app"
+  WM_USERS_FILE = "/app/data/users.json"
+  WM_ANCHOR = "USD"
+
+[[mounts]]
+  source = "wm_data"
+  destination = "/app/data"
+
+[http_service]
+  internal_port = 8000
+  force_https = true
+  auto_stop_machines = "stop"
+  auto_start_machines = true
+  min_machines_running = 0
+  processes = ["app"]
+
+  [[http_service.checks]]
+    interval = "30s"
+    timeout = "5s"
+    grace_period = "10s"
+    method = "GET"
+    path = "/api/health"
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "256mb"
+  cpu_kind = "shared"
+  cpus = 1
