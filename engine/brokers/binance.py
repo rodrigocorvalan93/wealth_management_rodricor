@@ -34,6 +34,10 @@ BASE_URL = "https://api.binance.com"
 # Lista corta de stablecoins comunes (en mayúsculas, base symbol)
 _STABLES = {"USDT", "USDC", "BUSD", "DAI", "TUSD", "USDP", "FDUSD"}
 
+# Fiats que Binance soporta (cuando comprás cripto con tarjeta o haces P2P)
+_FIATS = {"ARS", "USD", "EUR", "BRL", "GBP", "RUB", "TRY", "MXN", "COP",
+          "CLP", "PEN", "UYU", "BOB", "PYG"}
+
 
 def _sign(secret: str, query: str) -> str:
     return hmac.new(
@@ -101,17 +105,31 @@ def fetch_positions(creds: dict) -> dict:
             continue
 
         is_stable = sym in _STABLES
-        is_cash = is_stable  # los stablecoins funcionan como cash USD para el ledger
-        # Currency nativa: para stablecoins, USDT/USDC son su propia "moneda"
-        # (en el motor están registradas como currencies). Para BTC/ETH la
-        # moneda nativa es el propio asset.
+        is_fiat = sym in _FIATS
+        # is_cash sugerido: stablecoins + fiats. El endpoint apply lo
+        # puede sobrescribir según lo que el user tenga en sus monedas.
+        is_cash = is_stable or is_fiat
+        # asset_class:
+        #   FIAT      -> CASH (saldo en moneda fiat, ej ARS, USD, BRL)
+        #   STABLE    -> STABLECOIN (USDT, USDC, ...)
+        #   resto     -> CRYPTO (BTC, ETH, SOL, ...)
+        if is_fiat:
+            cls = "CASH"
+        elif is_stable:
+            cls = "STABLECOIN"
+        else:
+            cls = "CRYPTO"
+        # Currency natural del asset:
+        #   - stables/fiats: ellos mismos (son la currency)
+        #   - crypto: USD (binance cotiza en USD aunque podés tradear contra USDT)
+        natural_ccy = sym if (is_stable or is_fiat) else "USD"
         positions.append({
             "ticker": sym,
             "raw_ticker": sym,
             "qty": total,
             "avg_price": None,  # Binance no expone avg cost por endpoint público
-            "currency": sym if is_stable else sym,  # se manejan como currencies
-            "asset_class": "STABLECOIN" if is_stable else "CRYPTO",
+            "currency": natural_ccy,
+            "asset_class": cls,
             "name": sym,
             "is_cash": is_cash,
             "free": free,

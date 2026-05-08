@@ -915,6 +915,7 @@
       const account = fd.get("account");
       const fecha = fd.get("fecha");
       const create_missing = fd.get("create_missing_assets") === "on";
+      const create_missing_ccy = fd.get("create_missing_currencies") === "on";
       const checked = form.querySelectorAll("input[name=imp]:checked");
       const positions = [];
       for (const cb of checked) {
@@ -933,7 +934,8 @@
         const r = await API.req(`/api/import/${broker}/apply`, {
           method: "POST",
           json: { account, fecha, positions,
-                  create_missing_assets: create_missing },
+                  create_missing_assets: create_missing,
+                  create_missing_currencies: create_missing_ccy },
         });
         let msg = `✓ ${r.n_positions_written} posiciones importadas`;
         if (r.n_assets_created) msg += `, ${r.n_assets_created} assets creados`;
@@ -4563,13 +4565,22 @@ python yfinance_loader.py</pre>
               <label>Fecha del saldo</label>
               <input type="date" name="fecha" value="${fmt.today()}">
             </div>
-            <div class="field" style="display:flex; align-items:center; gap:8px;">
+            <label class="check-row" for="create-missing"
+                   style="display:flex; align-items:center; gap:10px;
+                          cursor:pointer; padding:10px; border:1px solid var(--border);
+                          border-radius:10px; margin-top:8px;">
               <input type="checkbox" name="create_missing_assets" id="create-missing" checked
-                     style="width:auto;">
-              <label for="create-missing" style="margin:0;">
-                Crear assets nuevos automáticamente en <code>especies</code>
-              </label>
-            </div>
+                     style="width:18px; height:18px; cursor:pointer; flex:0 0 auto; margin:0; accent-color: var(--accent);">
+              <span>Crear assets nuevos automáticamente en <code>especies</code></span>
+            </label>
+            <label class="check-row" for="create-missing-ccy"
+                   style="display:flex; align-items:center; gap:10px;
+                          cursor:pointer; padding:10px; border:1px solid var(--border);
+                          border-radius:10px; margin-top:8px;">
+              <input type="checkbox" name="create_missing_currencies" id="create-missing-ccy" checked
+                     style="width:18px; height:18px; cursor:pointer; flex:0 0 auto; margin:0; accent-color: var(--accent);">
+              <span>Crear monedas nuevas automáticamente en <code>monedas</code></span>
+            </label>
           </section>
 
           <section>

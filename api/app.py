@@ -2248,20 +2248,22 @@ def create_app() -> Flask:
 
         Body:
           {
-            "account": "cocos",                     # cuenta destino (debe existir)
-            "fecha": "2026-05-06",                   # fecha del saldo inicial (default hoy)
-            "positions": [                           # subset que el user confirmó
-              {"ticker":"AL30D","qty":1000,"avg_price":65.5,"currency":"USB",
-               "asset_class":"BOND_AR","name":"Bonar 2030",
-               "is_cash":false,"register_asset":true},
-              ...
-            ],
-            "create_missing_assets": true            # crear assets nuevos en `especies`
+            "account": "cocos",
+            "fecha": "2026-05-06",
+            "positions": [...],
+            "create_missing_assets": true,
+            "create_missing_currencies": true   # NEW: crear monedas si faltan
           }
 
-        Crea filas en la hoja `_carga_inicial` del Excel master (que
-        el motor procesa via cli.cargar_iniciales para generar asientos
-        de OPENING_BALANCE). Devuelve cuántas filas escribió.
+        Estrategia (cambiada en commit posterior):
+          - Antes escribía a `_carga_inicial` que requiere correr el CLI
+            cli/cargar_iniciales para procesarse. Ahora escribimos directo
+            a `asientos_contables` con event_type=ACCOUNTING_ADJUSTMENT y
+            doble entrada (cuenta destino + opening_balance), que SÍ se
+            procesa por reimport_excel automáticamente.
+          - Si el currency del asset no existe en `monedas` y `create_missing_currencies`
+            está True, lo agregamos auto (con stable=1 si la heurística lo
+            sugiere).
         """
         _require_auth(); _block_if_switched_mutation()
         body = request.get_json(silent=True) or {}
@@ -2269,6 +2271,7 @@ def create_app() -> Flask:
         fecha = body.get("fecha") or date.today().isoformat()
         positions = body.get("positions") or []
         create_missing = bool(body.get("create_missing_assets", True))
+        create_missing_ccy = bool(body.get("create_missing_currencies", True))
         if not account or not positions:
             abort(400, "account y positions son requeridos")
 
@@ -2282,7 +2285,8 @@ def create_app() -> Flask:
                      for r in list_rows(s.xlsx_path, "cuentas")
                      if r.get("Code")}
         if account not in accounts:
-            abort(400, f"Cuenta '{account}' no existe en `cuentas`")
+            abort(400, f"Cuenta '{account}' no existe en `cuentas`. "
+                       f"Cuentas disponibles: {sorted(accounts.keys())[:10]}...")
 
         # Assets / monedas existentes
         existing_assets = {r.get("Ticker"): r
@@ -2291,105 +2295,267 @@ def create_app() -> Flask:
         existing_ccy = set(r.get("Code") for r in list_rows(s.xlsx_path, "monedas")
                             if r.get("Code"))
 
-        with excel_write_lock():
-            backup_excel()
-            n_assets = 0
-            n_initial = 0
-            warnings = []
-            for p in positions:
-                ticker = (p.get("ticker") or "").strip()
-                qty = float(p.get("qty") or 0)
-                ccy = (p.get("currency") or "ARS").strip().upper()
-                avg = p.get("avg_price")
-                is_cash = bool(p.get("is_cash"))
-                cls = p.get("asset_class") or "OTHER"
-                name = p.get("name") or ticker
+        STABLES_HEURISTIC = {"USDT", "USDC", "BUSD", "DAI", "TUSD", "USDP", "FDUSD"}
+        FIAT_HEURISTIC = {"ARS", "USD", "USB", "EUR", "BRL", "GBP", "JPY",
+                          "MXN", "CHF", "CAD", "AUD", "CLP", "UYU"}
 
-                if not ticker or abs(qty) < 1e-9:
-                    continue
+        warnings = []
+        details = []  # detalle per-position de qué pasó
 
-                # Crear asset si no existe (solo no-cash)
-                if not is_cash and ticker not in existing_assets:
-                    if create_missing:
-                        try:
-                            append_row(s.xlsx_path, "especies", {
-                                "Ticker": ticker,
-                                "Name": name or ticker,
-                                "Asset Class": cls,
-                                "Currency": ccy,
-                                "Notes": f"Auto-importado de {broker}",
-                            })
-                            existing_assets[ticker] = True
-                            n_assets += 1
-                        except Exception as e:
-                            warnings.append(
-                                f"No pude crear asset {ticker}: {e}"
-                            )
-                            continue
-                    else:
-                        warnings.append(
-                            f"Asset {ticker} no existe — skipped"
-                        )
+        try:
+            with excel_write_lock():
+                backup_excel()
+                n_assets = 0
+                n_ccy = 0
+                n_initial = 0
+                # Open the workbook UNA VEZ y mantener referencia para
+                # escrituras directas a asientos_contables.
+                from openpyxl import load_workbook
+                from datetime import datetime as _dt
+
+                event_id_base = f"OPEN-IMP-{broker.upper()}-" + _dt.now().strftime("%Y%m%dT%H%M%S")
+
+                for idx, p in enumerate(positions):
+                    ticker = (p.get("ticker") or "").strip()
+                    qty = float(p.get("qty") or 0)
+                    ccy = (p.get("currency") or "").strip().upper()
+                    avg = p.get("avg_price")
+                    is_cash_input = bool(p.get("is_cash"))
+                    cls = p.get("asset_class") or "OTHER"
+                    name = p.get("name") or ticker
+
+                    if not ticker or abs(qty) < 1e-9:
+                        details.append({"ticker": ticker, "skipped": "qty=0"})
                         continue
 
-                # Cash: validar que la moneda exista
-                if is_cash and ticker not in existing_ccy:
-                    warnings.append(
-                        f"Moneda {ticker} no existe en `monedas` — skipped"
-                    )
-                    continue
-
-                # Append a `_carga_inicial`. La hoja tiene columnas:
-                #   Fecha | Cuenta | Activo | Qty | Unit Price | Currency | Notes
-                try:
-                    payload = {
-                        "Fecha": fecha,
-                        "Cuenta": account,
-                        "Activo": ticker,
-                        "Qty": qty,
-                        "Unit Price": avg if avg else (1.0 if is_cash else None),
-                        "Price Currency": ccy,
-                        "Description": (f"Saldo inicial {ticker} "
-                                         f"(auto-import {broker})"),
-                    }
-                    # _carga_inicial puede no estar en ALLOWED_SHEETS;
-                    # escribimos directo al workbook si hace falta.
-                    try:
-                        append_row(s.xlsx_path, "_carga_inicial", payload)
-                    except Exception:
-                        # Fallback: escribir en asientos_contables como
-                        # OPENING_BALANCE (compat con el flow viejo).
-                        from openpyxl import load_workbook
-                        wb = load_workbook(filename=str(s.xlsx_path))
-                        if "_carga_inicial" in wb.sheetnames:
-                            ws = wb["_carga_inicial"]
-                            ws.append([
-                                fecha, account, ticker, qty,
-                                avg if avg else (1.0 if is_cash else None),
-                                ccy, payload["Description"],
-                            ])
-                            wb.save(str(s.xlsx_path))
+                    # Override del flag is_cash basado en lo que tiene el user:
+                    # si el ticker está en `monedas` (es una currency conocida),
+                    # tratarlo como cash. Si está en `especies` como activo,
+                    # tratarlo como asset. Esto resuelve el caso USDT
+                    # ambiguo (currency Y asset al mismo tiempo).
+                    in_monedas = ticker in existing_ccy
+                    in_especies = ticker in existing_assets
+                    if in_especies and not in_monedas:
+                        is_cash = False  # registrado como asset
+                    elif in_monedas and not in_especies:
+                        is_cash = True   # registrado como currency
+                    elif in_especies and in_monedas:
+                        # AMBOS — preferimos asset (engine convention:
+                        # `_calc_position` trata como asset si está en assets).
+                        is_cash = False
+                    else:
+                        # Ninguno todavía — usar heurística + lo que dijo el broker
+                        if ticker in FIAT_HEURISTIC:
+                            is_cash = True
+                            cls = "CASH"
+                        elif ticker in STABLES_HEURISTIC:
+                            is_cash = is_cash_input  # respetar lo que dijo
                         else:
-                            raise
-                    n_initial += 1
+                            is_cash = False
+
+                    # Default ccy si no vino del broker
+                    if not ccy:
+                        ccy = ticker if is_cash else "USD"
+
+                    # Fix para el caso "asset crypto cuya currency es ETH/BTC":
+                    # si ETH no está en `monedas`, fallback a USD para que el FK
+                    # de `assets.currency` no se rompa al hacer reimport.
+                    if not is_cash and ccy not in existing_ccy:
+                        if ccy in STABLES_HEURISTIC and create_missing_ccy:
+                            # Crear stablecoin en monedas
+                            try:
+                                append_row(s.xlsx_path, "monedas", {
+                                    "Code": ccy, "Name": f"{ccy} stablecoin",
+                                    "Is Stable": 1, "Quote vs": "USD",
+                                    "Is Base": 0,
+                                    "Notas": f"Auto-creada por import {broker}",
+                                })
+                                existing_ccy.add(ccy); n_ccy += 1
+                            except Exception as e:
+                                warnings.append(f"No pude crear moneda {ccy}: {e}")
+                                ccy = "USD"
+                        else:
+                            warnings.append(
+                                f"Moneda '{ccy}' del asset {ticker} no existe — "
+                                f"usando USD como fallback. Editá el asset "
+                                f"después si es incorrecto."
+                            )
+                            ccy = "USD"
+
+                    # Crear el asset si no existe (solo no-cash)
+                    if not is_cash and ticker not in existing_assets:
+                        if create_missing:
+                            try:
+                                append_row(s.xlsx_path, "especies", {
+                                    "Ticker": ticker,
+                                    "Name": name or ticker,
+                                    "Asset Class": cls,
+                                    "Currency": ccy,
+                                    "Notes": f"Auto-importado de {broker}",
+                                })
+                                existing_assets[ticker] = True
+                                n_assets += 1
+                            except Exception as e:
+                                warnings.append(
+                                    f"No pude crear asset {ticker}: {e}"
+                                )
+                                continue
+                        else:
+                            warnings.append(
+                                f"Asset {ticker} no existe y create_missing_assets=false — skipped"
+                            )
+                            continue
+
+                    # Si es cash y la currency no existe, crearla
+                    if is_cash and ticker not in existing_ccy:
+                        if create_missing_ccy:
+                            try:
+                                is_stable = ticker in STABLES_HEURISTIC
+                                append_row(s.xlsx_path, "monedas", {
+                                    "Code": ticker,
+                                    "Name": ticker,
+                                    "Is Stable": 1 if is_stable else 0,
+                                    "Quote vs": "USD" if is_stable else None,
+                                    "Is Base": 0,
+                                    "Notas": f"Auto-creada por import {broker}",
+                                })
+                                existing_ccy.add(ticker); n_ccy += 1
+                            except Exception as e:
+                                warnings.append(
+                                    f"No pude crear moneda {ticker}: {e}"
+                                )
+                                continue
+                        else:
+                            warnings.append(
+                                f"Moneda {ticker} no existe — skipped"
+                            )
+                            continue
+
+                    # Escribir a `asientos_contables` (procesado por
+                    # reimport_excel automáticamente). Doble entrada:
+                    #   1. (account, asset) gana qty
+                    #   2. (opening_balance, asset) pierde qty
+                    eid_ext = f"{event_id_base}-{idx:03d}-{ticker}"
+                    asset_in_ledger = ticker
+                    unit_price = avg if avg else (1.0 if is_cash else None)
+                    desc = f"Saldo inicial {ticker} (auto-import {broker})"
+
+                    try:
+                        wb = load_workbook(filename=str(s.xlsx_path))
+                        if "asientos_contables" not in wb.sheetnames:
+                            warnings.append(
+                                "No existe la hoja 'asientos_contables' — "
+                                "no pude registrar saldos. Re-creá el master."
+                            )
+                            break
+                        ws = wb["asientos_contables"]
+                        # Headers en fila 4. Detectar columnas.
+                        headers = {}
+                        for c in range(1, ws.max_column + 1):
+                            h = ws.cell(row=4, column=c).value
+                            if isinstance(h, str):
+                                headers[h.strip()] = c
+                        # Verificar columnas mínimas
+                        required = ["Event ID", "Fecha", "Description", "Cuenta",
+                                    "Activo", "Qty (signada)"]
+                        missing = [h for h in required if h not in headers]
+                        if missing:
+                            warnings.append(
+                                f"asientos_contables falta columnas: {missing}"
+                            )
+                            break
+                        # Próxima fila libre
+                        next_row = ws.max_row + 1
+                        # Si max_row está dentro de las filas de headers/title
+                        # (rare, fresh sheet), arrancamos en row 5
+                        if next_row <= 4:
+                            next_row = 5
+
+                        def _put(row, col_name, value):
+                            if col_name in headers:
+                                ws.cell(row=row, column=headers[col_name],
+                                         value=value)
+
+                        # Fila 1: account gana qty
+                        _put(next_row, "Event ID", eid_ext)
+                        _put(next_row, "Fecha", fecha)
+                        _put(next_row, "Description", desc)
+                        _put(next_row, "Cuenta", account)
+                        _put(next_row, "Activo", asset_in_ledger)
+                        _put(next_row, "Qty (signada)", qty)
+                        if unit_price is not None:
+                            _put(next_row, "Unit Price", unit_price)
+                            _put(next_row, "Price Currency", ccy)
+
+                        # Fila 2: opening_balance pierde qty (contraparte)
+                        next_row += 1
+                        _put(next_row, "Event ID", eid_ext)
+                        _put(next_row, "Fecha", fecha)
+                        _put(next_row, "Description", desc + " (contraparte)")
+                        _put(next_row, "Cuenta", "opening_balance")
+                        _put(next_row, "Activo", asset_in_ledger)
+                        _put(next_row, "Qty (signada)", -qty)
+                        if unit_price is not None:
+                            _put(next_row, "Unit Price", unit_price)
+                            _put(next_row, "Price Currency", ccy)
+
+                        wb.save(str(s.xlsx_path))
+                        n_initial += 1
+                        details.append({
+                            "ticker": ticker, "qty": qty, "is_cash": is_cash,
+                            "ccy": ccy, "ok": True,
+                        })
+                    except Exception as e:
+                        import traceback
+                        traceback.print_exc()
+                        warnings.append(
+                            f"Error escribiendo {ticker}: "
+                            f"{type(e).__name__}: {e}"
+                        )
+                        details.append({
+                            "ticker": ticker, "ok": False,
+                            "error": f"{type(e).__name__}: {e}",
+                        })
+                        continue
+
+                # Re-importar para que el motor procese los nuevos asientos
+                try:
+                    stats = reimport_excel()
                 except Exception as e:
-                    warnings.append(f"No pude escribir saldo {ticker}: {e}")
-                    continue
+                    import traceback
+                    traceback.print_exc()
+                    warnings.append(
+                        f"Reimport falló: {type(e).__name__}: {e}. "
+                        f"Los datos están escritos al Excel pero el motor "
+                        f"no los procesó. Hacé refresh manual."
+                    )
+                    stats = None
+                prune_backups(keep_last=50)
 
-            # Re-importar para que el motor procese la carga inicial
-            stats = reimport_excel()
-            prune_backups(keep_last=50)
-
-        return jsonify({
-            "ok": True,
-            "broker": broker,
-            "account": account,
-            "fecha": fecha,
-            "n_assets_created": n_assets,
-            "n_positions_written": n_initial,
-            "warnings": warnings,
-            "import_stats": stats,
-        })
+            return jsonify({
+                "ok": True,
+                "broker": broker,
+                "account": account,
+                "fecha": fecha,
+                "n_assets_created": n_assets,
+                "n_currencies_created": n_ccy,
+                "n_positions_written": n_initial,
+                "warnings": warnings,
+                "details": details,
+                "import_stats": stats,
+            })
+        except Exception as e:
+            import traceback
+            tb = traceback.format_exc()
+            print(f"[import_apply] FATAL {type(e).__name__}: {e}\n{tb}")
+            return jsonify({
+                "error": True,
+                "code": 500,
+                "message": f"{type(e).__name__}: {e}",
+                "traceback_tail": tb.split("\n")[-15:],
+                "warnings": warnings,
+                "details": details,
+            }), 500
 
     # =========================================================================
     # Audit log per-user (read-only)
