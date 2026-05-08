@@ -174,6 +174,12 @@
     runByma: (tickers) => API.req("/api/loaders/byma", {
       method: "POST", json: tickers ? { tickers } : {},
     }),
+    runCripto: (tickers) => API.req("/api/loaders/cripto", {
+      method: "POST", json: tickers ? { tickers } : {},
+    }),
+    runCafci: (fecha) => API.req("/api/loaders/cafci", {
+      method: "POST", json: fecha ? { fecha } : {},
+    }),
 
     // Audit log
     auditLog: (n = 100) => API.req(`/api/audit-log?n=${n}`, { noCache: true }),
@@ -961,6 +967,40 @@
           if (confirm("Faltan credenciales BYMA. ¿Configurarlas ahora?")) {
             navigate("/credentials");
           }
+        } else {
+          toast(`Error: ${e.message}`, "error");
+        }
+      }
+    },
+    async runCripto() {
+      try {
+        toast("Bajando precios cripto desde CoinGecko...", "info");
+        const res = await API.runCripto();
+        let msg = `✓ ${res.n_prices} precios cripto refrescados`;
+        if ((res.unknown_skipped || []).length) {
+          msg += ` (skip: ${res.unknown_skipped.join(",")})`;
+        }
+        toast(msg, "success");
+        API._bustCache();
+        render();
+      } catch (e) {
+        toast(`Error: ${e.message}`, "error");
+      }
+    },
+    async runCafci() {
+      try {
+        toast("Bajando VCP desde CAFCI... (puede tardar)", "info");
+        const res = await API.runCafci();
+        toast(`✓ FCIs refrescados (compartido a todos los users)`, "success");
+        API._bustCache();
+        render();
+      } catch (e) {
+        if (e.message.toLowerCase().includes("token")) {
+          if (confirm("Falta el token CAFCI. ¿Configurarlo ahora?")) {
+            navigate("/credentials");
+          }
+        } else if (e.message.toLowerCase().includes("superadmin")) {
+          toast("Solo el superadmin puede correr CAFCI", "error");
         } else {
           toast(`Error: ${e.message}`, "error");
         }
@@ -4160,7 +4200,7 @@ python yfinance_loader.py</pre>
         <section>
           <h2>🔐 Brokers y credenciales</h2>
           <a href="#/credentials" class="btn ghost full" style="margin-bottom:8px">
-            🔑 Configurar credenciales (BYMA, Binance, IBKR, CAFCI)
+            🔑 Configurar credenciales (BYMA, Binance, IBKR${cfg && cfg.is_superadmin ? ", CAFCI" : ""})
           </a>
           <a href="#/import" class="btn primary full" style="margin-bottom:8px">
             📥 Auto-importar tenencias
@@ -4168,6 +4208,14 @@ python yfinance_loader.py</pre>
           <button class="btn ghost full" data-onclick="runByma" style="margin-bottom:8px">
             🔄 Refrescar precios BYMA
           </button>
+          <button class="btn ghost full" data-onclick="runCripto" style="margin-bottom:8px">
+            🪙 Refrescar precios cripto
+          </button>
+          ${cfg && cfg.is_superadmin ? `
+            <button class="btn ghost full" data-onclick="runCafci" style="margin-bottom:8px">
+              📊 Refrescar VCP de FCIs (CAFCI)
+            </button>
+          ` : ""}
         </section>
 
         <section>
@@ -4629,6 +4677,7 @@ python yfinance_loader.py</pre>
     }
     const fields = data.fields || [];
     const configured = data.configured || {};
+    const isSuper = !!data.is_superadmin;
 
     return `
       ${headerWithBack("🔑 Credenciales del broker", "/settings")}
@@ -4651,6 +4700,7 @@ python yfinance_loader.py</pre>
                 <label>
                   ${escapeHtml(f.label)}
                   ${configured[f.key] ? '<span class="tag success" style="font-size:9px; margin-left:4px;">configurado</span>' : ''}
+                  ${f.superadmin_only ? '<span class="tag warn" style="font-size:9px; margin-left:4px;">superadmin</span>' : ''}
                 </label>
                 <input type="${f.secret ? "password" : "text"}"
                        name="${escapeHtml(f.key)}"
@@ -4674,14 +4724,38 @@ python yfinance_loader.py</pre>
         </section>
 
         <section>
-          <h2>Probar</h2>
-          <button class="btn ghost full" data-onclick="runByma">
-            🔄 Bajar precios BYMA ahora
+          <h2>Refrescar precios ahora</h2>
+          <button class="btn ghost full" data-onclick="runByma" style="margin-bottom:8px;">
+            🔄 Bajar precios BYMA (acciones, bonos, CEDEARs)
           </button>
-          <div class="muted" style="font-size:12px; margin-top:6px;">
+          <div class="muted" style="font-size:12px; margin-bottom:14px;">
             Usa los tickers del archivo <code>tickers_byma.txt</code> del repo.
-            Pronto: configurarlos desde la app.
+            Requiere credenciales BYMA configuradas.
           </div>
+
+          <button class="btn ghost full" data-onclick="runCripto" style="margin-bottom:8px;">
+            🪙 Bajar precios cripto (CoinGecko)
+          </button>
+          <div class="muted" style="font-size:12px; margin-bottom:14px;">
+            BTC, ETH, SOL, USDT, USDC y más. API pública, sin credenciales.
+            Los precios se comparten entre todos los users.
+          </div>
+
+          ${isSuper ? `
+          <button class="btn ghost full" data-onclick="runCafci" style="margin-bottom:8px;">
+            📊 Bajar VCP de FCIs (CAFCI) — solo superadmin
+          </button>
+          <div class="muted" style="font-size:12px;">
+            Refresca <code>data/precios_cafci.csv</code> para todos los users.
+            Requiere token CAFCI configurado arriba.
+          </div>
+          ` : `
+          <div class="muted" style="font-size:12px;">
+            Los precios de FCIs (CAFCI) los actualiza el superadmin —
+            cuando lo haga, vas a verlos automáticamente en tu próximo
+            re-import.
+          </div>
+          `}
         </section>
       </main>
       ${bottomNav("/settings")}

@@ -380,6 +380,7 @@ def create_app() -> Flask:
         return jsonify({
             "user_id": g.active_user_id,
             "is_admin": g.is_admin,
+            "is_superadmin": getattr(g, "is_superadmin", False),
             "is_switched": g.is_switched,
             "auth_user_id": g.auth_user.user_id if g.auth_user else None,
             "auth_user_display_name": g.auth_user.display_name if g.auth_user else None,
@@ -2071,12 +2072,19 @@ def create_app() -> Flask:
 
         El response es {"fields": [...], "configured": {key: True}}.
         Los valores secretos NUNCA se devuelven via API.
+        Los campos marcados como superadmin_only sólo aparecen si el caller
+        es superadmin (ej. cafci_token).
         """
         _require_auth(); _block_if_switched_mutation()
+        is_super = bool(getattr(g, "is_superadmin", False))
         existing = creds.get_credentials(g.active_user_id)
+        fields = creds.list_supported_fields(is_superadmin=is_super)
+        visible_keys = {f["key"] for f in fields}
         return jsonify({
-            "fields": creds.list_supported_fields(),
-            "configured": {k: True for k, v in existing.items() if v},
+            "fields": fields,
+            "configured": {k: True for k, v in existing.items()
+                            if v and k in visible_keys},
+            "is_superadmin": is_super,
         })
 
     @app.put("/api/credentials")
@@ -2085,11 +2093,20 @@ def create_app() -> Flask:
 
         - Pasar value="" o null borra esa credencial.
         - Solo se aceptan keys de creds.CRED_FIELDS.
+        - Las credenciales marcadas como superadmin_only (ej cafci_token)
+          sólo pueden modificarlas los superadmins.
         """
         _require_auth(); _block_if_switched_mutation()
         body = request.get_json(silent=True) or {}
         if not isinstance(body, dict):
             abort(400, "Body debe ser JSON object")
+        is_super = bool(getattr(g, "is_superadmin", False))
+        if not is_super:
+            forbidden = creds.SUPERADMIN_ONLY_FIELDS & set(body.keys())
+            if forbidden:
+                abort(403,
+                      f"Credenciales {sorted(forbidden)} sólo las puede "
+                      "configurar el superadmin.")
         result = creds.set_credentials(g.active_user_id, body)
         return jsonify({"updated": True, "configured": result})
 
@@ -2157,6 +2174,124 @@ def create_app() -> Flask:
             stats = reimport_excel()
         return jsonify({"loader_rc": rc, "n_tickers": len(tickers),
                         "import_stats": stats})
+
+    @app.post("/api/loaders/cafci")
+    def loader_cafci_endpoint():
+        """Corre el cafci_loader.run() — SOLO superadmin.
+
+        El token de CAFCI se lee de las credenciales del superadmin.
+        El CSV resultante (data/precios_cafci.csv) es compartido entre
+        todos los users, así que cualquier user que re-importe su Excel
+        después de esta llamada va a ver los precios actualizados.
+
+        Body opcional:
+          {"fecha": "2026-04-30"}  — backfill de un día específico
+                                     (default: último reporte diario)
+        """
+        _require_superadmin(); _block_if_switched_mutation()
+        c = creds.get_credentials(g.active_user_id)
+        token = c.get("cafci_token")
+        if not token:
+            abort(400, "Falta el token de CAFCI. Cargalo en /credentials.")
+
+        body = request.get_json(silent=True) or {}
+        fecha = (body.get("fecha") or "").strip() or None
+        if fecha:
+            try:
+                date.fromisoformat(fecha)
+            except ValueError:
+                abort(400, f"Fecha inválida: {fecha} (esperado YYYY-MM-DD)")
+
+        repo_root = Path(__file__).resolve().parent.parent
+        fcis_file = repo_root / "fcis_cafci.txt"
+        if not fcis_file.is_file():
+            abort(500, f"No encuentro {fcis_file}")
+
+        s = get_settings()
+        # cafci_loader.run() lee el token de os.environ["CAFCI_TOKEN"]
+        prev_token = os.environ.get("CAFCI_TOKEN")
+        os.environ["CAFCI_TOKEN"] = token
+        try:
+            from cafci_loader import run as cafci_run
+            rc = cafci_run(
+                fcis_file=fcis_file,
+                output_dir=s.shared_data_dir,
+                fecha=fecha,
+                dry_run=False,
+                use_xlsx_currency=True,
+                xlsx_path=s.xlsx_path,
+            )
+        except Exception as e:
+            abort(500, f"CAFCI loader falló: {type(e).__name__}: {e}")
+        finally:
+            if prev_token is None:
+                os.environ.pop("CAFCI_TOKEN", None)
+            else:
+                os.environ["CAFCI_TOKEN"] = prev_token
+
+        if rc != 0:
+            abort(500, "CAFCI loader devolvió error (revisá logs)")
+
+        # Re-importar el Excel del superadmin para que vea los nuevos
+        # precios inmediatamente. El resto de los users tomará los
+        # precios cuando ellos disparen un re-import.
+        with excel_write_lock():
+            stats = reimport_excel()
+        return jsonify({
+            "loader_rc": rc,
+            "fecha": fecha or "daily",
+            "import_stats": stats,
+            "shared": True,
+        })
+
+    @app.post("/api/loaders/cripto")
+    def loader_cripto_endpoint():
+        """Refresca precios cripto desde CoinGecko (API pública, sin auth).
+
+        Disponible para todos los users autenticados — el CSV resultante
+        (data/precios_cripto.csv) es compartido.
+
+        Body opcional:
+          {"tickers": ["BTC","ETH","USDT"]}   — override de tickers
+        """
+        _require_auth(); _block_if_switched_mutation()
+        body = request.get_json(silent=True) or {}
+        tickers = body.get("tickers")
+        if tickers and not isinstance(tickers, list):
+            abort(400, "tickers debe ser una lista")
+
+        from cripto_loader import (
+            upsert_current as cripto_upsert,
+            DEFAULT_TICKERS as CRIPTO_DEFAULT,
+            TICKER_TO_COINGECKO,
+        )
+        if not tickers:
+            tickers = list(CRIPTO_DEFAULT)
+        tickers = [t.strip().upper() for t in tickers if t and t.strip()]
+        # Filtrar tickers desconocidos para CoinGecko
+        unknown = [t for t in tickers if t not in TICKER_TO_COINGECKO]
+        tickers = [t for t in tickers if t in TICKER_TO_COINGECKO]
+        if not tickers:
+            abort(400, "Ningún ticker reconocido por CoinGecko. "
+                       f"Soportados: {sorted(TICKER_TO_COINGECKO.keys())}")
+
+        s = get_settings()
+        out_path = s.shared_data_dir / "precios_cripto.csv"
+        try:
+            n = cripto_upsert(out_path, tickers)
+        except Exception as e:
+            abort(502, f"CoinGecko falló: {type(e).__name__}: {e}")
+
+        # Re-import para que el user actual vea los precios nuevos
+        with excel_write_lock():
+            stats = reimport_excel()
+        return jsonify({
+            "n_prices": n,
+            "tickers": tickers,
+            "unknown_skipped": unknown,
+            "import_stats": stats,
+            "shared": True,
+        })
 
     # =========================================================================
     # Auto-import de tenencias desde brokers (Cocos / Binance / IBKR)
