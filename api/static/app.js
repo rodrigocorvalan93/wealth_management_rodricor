@@ -391,7 +391,31 @@
       attachListeners(root);
       updateNav();
     } catch (e) {
-      root.innerHTML = `<div class="empty"><div class="icon">⚠️</div><div>${escapeHtml(e.message)}</div></div>`;
+      const msg = String(e.message || "");
+      // Detectar el caso "Excel master no presente" y ofrecer bootstrap
+      const isMissingMaster = /master no presente|no hay excel master/i.test(msg);
+      root.innerHTML = isMissingMaster ? `
+        <div class="cta-card" style="margin: 20px 16px;">
+          <div class="cta-icon">📂</div>
+          <div class="cta-title">Tu portfolio todavía está vacío</div>
+          <div class="cta-desc">
+            Empezá de cero o subí un Excel master que ya tengas
+            (de un backup o de otra instalación).
+          </div>
+          <div class="cta-actions">
+            <button class="btn primary" data-onclick="bootstrapMaster">
+              ✨ Crear desde cero
+            </button>
+            <button class="btn ghost"
+                    onclick="document.getElementById('xlsxUploadCta').click();">
+              ⬆ Subir un Excel viejo
+            </button>
+          </div>
+          <input type="file" id="xlsxUploadCta" accept=".xlsx,.xls"
+                 style="display:none" onchange="window.uploadInitialExcel(event);">
+        </div>
+      ` : `<div class="empty"><div class="icon">⚠️</div><div>${escapeHtml(msg)}</div></div>`;
+      attachListeners(root);
     }
   }
 
@@ -810,6 +834,22 @@
       } catch (e) { toast(e.message, "error"); }
     },
 
+    async bootstrapMaster() {
+      try {
+        toast("Creando tu portfolio...", "info");
+        const r = await API.req("/api/account/bootstrap", { method: "POST" });
+        if (r.already) {
+          toast("Ya tenías master — refrescando", "info");
+        } else {
+          toast("✓ Portfolio creado. Empezá cargando cuentas.", "success");
+        }
+        invalidateMeta();
+        API._bustCache();
+        navigate("/welcome");
+      } catch (e) {
+        toast(`Error: ${e.message}`, "error");
+      }
+    },
     async refreshAll() {
       try {
         toast("Refrescando...", "info");
@@ -854,6 +894,61 @@
         toast(`Error: ${e.message}`, "error");
       }
     },
+    async testBroker(brokerId) {
+      try {
+        toast(`Probando ${brokerId}...`, "info");
+        const r = await API.req(`/api/import/${brokerId}/test`,
+                                  { method: "POST" });
+        if (r.ok === false) {
+          toast(`✗ ${r.error || 'Falló'}`, "error");
+        } else {
+          const detail = r.n_positions != null
+            ? `${r.n_positions} posiciones detectadas`
+            : (r.account_type || "OK");
+          toast(`✓ ${brokerId}: ${detail}`, "success");
+        }
+      } catch (e) { toast(e.message, "error"); }
+    },
+    async applyImport(_data, form) {
+      const fd = new FormData(form);
+      const broker = fd.get("broker");
+      const account = fd.get("account");
+      const fecha = fd.get("fecha");
+      const create_missing = fd.get("create_missing_assets") === "on";
+      const checked = form.querySelectorAll("input[name=imp]:checked");
+      const positions = [];
+      for (const cb of checked) {
+        const i = cb.value;
+        const dataInput = form.querySelector(`input[name="data_${i}"]`);
+        if (!dataInput) continue;
+        try {
+          positions.push(JSON.parse(dataInput.value));
+        } catch (_) {}
+      }
+      if (positions.length === 0) {
+        toast("Seleccioná al menos una posición", "error"); return;
+      }
+      try {
+        toast(`Importando ${positions.length} posiciones...`, "info");
+        const r = await API.req(`/api/import/${broker}/apply`, {
+          method: "POST",
+          json: { account, fecha, positions,
+                  create_missing_assets: create_missing },
+        });
+        let msg = `✓ ${r.n_positions_written} posiciones importadas`;
+        if (r.n_assets_created) msg += `, ${r.n_assets_created} assets creados`;
+        toast(msg, "success");
+        if ((r.warnings || []).length > 0) {
+          setTimeout(() => toast(
+            `${r.warnings.length} warnings — revisá audit log`, "info"
+          ), 1500);
+        }
+        invalidateMeta();
+        navigate("/");
+      } catch (e) {
+        toast(e.message, "error");
+      }
+    },
     async runByma() {
       try {
         toast("Bajando precios BYMA... (puede tardar 10-20s)", "info");
@@ -870,6 +965,87 @@
           toast(`Error: ${e.message}`, "error");
         }
       }
+    },
+    async updateDisplayName(data) {
+      try {
+        await API.req("/api/auth/me", { method: "PUT", json: data });
+        toast("Nombre actualizado ✓", "success");
+        render();
+      } catch (e) { toast(e.message, "error"); }
+    },
+    async changePassword(data, form) {
+      if (data.new_password !== data.confirm) {
+        toast("Las contraseñas no coinciden", "error"); return;
+      }
+      try {
+        await API.req("/api/auth/change-password", {
+          method: "POST",
+          json: { current_password: data.current_password,
+                  new_password: data.new_password },
+        });
+        toast("Contraseña cambiada ✓", "success");
+        form.reset();
+        render();
+      } catch (e) { toast(e.message, "error"); }
+    },
+    async resendVerify() {
+      try {
+        const r = await API.req("/api/auth/resend-verify", { method: "POST" });
+        if (r.already_verified) {
+          toast("Tu email ya está verificado", "info");
+        } else {
+          toast(`Te mandamos un email (${r.via})`, "success");
+        }
+      } catch (e) { toast(e.message, "error"); }
+    },
+    async revokeSession(prefix) {
+      if (!confirm(`¿Revocar la sesión que empieza con ${prefix}…?`)) return;
+      try {
+        await API.req(`/api/auth/sessions/${encodeURIComponent(prefix)}`,
+                       { method: "DELETE" });
+        toast("Sesión revocada", "success");
+        render();
+      } catch (e) { toast(e.message, "error"); }
+    },
+    async revokeAllSessions() {
+      if (!confirm("¿Revocar todas las otras sesiones? Tendrás que volver a loguearte en cada device.")) return;
+      try {
+        const r = await API.req("/api/auth/sessions", { method: "DELETE" });
+        toast(`Revocadas ${r.revoked} sesiones`, "success");
+        render();
+      } catch (e) { toast(e.message, "error"); }
+    },
+    async toggleAdmin(arg) {
+      const [userId, val] = arg.split("|");
+      try {
+        await API.req(`/api/superadmin/users/${encodeURIComponent(userId)}/admin`,
+          { method: "PUT", json: { is_admin: val === "1" } });
+        toast("Updated ✓", "success");
+        render();
+      } catch (e) { toast(e.message, "error"); }
+    },
+    async toggleSuper(arg) {
+      const [userId, val] = arg.split("|");
+      const isPromoting = val === "1";
+      const msg = isPromoting
+        ? `¿Convertir a "${userId}" en SUPERADMIN? Va a poder ver y gestionar todos los users.`
+        : `¿Quitarle SUPERADMIN a "${userId}"?`;
+      if (!confirm(msg)) return;
+      try {
+        await API.req(`/api/superadmin/users/${encodeURIComponent(userId)}/superadmin`,
+          { method: "PUT", json: { is_superadmin: isPromoting } });
+        toast("Updated ✓", "success");
+        render();
+      } catch (e) { toast(e.message, "error"); }
+    },
+    async deleteAuthUser(userId) {
+      if (!confirm(`¿Borrar la cuenta auth de "${userId}"? Esto NO borra sus datos de wealth (xlsx, db) — para eso pediles que borren su propia cuenta.`)) return;
+      try {
+        await API.req(`/api/superadmin/users/${encodeURIComponent(userId)}`,
+          { method: "DELETE" });
+        toast("User borrado", "success");
+        render();
+      } catch (e) { toast(e.message, "error"); }
     },
     async deleteMyAccount() {
       const phrase = "BORRAR";
@@ -931,10 +1107,14 @@
       API.setAnchor(a);
       render();
     },
-    logout() {
-      if (confirm("¿Cerrar sesión y borrar token?")) {
-        API.logout();
-      }
+    async logout() {
+      if (!confirm("¿Cerrar sesión y borrar token?")) return;
+      // Best-effort: invalidar la sesión en el server (auth_db). No bloquea
+      // si falla — el user igual va a quedar sin token.
+      try {
+        await API.req("/api/auth/logout", { method: "POST" });
+      } catch (_) {}
+      API.logout();
     },
   };
 
@@ -3955,10 +4135,20 @@ python yfinance_loader.py</pre>
           </form>
         </section>
 
+        <section>
+          <h2>Cuenta</h2>
+          <a href="#/me" class="btn ghost full" style="margin-bottom:6px">
+            👤 Mi perfil + contraseña
+          </a>
+        </section>
+
         ${cfg && cfg.is_admin ? `
           <section>
             <h2>Admin</h2>
-            <a href="#/admin" class="btn primary full" style="margin-bottom:6px">👥 Gestión de usuarios</a>
+            ${cfg.is_admin ? `
+              <a href="#/superadmin" class="btn primary full" style="margin-bottom:6px">⭐ Superadmin (auth users)</a>
+            ` : ''}
+            <a href="#/admin" class="btn ghost full" style="margin-bottom:6px">👥 Users legacy (token)</a>
             ${cfg.is_switched ? `
               <button class="btn ghost full" data-onclick="switchToUser" data-arg="" style="margin-bottom:6px">
                 ← Volver a tu user (${escapeHtml(cfg.auth_user_id)})
@@ -3968,9 +4158,12 @@ python yfinance_loader.py</pre>
         ` : ""}
 
         <section>
-          <h2>🔐 Credenciales del broker</h2>
+          <h2>🔐 Brokers y credenciales</h2>
           <a href="#/credentials" class="btn ghost full" style="margin-bottom:8px">
-            🔑 Configurar BYMA / CAFCI
+            🔑 Configurar credenciales (BYMA, Binance, IBKR, CAFCI)
+          </a>
+          <a href="#/import" class="btn primary full" style="margin-bottom:8px">
+            📥 Auto-importar tenencias
           </a>
           <button class="btn ghost full" data-onclick="runByma" style="margin-bottom:8px">
             🔄 Refrescar precios BYMA
@@ -3982,7 +4175,13 @@ python yfinance_loader.py</pre>
           <button class="btn primary full" data-onclick="refreshAll" style="margin-bottom:8px">⟳ Refrescar DB desde Excel</button>
           <a class="btn ghost full" href="${API.base}/api/download/excel"
              style="margin-bottom:8px"
-             onclick="event.preventDefault(); downloadExcel();">⬇ Descargar Excel</a>
+             onclick="event.preventDefault(); downloadExcel();">⬇ Descargar Excel master</a>
+          <button class="btn ghost full" style="margin-bottom:8px"
+                  onclick="document.getElementById('xlsxUploadSettings').click();">
+            ⬆ Subir / reemplazar Excel master
+          </button>
+          <input type="file" id="xlsxUploadSettings" accept=".xlsx,.xls"
+                 style="display:none" onchange="window.uploadInitialExcel(event);">
           <a class="btn ghost full" href="#/setup" style="margin-bottom:8px">🎉 Wizard inicial</a>
           <a class="btn ghost full" href="#/welcome" style="margin-bottom:8px">🚀 Onboarding paso a paso</a>
           <a class="btn ghost full" href="#/help" style="margin-bottom:8px">❓ Ayuda y manualcitos</a>
@@ -4041,6 +4240,379 @@ python yfinance_loader.py</pre>
         </section>
       </main>
       ${bottomNav("/settings")}
+    `;
+  });
+
+  // ====================================================================
+  // /me — Perfil + cambio de contraseña + sessions
+  // ====================================================================
+  route("/me", async () => {
+    let me;
+    try { me = await API.req("/api/auth/me", { noCache: true }); }
+    catch (e) {
+      return `${headerWithBack("👤 Mi cuenta", "/settings")}
+        <main><div class="card">Error: ${escapeHtml(e.message)}</div></main>`;
+    }
+    const u = me.user || {};
+    const isLegacy = me.auth_via === "legacy";
+    const sessions = me.sessions || [];
+    return `
+      ${headerWithBack("👤 Mi cuenta", "/settings")}
+      <main>
+        <section>
+          <div class="card">
+            <div style="display:flex; justify-content:space-between; align-items:flex-start; gap:12px;">
+              <div>
+                <div style="font-size:18px; font-weight:700;">${escapeHtml(u.display_name || u.user_id || "")}</div>
+                <div class="muted" style="font-size:13px;">${escapeHtml(u.email || "(sin email — modo legacy)")}</div>
+                <div class="muted" style="font-size:11px; margin-top:4px;">user_id: <code>${escapeHtml(u.user_id || "")}</code></div>
+              </div>
+              <div style="text-align:right;">
+                ${u.is_superadmin ? '<span class="tag" style="background: var(--orange-soft); color: var(--orange);">⭐ superadmin</span><br>' : ''}
+                ${u.is_admin && !u.is_superadmin ? '<span class="tag">admin</span><br>' : ''}
+                ${u.email_verified === true ? '<span class="tag success">✓ verificado</span>' :
+                  u.email_verified === false ? '<span class="tag warn">sin verificar</span>' : ''}
+              </div>
+            </div>
+          </div>
+        </section>
+
+        ${isLegacy ? `
+          <div class="card compact" style="background: var(--orange-soft); color: var(--text);">
+            ⚠ Estás logueado con un token legacy (sin email/password).
+            Migrá a una cuenta real con
+            <a href="#/signup" style="text-decoration:underline; color: var(--accent);">signup</a>
+            para recuperación + 2FA + audit por email.
+          </div>
+        ` : `
+          <section>
+            <h2>Cambiar nombre</h2>
+            <form data-action="updateDisplayName">
+              <div style="display:flex; gap:8px;">
+                <input name="display_name" type="text" value="${escapeHtml(u.display_name || '')}"
+                       style="flex:1; padding:10px; border:1px solid var(--border); border-radius:8px;">
+                <button type="submit" class="btn primary">Guardar</button>
+              </div>
+            </form>
+          </section>
+
+          <section>
+            <h2>Cambiar contraseña</h2>
+            <form data-action="changePassword">
+              <div class="field">
+                <label>Contraseña actual</label>
+                <input type="password" name="current_password" required minlength="8"
+                       autocomplete="current-password">
+              </div>
+              <div class="field">
+                <label>Nueva contraseña</label>
+                <input type="password" name="new_password" required minlength="8"
+                       autocomplete="new-password">
+              </div>
+              <div class="field">
+                <label>Confirmar</label>
+                <input type="password" name="confirm" required minlength="8">
+              </div>
+              <button type="submit" class="btn primary full" style="margin-top:8px;">
+                Cambiar contraseña
+              </button>
+              <div class="muted" style="font-size:12px; margin-top:6px;">
+                Esto invalida todas las otras sesiones (vas a tener que
+                volver a loguearte en cada device).
+              </div>
+            </form>
+          </section>
+
+          ${u.email_verified === false ? `
+            <section>
+              <button class="btn ghost full" data-onclick="resendVerify">
+                ✉️ Re-enviar email de verificación
+              </button>
+            </section>
+          ` : ''}
+
+          <section>
+            <h2>Sesiones activas (${sessions.length})</h2>
+            ${sessions.length === 0 ? '<div class="card muted">Sin sesiones.</div>' :
+              `<div class="list">${sessions.map(s => `
+                <div class="list-item" style="align-items: flex-start;">
+                  <div class="meta">
+                    <div class="meta-line1 tabular" style="font-size:13px;">
+                      ${escapeHtml(s.token_prefix)}…
+                    </div>
+                    <div class="meta-line2 muted" style="font-size:11px;">
+                      Última: ${escapeHtml(s.last_used_at || '')}
+                      · Expira: ${escapeHtml(s.expires_at || '')}<br>
+                      ${escapeHtml((s.user_agent || '').slice(0, 60))}
+                      ${s.ip ? '· ' + escapeHtml(s.ip) : ''}
+                    </div>
+                  </div>
+                  <button class="btn ghost" data-onclick="revokeSession" data-arg="${escapeHtml(s.token_prefix)}"
+                          style="padding:6px 10px; font-size:12px;">Revocar</button>
+                </div>
+              `).join('')}</div>`
+            }
+            <button class="btn danger full" data-onclick="revokeAllSessions" style="margin-top:8px;">
+              Revocar todas las otras sesiones
+            </button>
+          </section>
+        `}
+      </main>
+      ${bottomNav("/settings")}
+    `;
+  });
+
+  // ====================================================================
+  // /superadmin — Gestión de auth_users (solo superadmin)
+  // ====================================================================
+  route("/superadmin", async () => {
+    let data;
+    try { data = await API.req("/api/superadmin/users", { noCache: true }); }
+    catch (e) {
+      return `${headerWithBack("⭐ Superadmin", "/settings")}
+        <main><div class="card">${escapeHtml(e.message)}</div></main>`;
+    }
+    const users = data.users || [];
+    const me = data.self;
+    return `
+      ${headerWithBack("⭐ Superadmin", "/settings")}
+      <main>
+        <section>
+          <div class="card compact muted" style="font-size:13px;">
+            Sos el superadmin del deploy. Podés ver y gestionar todos los
+            users registrados con email/password. Los users legacy (token
+            estático) viven aparte en
+            <a href="#/admin" style="color:var(--accent);">/admin</a>.
+          </div>
+        </section>
+        <section>
+          <h2>Users (${users.length})</h2>
+          <div class="list">
+            ${users.map(u => {
+              const isMe = u.user_id === me;
+              const flagAdmin = u.is_admin ? '<span class="tag">admin</span>' : '';
+              const flagSuper = u.is_superadmin ? '<span class="tag" style="background:var(--orange-soft); color:var(--orange);">⭐ super</span>' : '';
+              const flagVerified = u.email_verified
+                ? '<span class="tag success" style="font-size:9px;">✓</span>'
+                : '<span class="tag warn" style="font-size:9px;">sin verif</span>';
+              return `
+                <div class="list-item" style="align-items:flex-start;">
+                  <div class="meta">
+                    <div class="meta-line1">
+                      ${escapeHtml(u.display_name || u.email)}
+                      ${isMe ? ' <span class="tag">vos</span>' : ''}
+                      ${flagSuper} ${flagAdmin} ${flagVerified}
+                    </div>
+                    <div class="meta-line2 muted" style="font-size:12px;">
+                      ${escapeHtml(u.email)} · ${escapeHtml(u.user_id)}
+                      <br>creado ${escapeHtml((u.created_at || '').slice(0, 10))}
+                      ${u.last_login_at ? ' · último login ' + escapeHtml(u.last_login_at.slice(0, 10)) : ''}
+                    </div>
+                  </div>
+                  ${!isMe ? `
+                    <div style="display:flex; flex-direction:column; gap:4px;">
+                      <button class="btn ghost" style="padding:4px 8px; font-size:11px;"
+                              data-onclick="toggleAdmin" data-arg="${escapeHtml(u.user_id)}|${u.is_admin ? '0' : '1'}">
+                        ${u.is_admin ? '⊖ admin' : '⊕ admin'}
+                      </button>
+                      <button class="btn ghost" style="padding:4px 8px; font-size:11px;"
+                              data-onclick="toggleSuper" data-arg="${escapeHtml(u.user_id)}|${u.is_superadmin ? '0' : '1'}">
+                        ${u.is_superadmin ? '⊖ super' : '⊕ super'}
+                      </button>
+                      <button class="btn danger" style="padding:4px 8px; font-size:11px;"
+                              data-onclick="deleteAuthUser" data-arg="${escapeHtml(u.user_id)}">
+                        🗑
+                      </button>
+                    </div>
+                  ` : ''}
+                </div>
+              `;
+            }).join('')}
+          </div>
+        </section>
+      </main>
+      ${bottomNav("/settings")}
+    `;
+  });
+
+  // ====================================================================
+  // /import — Auto-import de tenencias desde brokers
+  // ====================================================================
+  route("/import", async () => {
+    let data;
+    try { data = await API.req("/api/import/brokers", { noCache: true }); }
+    catch (e) {
+      return `${headerWithBack("📥 Auto-import", "/settings")}
+        <main><div class="card">${escapeHtml(e.message)}</div></main>`;
+    }
+    const brokers = data.brokers || [];
+    return `
+      ${headerWithBack("📥 Auto-import", "/settings")}
+      <main>
+        <section>
+          <div class="card compact muted" style="font-size:13px;">
+            Conectá tu broker para importar tus tenencias automáticamente.
+            Las credenciales se guardan encriptadas y son <b>read-only</b> —
+            esta app NUNCA opera por vos. Si el broker pide permisos,
+            elegí solo "Reading"/"View".
+          </div>
+        </section>
+        <section>
+          <h2>Brokers disponibles</h2>
+          ${brokers.map(b => `
+            <div class="card" style="margin-bottom:12px;">
+              <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px;">
+                <div>
+                  <div style="font-weight:700; font-size:16px;">
+                    ${b.icon} ${escapeHtml(b.name)}
+                  </div>
+                  <div class="muted" style="font-size:12px;">
+                    ${b.ready
+                      ? '<span class="tag success">credenciales listas</span>'
+                      : '<span class="tag warn">faltan credenciales</span>'}
+                  </div>
+                </div>
+                <div style="display:flex; gap:6px;">
+                  ${b.ready ? `
+                    <button class="btn ghost" data-onclick="testBroker"
+                            data-arg="${escapeHtml(b.id)}"
+                            style="padding:6px 10px; font-size:12px;">
+                      Probar
+                    </button>
+                    <a class="btn primary" href="#/import/${escapeHtml(b.id)}"
+                       style="padding:6px 14px; font-size:13px;">
+                      Importar →
+                    </a>
+                  ` : `
+                    <a class="btn primary" href="#/credentials"
+                       style="padding:6px 14px; font-size:13px;">
+                      Configurar
+                    </a>
+                  `}
+                </div>
+              </div>
+              <div class="muted" style="font-size:12px; line-height:1.4;">
+                ${escapeHtml(b.help)}
+              </div>
+            </div>
+          `).join("")}
+        </section>
+      </main>
+      ${bottomNav("/settings")}
+    `;
+  });
+
+  // ====================================================================
+  // /import/:broker — Preview + apply de un broker específico
+  // ====================================================================
+  route("/import/:broker", async ({ broker }) => {
+    let preview, meta;
+    try {
+      [preview, meta] = await Promise.all([
+        API.req(`/api/import/${broker}/preview`, { method: "POST", json: {} }),
+        loadMeta(),
+      ]);
+    } catch (e) {
+      return `${headerWithBack("📥 Importar", "/import")}
+        <main>
+          <div class="card">
+            <div style="font-weight:700; margin-bottom:8px;">No pude bajar las posiciones.</div>
+            <div class="muted" style="font-size:13px;">${escapeHtml(e.message)}</div>
+            <a href="#/credentials" class="btn ghost full" style="margin-top:12px;">Revisar credenciales</a>
+          </div>
+        </main>`;
+    }
+    const positions = preview.positions || [];
+    const asOf = preview.as_of || "";
+    const accounts = meta.accounts || [];
+
+    return `
+      ${headerWithBack(`📥 Importar de ${escapeHtml(broker)}`, "/import")}
+      <main>
+        <section>
+          <div class="card compact" style="margin-bottom:8px;">
+            <div style="display:flex; justify-content:space-between;">
+              <div>
+                <b>${positions.length}</b> posiciones · al <b>${escapeHtml(asOf)}</b>
+              </div>
+              <button class="btn ghost" onclick="document.querySelectorAll('input[name=imp]').forEach(c => c.checked = !c.checked)"
+                      style="padding:4px 10px; font-size:11px;">Toggle todos</button>
+            </div>
+            ${(preview.warnings || []).length > 0 ? `
+              <div class="muted" style="font-size:12px; margin-top:6px;">
+                ⚠ ${preview.warnings.map(escapeHtml).join("; ")}
+              </div>
+            ` : ""}
+          </div>
+        </section>
+
+        <form data-action="applyImport" id="import-form">
+          <input type="hidden" name="broker" value="${escapeHtml(broker)}">
+
+          <section>
+            <h2>Configuración</h2>
+            <div class="field">
+              <label>Cuenta destino *</label>
+              <select name="account" required>
+                ${accounts.map(a =>
+                  `<option value="${escapeHtml(a)}">${escapeHtml(a)}</option>`
+                ).join("")}
+              </select>
+            </div>
+            <div class="field">
+              <label>Fecha del saldo</label>
+              <input type="date" name="fecha" value="${fmt.today()}">
+            </div>
+            <div class="field" style="display:flex; align-items:center; gap:8px;">
+              <input type="checkbox" name="create_missing_assets" id="create-missing" checked
+                     style="width:auto;">
+              <label for="create-missing" style="margin:0;">
+                Crear assets nuevos automáticamente en <code>especies</code>
+              </label>
+            </div>
+          </section>
+
+          <section>
+            <h2>Posiciones a importar</h2>
+            <div class="list">
+              ${positions.length === 0 ? `<div class="card muted">Sin posiciones.</div>` :
+                positions.map((p, i) => `
+                <label class="list-item" style="cursor:pointer; align-items:flex-start;">
+                  <input type="checkbox" name="imp" value="${i}" checked
+                         style="width:auto; margin-right:8px; margin-top:4px;">
+                  <div class="meta" style="flex:1;">
+                    <div class="meta-line1">
+                      ${tickerHtml(p.ticker, p.asset_class)}
+                      ${p.is_cash ? '<span class="tag" style="font-size:9px;">cash</span>' : ''}
+                      ${p.known === false ? '<span class="tag warn" style="font-size:9px;">nuevo</span>' :
+                        p.known === true ? '<span class="tag success" style="font-size:9px;">existe</span>' : ''}
+                    </div>
+                    <div class="meta-line2 muted" style="font-size:11px;">
+                      ${escapeHtml(p.name || '')} · ${escapeHtml(p.asset_class)}
+                      ${p.avg_price != null ? '· avg ' + fmt.money(p.avg_price, 4) : ''}
+                    </div>
+                  </div>
+                  <div class="right">
+                    <div class="amount tabular">${fmt.money(p.qty, 6)}</div>
+                    <div class="sub muted">${escapeHtml(p.currency)}</div>
+                  </div>
+                  <input type="hidden" name="data_${i}"
+                         value='${escapeHtml(JSON.stringify(p))}'>
+                </label>
+              `).join("")}
+            </div>
+          </section>
+
+          ${positions.length > 0 ? `
+            <button type="submit" class="btn primary full" style="margin-top:14px;">
+              Importar seleccionadas
+            </button>
+            <div class="muted" style="font-size:12px; text-align:center; margin-top:8px;">
+              Se escribe al sheet <code>_carga_inicial</code> y se re-importa el master.
+            </div>
+          ` : ""}
+        </form>
+      </main>
     `;
   });
 
@@ -4288,9 +4860,9 @@ python yfinance_loader.py</pre>
             "Configurar", "#/credentials",
             hasBymaCreds)}
 
-          ${step(3, "Cargar tu primer trade o saldo inicial",
-            "Si ya tenías posiciones, agregalas como saldo inicial en la hoja '_carga_inicial' del Excel. Si arrancás de cero, cargá un trade.",
-            "Cargar trade", "#/trades/new",
+          ${step(3, "Cargar tus tenencias",
+            "Si ya tenías posiciones, podés <b>auto-importarlas</b> desde tu broker. Si arrancás de cero, cargá tu primer trade manualmente.",
+            "Auto-importar", "#/import",
             hasTrades)}
 
           ${step(4, "Refrescar precios y ver tu portfolio",
@@ -4640,46 +5212,244 @@ python yfinance_loader.py</pre>
 
   // -------- Bootstrap --------
 
-  // Si no hay token → login screen
+  // Si no hay token → login screen.
+  // Soporta dos modos: 'login' (default) y 'signup'. Hash router de
+  // estados internos: #/forgot, #/reset?token=..., #/verify?token=...
   function showLogin() {
-    document.body.innerHTML = `
-      <div class="login-screen">
-        <div class="logo">WM</div>
-        <div class="tagline">Wealth Management</div>
-        <form id="login-form">
-          <div class="field">
-            <label>API Token</label>
-            <input type="password" name="token" placeholder="github_pat_... o tu token de 64 chars"
-                   autocomplete="off" required>
-          </div>
-          <button type="submit" class="btn primary full" style="margin-top:12px">Entrar</button>
-          <div style="text-align:center; margin-top:12px; font-size:12px; opacity:0.8;">
-            El token se guarda solo en este dispositivo (localStorage).
-          </div>
-        </form>
-      </div>
-    `;
-    document.getElementById("login-form").addEventListener("submit", async (e) => {
-      e.preventDefault();
-      const tok = e.target.token.value.trim();
-      if (!tok) return;
-      API.setToken(tok);
-      // Verificar haciendo una llamada autenticada
-      try {
-        const data = await API.req("/api/config");
-        if (data.anchor) {
-          API.setAnchor(data.anchor);
+    function paint() {
+      const hash = (window.location.hash || "").replace(/^#/, "");
+      // Forzar estado por hash si el user vino con un link de email
+      if (hash.startsWith("/reset-password")) return paintReset(hash);
+      if (hash.startsWith("/verify-email"))   return paintVerify(hash);
+      if (hash === "/forgot-password")        return paintForgot();
+      if (hash === "/signup")                 return paintAuthForm("signup");
+      return paintAuthForm("login");
+    }
+
+    function paintAuthForm(mode) {
+      const isSignup = mode === "signup";
+      document.body.innerHTML = `
+        <div class="login-screen">
+          <div class="logo">WM</div>
+          <div class="tagline">Wealth Management</div>
+          <form id="auth-form" autocomplete="on">
+            <div class="field">
+              <label>Email</label>
+              <input type="email" name="email" required autocomplete="email"
+                     placeholder="vos@ejemplo.com">
+            </div>
+            <div class="field">
+              <label>Contraseña</label>
+              <input type="password" name="password" required
+                     autocomplete="${isSignup ? 'new-password' : 'current-password'}"
+                     minlength="8" placeholder="8+ chars, letras + números">
+            </div>
+            ${isSignup ? `
+              <div class="field">
+                <label>Nombre (opcional)</label>
+                <input type="text" name="display_name" autocomplete="name"
+                       placeholder="¿Cómo te llamamos?">
+              </div>
+            ` : ""}
+            <button type="submit" class="btn primary full" style="margin-top:12px">
+              ${isSignup ? "Crear cuenta" : "Entrar"}
+            </button>
+            <div style="text-align:center; margin-top:14px; font-size:13px;">
+              ${isSignup
+                ? `¿Ya tenés cuenta? <a href="#/" style="color:#fff;text-decoration:underline;">Entrar</a>`
+                : `¿Sin cuenta? <a href="#/signup" style="color:#fff;text-decoration:underline;">Crear una</a>`}
+            </div>
+            <div style="text-align:center; margin-top:6px; font-size:12px; opacity:0.85;">
+              <a href="#/forgot-password" style="color:#fff;text-decoration:underline;">
+                Olvidé mi contraseña
+              </a>
+            </div>
+            ${!isSignup ? `
+              <details style="margin-top:14px; opacity:0.7; font-size:11px;">
+                <summary style="cursor:pointer;">Tengo un API token (modo legacy)</summary>
+                <input id="legacy-token" type="password"
+                       placeholder="bearer token de 64 chars"
+                       style="margin-top:8px; width:100%; padding:10px;">
+                <button type="button" id="legacy-go" class="btn ghost full" style="margin-top:6px; background:rgba(255,255,255,0.1); color:#fff;">Entrar con token</button>
+              </details>
+            ` : ""}
+          </form>
+        </div>
+      `;
+      document.getElementById("auth-form").addEventListener("submit", async (e) => {
+        e.preventDefault();
+        const fd = new FormData(e.target);
+        const body = Object.fromEntries(fd.entries());
+        try {
+          if (isSignup) {
+            const r = await API.req("/api/auth/signup",
+              { method: "POST", json: body, skipAuth: true });
+            if (r.verify_token_dev) {
+              // Bootstrap superadmin con auto-verify: usamos el token directamente
+              await API.req("/api/auth/verify-email",
+                { method: "POST", json: { token: r.verify_token_dev },
+                  skipAuth: true });
+              toast("Cuenta creada y verificada (modo dev) ✓", "success");
+            } else {
+              toast(`Cuenta creada. Te mandamos un email a ${body.email} ` +
+                    `para verificarla (revisá spam).`, "success");
+            }
+            // Auto-login
+            const login = await API.req("/api/auth/login",
+              { method: "POST", json: { email: body.email, password: body.password },
+                skipAuth: true });
+            API.setToken(login.session_token);
+            window.location.hash = "/welcome";
+            window.location.reload();
+          } else {
+            const r = await API.req("/api/auth/login",
+              { method: "POST", json: body, skipAuth: true });
+            API.setToken(r.session_token);
+            if (!r.user.email_verified) {
+              toast("Recordá verificar tu email para asegurar tu cuenta", "info");
+            }
+            window.location.hash = "";
+            window.location.reload();
+          }
+        } catch (err) {
+          toast(err.message || "Error", "error");
         }
-        window.location.reload();
-      } catch (err) {
-        toast("Token inválido o server caído: " + err.message, "error");
-        API.setToken("");
+      });
+      // Legacy token entry
+      const legacyBtn = document.getElementById("legacy-go");
+      if (legacyBtn) {
+        legacyBtn.addEventListener("click", async () => {
+          const tok = document.getElementById("legacy-token").value.trim();
+          if (!tok) return;
+          API.setToken(tok);
+          try {
+            await API.req("/api/config", { noCache: true });
+            window.location.reload();
+          } catch (err) {
+            toast("Token inválido: " + err.message, "error");
+            API.setToken("");
+          }
+        });
       }
-    });
+    }
+
+    function paintForgot() {
+      document.body.innerHTML = `
+        <div class="login-screen">
+          <div class="logo">WM</div>
+          <div class="tagline">Recuperar contraseña</div>
+          <form id="forgot-form">
+            <div class="field">
+              <label>Email</label>
+              <input type="email" name="email" required autocomplete="email"
+                     placeholder="vos@ejemplo.com">
+            </div>
+            <button type="submit" class="btn primary full" style="margin-top:12px">
+              Mandarme link
+            </button>
+            <div style="text-align:center; margin-top:14px; font-size:13px;">
+              <a href="#/" style="color:#fff;text-decoration:underline;">Volver al login</a>
+            </div>
+          </form>
+        </div>
+      `;
+      document.getElementById("forgot-form").addEventListener("submit", async (e) => {
+        e.preventDefault();
+        const email = e.target.email.value.trim();
+        try {
+          await API.req("/api/auth/forgot-password",
+            { method: "POST", json: { email }, skipAuth: true });
+          toast("Si el email existe te mandamos un link. Revisá spam también.",
+                "success");
+          setTimeout(() => { window.location.hash = "/"; paint(); }, 1200);
+        } catch (err) {
+          toast(err.message, "error");
+        }
+      });
+    }
+
+    function paintReset(hash) {
+      const qs = hash.split("?")[1] || "";
+      const params = new URLSearchParams(qs);
+      const token = params.get("token") || "";
+      document.body.innerHTML = `
+        <div class="login-screen">
+          <div class="logo">WM</div>
+          <div class="tagline">Cambiar contraseña</div>
+          <form id="reset-form">
+            <div class="field">
+              <label>Nueva contraseña</label>
+              <input type="password" name="new_password" required
+                     minlength="8" autocomplete="new-password">
+            </div>
+            <div class="field">
+              <label>Confirmar</label>
+              <input type="password" name="confirm" required minlength="8">
+            </div>
+            <button type="submit" class="btn primary full" style="margin-top:12px">
+              Cambiar contraseña
+            </button>
+          </form>
+        </div>
+      `;
+      document.getElementById("reset-form").addEventListener("submit", async (e) => {
+        e.preventDefault();
+        const np = e.target.new_password.value;
+        const c = e.target.confirm.value;
+        if (np !== c) { toast("Las contraseñas no coinciden", "error"); return; }
+        try {
+          await API.req("/api/auth/reset-password",
+            { method: "POST", json: { token, new_password: np }, skipAuth: true });
+          toast("Contraseña cambiada ✓ Ya podés entrar", "success");
+          setTimeout(() => { window.location.hash = "/"; paint(); }, 1200);
+        } catch (err) {
+          toast(err.message, "error");
+        }
+      });
+    }
+
+    function paintVerify(hash) {
+      const qs = hash.split("?")[1] || "";
+      const params = new URLSearchParams(qs);
+      const token = params.get("token") || "";
+      document.body.innerHTML = `
+        <div class="login-screen">
+          <div class="logo">WM</div>
+          <div class="tagline">Verificando email...</div>
+          <div id="verify-status" class="loading" style="color:#fff; opacity:0.85;">
+            <div class="spinner"></div> Esperá un toque...
+          </div>
+        </div>
+      `;
+      (async () => {
+        try {
+          await API.req("/api/auth/verify-email",
+            { method: "POST", json: { token }, skipAuth: true });
+          document.getElementById("verify-status").innerHTML =
+            "✓ Email verificado. Ya podés entrar.";
+          toast("Email verificado ✓", "success");
+          setTimeout(() => { window.location.hash = "/"; paint(); }, 1500);
+        } catch (err) {
+          document.getElementById("verify-status").innerHTML =
+            "✗ Link inválido o expirado.";
+          toast(err.message, "error");
+        }
+      })();
+    }
+
+    paint();
+    window.addEventListener("hashchange", paint);
   }
 
   function bootstrap() {
-    if (!API.token()) {
+    // Hashes que vienen por email (reset / verify) siempre van por showLogin
+    // — si el user tiene token de otra cuenta, igual queremos procesar el link.
+    const hash = (window.location.hash || "").replace(/^#/, "");
+    const isAuthHash = (hash.startsWith("/reset-password")
+                         || hash.startsWith("/verify-email")
+                         || hash === "/forgot-password"
+                         || hash === "/signup");
+    if (!API.token() || isAuthHash) {
       showLogin();
       return;
     }

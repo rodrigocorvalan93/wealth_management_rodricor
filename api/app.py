@@ -73,6 +73,7 @@ from .state import (
 )
 from . import credentials as creds
 from . import audit, ratelimit
+from . import auth as auth_mod
 from .users import (
     load_users, resolve_user_by_token, get_active_user,
     admin_switch_to, admin_switch_clear, is_switched,
@@ -130,42 +131,108 @@ def create_app() -> Flask:
 
     # --- Auth + user resolution (multi-tenant) ---
 
+    # Endpoints de auth que NO requieren auth previa
+    AUTH_PUBLIC_PATHS = {
+        "/api/auth/signup", "/api/auth/login",
+        "/api/auth/forgot-password", "/api/auth/reset-password",
+        "/api/auth/verify-email",
+    }
+
     @app.before_request
     def _resolve_user():
         """Resuelve el user activo desde el bearer token y lo setea en g.
 
-        - g.auth_user: el user dueño del token
-        - g.active_user_id: el user_id efectivamente activo (=auth_user, o
-          el target si el admin hizo switch)
+        Acepta dos tipos de token:
+          1. Session token de auth_db (preferido — emitido al login con
+             email/password). Resuelve via api/auth.resolve_session.
+          2. Legacy bearer token de WM_USERS_JSON / WM_API_TOKEN.
+
+        - g.auth_user: el user dueño del token (UserConfig-like)
+        - g.active_user_id: user_id efectivamente activo
         - g.is_admin: True si el auth_user es admin
+        - g.is_superadmin: True si el auth_user es superadmin
         - g.is_switched: True si el admin está viendo datos de otro
+        - g.auth_via: 'session' | 'legacy' | None
         """
-        # Endpoints públicos: no resolver user
+        # Defaults siempre presentes para evitar AttributeError
+        g.auth_user = None
+        g.active_user_id = None
+        g.is_admin = False
+        g.is_superadmin = False
+        g.is_switched = False
+        g.user_token = None
+        g.auth_via = None
+        g.auth_email = None
+
         if not request.path.startswith("/api/"):
             return
         if request.method == "OPTIONS":
             return
         if request.path == "/api/health":
             return
+        if request.path in AUTH_PUBLIC_PATHS:
+            return
 
         auth = request.headers.get("Authorization", "")
         if not auth.startswith("Bearer "):
-            return  # _require_auth abortará después
+            return
         token = auth[len("Bearer "):].strip()
+        g.user_token = token
 
+        # 1) Session token (auth_db)
+        try:
+            session_info = auth_mod.resolve_session(token)
+        except Exception:
+            session_info = None
+        if session_info:
+            class _U:
+                pass
+            u = _U()
+            u.user_id = session_info["user_id"]
+            u.display_name = session_info["display_name"]
+            u.is_admin = session_info["is_admin"] or session_info["is_superadmin"]
+            u.token = token
+            g.auth_user = u
+            g.active_user_id = session_info["user_id"]
+            g.is_admin = bool(session_info["is_admin"]
+                                or session_info["is_superadmin"])
+            g.is_superadmin = bool(session_info["is_superadmin"])
+            g.auth_email = session_info.get("email")
+            g.auth_email_verified = bool(session_info.get("email_verified"))
+            g.auth_via = "session"
+            # Switch state (compat) — superadmin puede usar el switch viejo
+            from .users import is_switched as _is_switched, _switched
+            if g.is_superadmin and token in _switched:
+                target_id = _switched[token]
+                # Validar que ese user_id realmente exista en alguno de los
+                # backends
+                target_legacy = next(
+                    (lu for lu in load_users() if lu.user_id == target_id), None
+                )
+                if target_legacy:
+                    g.active_user_id = target_legacy.user_id
+                    g.is_switched = True
+                else:
+                    # Switch a un user de auth_db
+                    p = auth_mod.get_user_profile(target_id)
+                    if p:
+                        g.active_user_id = p["user_id"]
+                        g.is_switched = True
+            return
+
+        # 2) Legacy bearer token (WM_USERS_JSON / WM_API_TOKEN)
         active = get_active_user(token)
         if active is None:
-            return  # _require_auth abortará
-
+            return
         auth_user, switched = active
-        # auth_user es el user dueño del token (puede ser admin con switch)
-        # Buscamos el user real al que apunta:
         actual_token_owner = resolve_user_by_token(token)
         g.auth_user = actual_token_owner
         g.active_user_id = auth_user.user_id
         g.is_admin = bool(actual_token_owner and actual_token_owner.is_admin)
+        # En legacy, admin es de facto superadmin (back-compat)
+        g.is_superadmin = bool(actual_token_owner and actual_token_owner.is_admin)
         g.is_switched = switched
-        g.user_token = token
+        g.auth_via = "legacy"
 
     @app.before_request
     def _rate_limit():
@@ -234,8 +301,6 @@ def create_app() -> Flask:
 
     def _require_auth():
         """Verifica que haya user resuelto en g."""
-        if not load_users():
-            abort(500, "Sin users configurados. Setea WM_USERS_JSON o WM_API_TOKEN.")
         if not getattr(g, "active_user_id", None):
             abort(401, "Token inválido o ausente")
 
@@ -244,6 +309,12 @@ def create_app() -> Flask:
         _require_auth()
         if not getattr(g, "is_admin", False):
             abort(403, "Acción solo para admin")
+
+    def _require_superadmin():
+        """Solo superadmins (o admin legacy)."""
+        _require_auth()
+        if not getattr(g, "is_superadmin", False):
+            abort(403, "Acción solo para superadmin")
 
     def _block_if_switched_mutation():
         """En vista 'switched', el admin no puede mutar datos del target user.
@@ -1719,6 +1790,278 @@ def create_app() -> Flask:
         )
 
     # =========================================================================
+    # Auth: signup / login / forgot-password / verify-email / me
+    # =========================================================================
+
+    def _client_ctx() -> dict:
+        ip = (request.headers.get("X-Forwarded-For",
+                                    request.remote_addr or "")
+              .split(",")[0].strip())
+        return {"ip": ip,
+                "user_agent": request.headers.get("User-Agent", "")[:200]}
+
+    def _auth_err_response(e: auth_mod.AuthError):
+        return jsonify({"error": True, "code": e.code,
+                        "message": e.message}), e.http_status
+
+    @app.post("/api/auth/signup")
+    def auth_signup():
+        body = request.get_json(silent=True) or {}
+        email = body.get("email") or ""
+        password = body.get("password") or ""
+        display_name = body.get("display_name") or ""
+        ctx = _client_ctx()
+        try:
+            r = auth_mod.signup(email, password, display_name=display_name,
+                                ip=ctx["ip"], user_agent=ctx["user_agent"])
+        except auth_mod.AuthError as e:
+            return _auth_err_response(e)
+
+        # Bootstrap del Excel master para el user nuevo. Sin esto, todas
+        # las páginas tiran "Excel master no presente". Mismo flow que
+        # /api/admin/users: build_master + add_carga_inicial + blank
+        # event sheets + auto-import.
+        bootstrap_warnings = []
+        try:
+            new_settings = get_user_settings(r.user_id)
+            new_settings.inputs_dir.mkdir(parents=True, exist_ok=True)
+            new_settings.user_data_dir.mkdir(parents=True, exist_ok=True)
+            new_settings.backups_dir.mkdir(parents=True, exist_ok=True)
+            if not new_settings.xlsx_path.is_file():
+                from build_master import build_master
+                try:
+                    from add_carga_inicial_sheet import add_carga_inicial_sheet
+                except ImportError:
+                    add_carga_inicial_sheet = None
+                build_master(new_settings.xlsx_path)
+                if add_carga_inicial_sheet:
+                    add_carga_inicial_sheet(new_settings.xlsx_path)
+                _blank_event_sheets(new_settings.xlsx_path)
+                # Auto-import para crear la DB
+                try:
+                    reimport_excel(settings=new_settings)
+                except Exception as e:
+                    bootstrap_warnings.append(
+                        f"Auto-import falló: {e}. Hacé refresh manual."
+                    )
+        except Exception as e:
+            print(f"[signup] WARN bootstrap del master falló para "
+                  f"{r.user_id}: {e}")
+            bootstrap_warnings.append(
+                f"No pude crear el Excel master automáticamente: {e}. "
+                f"Subí uno manualmente desde Settings."
+            )
+
+        # En modo dev sin SMTP, devolver el verify token para que el user
+        # pueda verificarse sin email funcional.
+        dev_token = r.verify_token_plain if (
+            r.verify_email_via != "smtp"
+            and os.environ.get("WM_AUTO_VERIFY_FIRST_SUPERADMIN") == "1"
+            and r.is_superadmin
+        ) else None
+        return jsonify({
+            "user_id": r.user_id,
+            "email": r.email,
+            "is_superadmin": r.is_superadmin,
+            "is_admin": r.is_admin,
+            "verify_email_sent_via": r.verify_email_via,
+            "verify_token_dev": dev_token,
+            "needs_verification": r.verify_token_plain is not None,
+            "bootstrap_warnings": bootstrap_warnings,
+        }), 201
+
+    @app.post("/api/auth/login")
+    def auth_login():
+        body = request.get_json(silent=True) or {}
+        email = body.get("email") or ""
+        password = body.get("password") or ""
+        ctx = _client_ctx()
+        try:
+            r = auth_mod.login(email, password, ip=ctx["ip"],
+                               user_agent=ctx["user_agent"])
+        except auth_mod.AuthError as e:
+            return _auth_err_response(e)
+        return jsonify({
+            "session_token": r.session_token,
+            "session_token_prefix": r.session_token_prefix,
+            "expires_at": r.expires_at,
+            "user": {
+                "user_id": r.user_id,
+                "email": r.email,
+                "display_name": r.display_name,
+                "is_admin": r.is_admin,
+                "is_superadmin": r.is_superadmin,
+                "email_verified": r.email_verified,
+            },
+        })
+
+    @app.post("/api/auth/logout")
+    def auth_logout():
+        token = (request.headers.get("Authorization", "")
+                 .replace("Bearer ", "").strip())
+        ok = auth_mod.logout(token)
+        return jsonify({"ok": ok})
+
+    @app.post("/api/auth/forgot-password")
+    def auth_forgot():
+        body = request.get_json(silent=True) or {}
+        email = body.get("email") or ""
+        ctx = _client_ctx()
+        # Siempre devolvemos OK aunque el email no exista (anti-enumeration)
+        result = auth_mod.request_password_reset(email, ip=ctx["ip"])
+        return jsonify({
+            "ok": True,
+            "message": "Si el email existe, te mandamos un link de "
+                        "recuperación. Revisá spam también.",
+            "delivery": result.get("via"),
+        })
+
+    @app.post("/api/auth/reset-password")
+    def auth_reset():
+        body = request.get_json(silent=True) or {}
+        token = body.get("token") or ""
+        new_password = body.get("new_password") or ""
+        ctx = _client_ctx()
+        try:
+            r = auth_mod.reset_password_with_token(token, new_password,
+                                                    ip=ctx["ip"])
+        except auth_mod.AuthError as e:
+            return _auth_err_response(e)
+        return jsonify(r)
+
+    @app.post("/api/auth/verify-email")
+    def auth_verify_email():
+        body = request.get_json(silent=True) or {}
+        token = body.get("token") or ""
+        try:
+            r = auth_mod.verify_email_with_token(token)
+        except auth_mod.AuthError as e:
+            return _auth_err_response(e)
+        return jsonify(r)
+
+    @app.post("/api/auth/resend-verify")
+    def auth_resend_verify():
+        _require_auth()
+        try:
+            r = auth_mod.resend_verification(g.active_user_id)
+        except auth_mod.AuthError as e:
+            return _auth_err_response(e)
+        return jsonify(r)
+
+    @app.post("/api/auth/change-password")
+    def auth_change_password():
+        _require_auth()
+        body = request.get_json(silent=True) or {}
+        try:
+            r = auth_mod.change_password(
+                g.active_user_id,
+                body.get("current_password") or "",
+                body.get("new_password") or "",
+                current_session_token=g.user_token,
+            )
+        except auth_mod.AuthError as e:
+            return _auth_err_response(e)
+        return jsonify(r)
+
+    @app.get("/api/auth/me")
+    def auth_me():
+        _require_auth()
+        # Si vino por session token, devolver el perfil del auth_users.
+        if getattr(g, "auth_via", None) == "session":
+            profile = auth_mod.get_user_profile(g.active_user_id)
+            sessions = auth_mod.list_user_sessions(g.active_user_id)
+            return jsonify({
+                "auth_via": "session",
+                "user": profile,
+                "active_sessions": len(sessions),
+                "sessions": sessions,
+                "is_switched": bool(g.is_switched),
+            })
+        # Legacy
+        return jsonify({
+            "auth_via": "legacy",
+            "user": {
+                "user_id": g.active_user_id,
+                "is_admin": g.is_admin,
+                "is_superadmin": g.is_superadmin,
+                "email": None,
+                "email_verified": None,
+                "display_name": (g.auth_user.display_name
+                                  if g.auth_user else g.active_user_id),
+            },
+            "is_switched": bool(g.is_switched),
+        })
+
+    @app.put("/api/auth/me")
+    def auth_update_me():
+        _require_auth()
+        body = request.get_json(silent=True) or {}
+        if "display_name" in body:
+            try:
+                r = auth_mod.update_display_name(g.active_user_id,
+                                                  body["display_name"])
+            except auth_mod.AuthError as e:
+                return _auth_err_response(e)
+            return jsonify(r)
+        return jsonify({"ok": True})
+
+    @app.delete("/api/auth/sessions/<prefix>")
+    def auth_revoke_session(prefix):
+        _require_auth()
+        ok = auth_mod.revoke_session(g.active_user_id, prefix)
+        return jsonify({"revoked": ok})
+
+    @app.delete("/api/auth/sessions")
+    def auth_revoke_all_sessions():
+        """Revoca todas las sesiones excepto la actual."""
+        _require_auth()
+        n = auth_mod.revoke_all_sessions(g.active_user_id,
+                                          except_token=g.user_token)
+        return jsonify({"revoked": n})
+
+    # =========================================================================
+    # Superadmin: gestión de auth_users
+    # =========================================================================
+
+    @app.get("/api/superadmin/users")
+    def superadmin_list_users():
+        _require_superadmin()
+        return jsonify({
+            "users": auth_mod.list_all_auth_users(),
+            "self": g.active_user_id,
+        })
+
+    @app.put("/api/superadmin/users/<user_id>/admin")
+    def superadmin_set_admin(user_id):
+        _require_superadmin()
+        body = request.get_json(silent=True) or {}
+        is_admin = bool(body.get("is_admin", True))
+        return jsonify(auth_mod.set_admin_flag(user_id, is_admin,
+                                                 g.active_user_id))
+
+    @app.put("/api/superadmin/users/<user_id>/superadmin")
+    def superadmin_set_superadmin(user_id):
+        _require_superadmin()
+        body = request.get_json(silent=True) or {}
+        is_super = bool(body.get("is_superadmin", True))
+        if user_id == g.active_user_id and not is_super:
+            abort(400, "No podés removerte a vos mismo el superadmin "
+                       "(promové a otro user antes).")
+        return jsonify(auth_mod.set_superadmin_flag(user_id, is_super,
+                                                     g.active_user_id))
+
+    @app.delete("/api/superadmin/users/<user_id>")
+    def superadmin_delete_user(user_id):
+        _require_superadmin()
+        if user_id == g.active_user_id:
+            abort(400, "No podés borrar tu propia cuenta desde acá. "
+                       "Usá /api/account.")
+        try:
+            return jsonify(auth_mod.delete_auth_user(user_id, g.active_user_id))
+        except auth_mod.AuthError as e:
+            return _auth_err_response(e)
+
+    # =========================================================================
     # Credenciales del user (BYMA, CAFCI, etc.) — encriptadas en disk
     # =========================================================================
 
@@ -1816,6 +2159,239 @@ def create_app() -> Flask:
                         "import_stats": stats})
 
     # =========================================================================
+    # Auto-import de tenencias desde brokers (Cocos / Binance / IBKR)
+    # =========================================================================
+
+    @app.get("/api/import/brokers")
+    def import_list_brokers():
+        """Devuelve los brokers soportados + qué credenciales tiene el user."""
+        _require_auth()
+        from engine import brokers
+        brokers_meta = brokers.list_brokers()
+        configured = creds.get_credentials(g.active_user_id)
+        for b in brokers_meta:
+            b["ready"] = all(configured.get(k) for k in b["needs"])
+        return jsonify({"brokers": brokers_meta})
+
+    @app.post("/api/import/<broker>/test")
+    def import_test_credentials(broker):
+        """Hace un ping a las credenciales del broker para validarlas
+        SIN bajar todo el historial. Útil para feedback rápido al user."""
+        _require_auth(); _block_if_switched_mutation()
+        from engine import brokers
+        mod = brokers.get(broker)
+        if mod is None:
+            abort(404, f"Broker '{broker}' no soportado")
+        c = creds.get_credentials(g.active_user_id)
+        # Algunos brokers exponen test_credentials, otros no
+        test_fn = getattr(mod, "test_credentials", None)
+        if test_fn is None:
+            # Fallback: hacer fetch_positions y reportar
+            try:
+                r = mod.fetch_positions(c)
+                return jsonify({"ok": True, "n_positions": len(r["positions"])})
+            except Exception as e:
+                return jsonify({"ok": False,
+                                 "error": f"{type(e).__name__}: {e}"}), 200
+        return jsonify(test_fn(c))
+
+    @app.post("/api/import/<broker>/preview")
+    def import_preview(broker):
+        """Trae las posiciones del broker y las devuelve SIN escribir nada.
+
+        Body opcional:
+          {"match_assets": true}  → si True, marca cuáles tickers ya
+                                    existen en `especies` del Excel
+                                    para que la UI los pueda diferenciar
+                                    de los nuevos.
+        """
+        _require_auth(); _block_if_switched_mutation()
+        from engine import brokers
+        mod = brokers.get(broker)
+        if mod is None:
+            abort(404, f"Broker '{broker}' no soportado")
+        c = creds.get_credentials(g.active_user_id)
+        try:
+            result = mod.fetch_positions(c)
+        except (ValueError, PermissionError) as e:
+            abort(400, str(e))
+        except Exception as e:
+            abort(502, f"Error del broker: {type(e).__name__}: {e}")
+
+        # Match contra `especies` para flagear assets desconocidos
+        s = get_settings()
+        existing_tickers = set()
+        existing_currencies = set()
+        try:
+            from .excel_io import list_rows
+            for row in list_rows(s.xlsx_path, "especies"):
+                t = row.get("Ticker")
+                if t:
+                    existing_tickers.add(str(t).strip())
+            for row in list_rows(s.xlsx_path, "monedas"):
+                code = row.get("Code")
+                if code:
+                    existing_currencies.add(str(code).strip())
+        except Exception:
+            pass
+        for p in result["positions"]:
+            t = p["ticker"]
+            if p["is_cash"]:
+                p["known"] = t in existing_currencies
+            else:
+                p["known"] = t in existing_tickers
+        return jsonify(result)
+
+    @app.post("/api/import/<broker>/apply")
+    def import_apply(broker):
+        """Aplica una preview al Excel master.
+
+        Body:
+          {
+            "account": "cocos",                     # cuenta destino (debe existir)
+            "fecha": "2026-05-06",                   # fecha del saldo inicial (default hoy)
+            "positions": [                           # subset que el user confirmó
+              {"ticker":"AL30D","qty":1000,"avg_price":65.5,"currency":"USB",
+               "asset_class":"BOND_AR","name":"Bonar 2030",
+               "is_cash":false,"register_asset":true},
+              ...
+            ],
+            "create_missing_assets": true            # crear assets nuevos en `especies`
+          }
+
+        Crea filas en la hoja `_carga_inicial` del Excel master (que
+        el motor procesa via cli.cargar_iniciales para generar asientos
+        de OPENING_BALANCE). Devuelve cuántas filas escribió.
+        """
+        _require_auth(); _block_if_switched_mutation()
+        body = request.get_json(silent=True) or {}
+        account = (body.get("account") or "").strip()
+        fecha = body.get("fecha") or date.today().isoformat()
+        positions = body.get("positions") or []
+        create_missing = bool(body.get("create_missing_assets", True))
+        if not account or not positions:
+            abort(400, "account y positions son requeridos")
+
+        s = get_settings()
+        if not s.xlsx_path.is_file():
+            abort(400, "No hay Excel master cargado todavía")
+
+        from .excel_io import list_rows, append_row
+        # Validar cuenta existe
+        accounts = {r.get("Code"): r
+                     for r in list_rows(s.xlsx_path, "cuentas")
+                     if r.get("Code")}
+        if account not in accounts:
+            abort(400, f"Cuenta '{account}' no existe en `cuentas`")
+
+        # Assets / monedas existentes
+        existing_assets = {r.get("Ticker"): r
+                            for r in list_rows(s.xlsx_path, "especies")
+                            if r.get("Ticker")}
+        existing_ccy = set(r.get("Code") for r in list_rows(s.xlsx_path, "monedas")
+                            if r.get("Code"))
+
+        with excel_write_lock():
+            backup_excel()
+            n_assets = 0
+            n_initial = 0
+            warnings = []
+            for p in positions:
+                ticker = (p.get("ticker") or "").strip()
+                qty = float(p.get("qty") or 0)
+                ccy = (p.get("currency") or "ARS").strip().upper()
+                avg = p.get("avg_price")
+                is_cash = bool(p.get("is_cash"))
+                cls = p.get("asset_class") or "OTHER"
+                name = p.get("name") or ticker
+
+                if not ticker or abs(qty) < 1e-9:
+                    continue
+
+                # Crear asset si no existe (solo no-cash)
+                if not is_cash and ticker not in existing_assets:
+                    if create_missing:
+                        try:
+                            append_row(s.xlsx_path, "especies", {
+                                "Ticker": ticker,
+                                "Name": name or ticker,
+                                "Asset Class": cls,
+                                "Currency": ccy,
+                                "Notes": f"Auto-importado de {broker}",
+                            })
+                            existing_assets[ticker] = True
+                            n_assets += 1
+                        except Exception as e:
+                            warnings.append(
+                                f"No pude crear asset {ticker}: {e}"
+                            )
+                            continue
+                    else:
+                        warnings.append(
+                            f"Asset {ticker} no existe — skipped"
+                        )
+                        continue
+
+                # Cash: validar que la moneda exista
+                if is_cash and ticker not in existing_ccy:
+                    warnings.append(
+                        f"Moneda {ticker} no existe en `monedas` — skipped"
+                    )
+                    continue
+
+                # Append a `_carga_inicial`. La hoja tiene columnas:
+                #   Fecha | Cuenta | Activo | Qty | Unit Price | Currency | Notes
+                try:
+                    payload = {
+                        "Fecha": fecha,
+                        "Cuenta": account,
+                        "Activo": ticker,
+                        "Qty": qty,
+                        "Unit Price": avg if avg else (1.0 if is_cash else None),
+                        "Price Currency": ccy,
+                        "Description": (f"Saldo inicial {ticker} "
+                                         f"(auto-import {broker})"),
+                    }
+                    # _carga_inicial puede no estar en ALLOWED_SHEETS;
+                    # escribimos directo al workbook si hace falta.
+                    try:
+                        append_row(s.xlsx_path, "_carga_inicial", payload)
+                    except Exception:
+                        # Fallback: escribir en asientos_contables como
+                        # OPENING_BALANCE (compat con el flow viejo).
+                        from openpyxl import load_workbook
+                        wb = load_workbook(filename=str(s.xlsx_path))
+                        if "_carga_inicial" in wb.sheetnames:
+                            ws = wb["_carga_inicial"]
+                            ws.append([
+                                fecha, account, ticker, qty,
+                                avg if avg else (1.0 if is_cash else None),
+                                ccy, payload["Description"],
+                            ])
+                            wb.save(str(s.xlsx_path))
+                        else:
+                            raise
+                    n_initial += 1
+                except Exception as e:
+                    warnings.append(f"No pude escribir saldo {ticker}: {e}")
+                    continue
+
+            # Re-importar para que el motor procese la carga inicial
+            stats = reimport_excel()
+            prune_backups(keep_last=50)
+
+        return jsonify({
+            "ok": True,
+            "broker": broker,
+            "account": account,
+            "fecha": fecha,
+            "n_assets_created": n_assets,
+            "n_positions_written": n_initial,
+            "warnings": warnings,
+            "import_stats": stats,
+        })
+
+    # =========================================================================
     # Audit log per-user (read-only)
     # =========================================================================
 
@@ -1880,6 +2456,46 @@ def create_app() -> Flask:
             buf.read(), mimetype="application/zip",
             headers={"Content-Disposition": f'attachment; filename="{fname}"'},
         )
+
+    @app.post("/api/account/bootstrap")
+    def account_bootstrap_endpoint():
+        """Crea el Excel master inicial para el user actual si no existe.
+
+        Útil para users registrados antes de que el signup hiciera
+        bootstrap automático. Idempotente: si el Excel ya existe, no
+        toca nada y devuelve already=True.
+        """
+        _require_auth(); _block_if_switched_mutation()
+        s = get_settings()
+        if s.xlsx_path.is_file():
+            return jsonify({"already": True, "xlsx_path": str(s.xlsx_path)})
+        s.inputs_dir.mkdir(parents=True, exist_ok=True)
+        s.user_data_dir.mkdir(parents=True, exist_ok=True)
+        s.backups_dir.mkdir(parents=True, exist_ok=True)
+        warnings = []
+        try:
+            from build_master import build_master
+            try:
+                from add_carga_inicial_sheet import add_carga_inicial_sheet
+            except ImportError:
+                add_carga_inicial_sheet = None
+            build_master(s.xlsx_path)
+            if add_carga_inicial_sheet:
+                add_carga_inicial_sheet(s.xlsx_path)
+            _blank_event_sheets(s.xlsx_path)
+            try:
+                stats = reimport_excel()
+            except Exception as e:
+                warnings.append(f"Auto-import falló: {e}")
+                stats = None
+        except Exception as e:
+            abort(500, f"No pude generar el master: {type(e).__name__}: {e}")
+        return jsonify({
+            "ok": True,
+            "xlsx_path": str(s.xlsx_path),
+            "import_stats": stats,
+            "warnings": warnings,
+        })
 
     @app.delete("/api/account")
     def account_delete_endpoint():

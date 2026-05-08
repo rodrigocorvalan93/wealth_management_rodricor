@@ -1,0 +1,39 @@
+# Datos privados que NO deben ir a la imagen
+data/
+inputs/
+*.csv
+*.xlsx
+*.xls
+*.db
+*.db-journal
+audit.log
+audit.log.*
+.encryption_key
+credentials.enc
+_outbox/
+
+# Tests + dev tooling
+tests/
+pytest.ini
+.pytest_cache/
+__pycache__/
+*.pyc
+*.pyo
+
+# Editor / git
+.git/
+.gitignore
+.venv/
+venv/
+.vscode/
+.idea/
+.DS_Store
+
+# Secrets locales
+secrets.txt
+.env
+.env.local
+users.json
+
+# Docs (no afectan runtime)
+*.md

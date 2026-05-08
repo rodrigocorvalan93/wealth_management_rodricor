@@ -1,0 +1,60 @@
+# render.yaml — deploy a Render.com
+#
+# Setup:
+#   1) Pushear este archivo al repo en GitHub.
+#   2) En Render dashboard → New → Blueprint → conectá tu repo.
+#   3) Render lee este archivo y crea el servicio + el disco.
+#   4) En la UI te pide los secrets marcados sync:false:
+#         WM_BOOTSTRAP_SUPERADMIN_EMAIL  → tu email
+#         WM_ENCRYPTION_KEY              → click "Generate" para auto-key
+#         WM_SMTP_HOST/USER/PASS/FROM    → opcional (sino emails al outbox)
+#   5) Deploy. La primera vez tarda ~3min (build + first start).
+#
+# Plan: starter ($7/mes) viene con disco persistente, free tier no tiene
+# (el data/ se borra en cada deploy en free). Si querés probar gratis primero,
+# cambiá `plan: starter` a `plan: free` y SACÁ la sección `disk:` — los
+# datos NO van a sobrevivir restarts.
+
+services:
+  - type: web
+    name: wm-wealth-management
+    runtime: docker
+    plan: starter            # $7/mes, 512MB RAM, disco persistente
+    region: oregon           # cambialo si querés (oregon | frankfurt | singapore)
+    branch: main             # o claude/improve-app-design-13rIy si testeás antes
+    autoDeploy: true
+    healthCheckPath: /api/health
+    disk:
+      name: wm-data
+      mountPath: /app/data
+      sizeGB: 1              # 1 GB es de sobra para 100s de users
+    envVars:
+      # === Bootstrap superadmin ===
+      - key: WM_BOOTSTRAP_SUPERADMIN_EMAIL
+        sync: false           # te lo pide Render en el dashboard
+      - key: WM_AUTO_VERIFY_FIRST_SUPERADMIN
+        value: "1"            # solo para el primer deploy; vacialo después
+      # === Encriptación ===
+      - key: WM_ENCRYPTION_KEY
+        generateValue: true   # Render genera un Fernet key seguro
+      # === Tokens / paths ===
+      - key: WM_BASE_DIR
+        value: /app
+      - key: WM_USERS_FILE
+        value: /app/data/users.json    # legacy multi-tenant (compat)
+      - key: WM_ANCHOR
+        value: USD
+      # === Public URL para los links de email ===
+      - key: WM_APP_URL
+        sync: false           # ej https://wm-wealth-management.onrender.com
+      # === SMTP (opcional — si no, los emails caen al outbox) ===
+      - key: WM_SMTP_HOST
+        sync: false
+      - key: WM_SMTP_PORT
+        value: "587"
+      - key: WM_SMTP_USER
+        sync: false
+      - key: WM_SMTP_PASS
+        sync: false
+      - key: WM_SMTP_FROM
+        sync: false
