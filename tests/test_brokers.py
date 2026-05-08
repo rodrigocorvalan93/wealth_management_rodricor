@@ -112,12 +112,20 @@ def test_binance_fetch_positions_parses():
             {"asset": "BTC", "free": "0.5", "locked": "0"},
             {"asset": "ETH", "free": "2.0", "locked": "0.5"},
             {"asset": "USDT", "free": "1000", "locked": "0"},
+            {"asset": "ARS", "free": "100000", "locked": "0"},
             {"asset": "DOGE", "free": "0", "locked": "0"},      # filtrado
             {"asset": "LDBTC", "free": "0.1", "locked": "0"},   # LD-prefix
         ]
     }
+    fake_prices = [
+        {"symbol": "BTCUSDT", "price": "95000.00"},
+        {"symbol": "ETHUSDT", "price": "3500.00"},
+        {"symbol": "OTHERUSDT", "price": "1.0"},
+    ]
     with patch("engine.brokers.binance._signed_get",
-                return_value=fake_response):
+                return_value=fake_response), \
+         patch("engine.brokers.binance._public_get",
+                return_value=fake_prices):
         r = binance.fetch_positions({
             "binance_api_key": "k", "binance_api_secret": "s"
         })
@@ -126,17 +134,32 @@ def test_binance_fetch_positions_parses():
     assert "BTC" in tickers
     assert "ETH" in tickers
     assert "USDT" in tickers
+    assert "ARS" in tickers
     assert "DOGE" not in tickers
     assert "LDBTC" not in tickers
+
     btc = next(p for p in r["positions"] if p["ticker"] == "BTC")
     assert btc["qty"] == 0.5
     assert btc["asset_class"] == "CRYPTO"
     assert btc["is_cash"] is False
+    assert btc["avg_price"] == 95000.0   # bajado del ticker
+
     eth = next(p for p in r["positions"] if p["ticker"] == "ETH")
-    assert eth["qty"] == 2.5  # free + locked
+    assert eth["qty"] == 2.5
+    assert eth["avg_price"] == 3500.0
+
     usdt = next(p for p in r["positions"] if p["ticker"] == "USDT")
     assert usdt["asset_class"] == "STABLECOIN"
-    assert usdt["is_cash"] is True
+    # NUEVO behavior: stables son ASSETS, no cash
+    assert usdt["is_cash"] is False
+    assert usdt["avg_price"] == 1.0
+    assert usdt["currency"] == "USD"
+
+    ars = next(p for p in r["positions"] if p["ticker"] == "ARS")
+    assert ars["asset_class"] == "CASH"
+    assert ars["is_cash"] is True
+    assert ars["avg_price"] == 1.0
+    assert ars["currency"] == "ARS"
 
 
 def test_binance_missing_creds():
