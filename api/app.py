@@ -2235,8 +2235,10 @@ def create_app() -> Flask:
         # Re-importar el Excel del superadmin para que vea los nuevos
         # precios inmediatamente. El resto de los users tomará los
         # precios cuando ellos disparen un re-import.
-        with excel_write_lock():
-            stats = reimport_excel()
+        stats = None
+        if s.xlsx_path.is_file():
+            with excel_write_lock():
+                stats = reimport_excel()
         return jsonify({
             "loader_rc": rc,
             "fecha": fecha or "daily",
@@ -2283,8 +2285,11 @@ def create_app() -> Flask:
             abort(502, f"CoinGecko falló: {type(e).__name__}: {e}")
 
         # Re-import para que el user actual vea los precios nuevos
-        with excel_write_lock():
-            stats = reimport_excel()
+        # (solo si tiene un master cargado — un user fresh todavía no)
+        stats = None
+        if s.xlsx_path.is_file():
+            with excel_write_lock():
+                stats = reimport_excel()
         return jsonify({
             "n_prices": n,
             "tickers": tickers,
@@ -2394,9 +2399,9 @@ def create_app() -> Flask:
             "create_missing_assets": true            # crear assets nuevos en `especies`
           }
 
-        Crea filas en la hoja `_carga_inicial` del Excel master (que
-        el motor procesa via cli.cargar_iniciales para generar asientos
-        de OPENING_BALANCE). Devuelve cuántas filas escribió.
+        Crea filas en la hoja `_carga_inicial` del Excel master, las
+        materializa como OPENING_BALANCE en `asientos_contables`
+        (vía cli.cargar_iniciales.generate_asientos) y re-importa.
         """
         _require_auth(); _block_if_switched_mutation()
         body = request.get_json(silent=True) or {}
@@ -2407,11 +2412,67 @@ def create_app() -> Flask:
         if not account or not positions:
             abort(400, "account y positions son requeridos")
 
+        result = _write_carga_inicial(
+            account=account, fecha=fecha, positions=positions,
+            create_missing=create_missing, broker_label=broker,
+        )
+        result["broker"] = broker
+        return jsonify(result)
+
+    @app.post("/api/carga-inicial")
+    def carga_inicial_manual():
+        """Carga manual de tenencias viejas (saldos de apertura).
+
+        Mismo contrato que /api/import/<broker>/apply pero sin broker:
+        el user arma la lista de posiciones a mano (desde el wizard).
+
+        Body:
+          {
+            "account": "cocos",
+            "fecha": "2026-05-06",
+            "positions": [
+              {"ticker":"AL30D","qty":500,"unit_price":65.5,"currency":"USB",
+               "asset_class":"BOND_AR","name":"Bonar 2030",
+               "is_cash":false,"strategy":"BH"},
+              {"ticker":"ARS","qty":200000,"is_cash":true,"currency":"ARS"},
+              ...
+            ],
+            "create_missing_assets": true
+          }
+        """
+        _require_auth(); _block_if_switched_mutation()
+        body = request.get_json(silent=True) or {}
+        account = (body.get("account") or "").strip()
+        fecha = body.get("fecha") or date.today().isoformat()
+        positions = body.get("positions") or []
+        create_missing = bool(body.get("create_missing_assets", True))
+        if not account or not positions:
+            abort(400, "account y positions son requeridos")
+
+        # Aceptar 'unit_price' (manual) o 'avg_price' (broker preview)
+        for p in positions:
+            if "unit_price" in p and "avg_price" not in p:
+                p["avg_price"] = p["unit_price"]
+
+        result = _write_carga_inicial(
+            account=account, fecha=fecha, positions=positions,
+            create_missing=create_missing, broker_label="manual",
+        )
+        return jsonify(result)
+
+    def _write_carga_inicial(account, fecha, positions, create_missing,
+                              broker_label):
+        """Escribe filas a `_carga_inicial`, las materializa como
+        OPENING_BALANCE en `asientos_contables` (via cli.cargar_iniciales)
+        y re-importa el Excel.
+
+        Usado tanto por /api/import/<broker>/apply como por la carga manual.
+        """
         s = get_settings()
         if not s.xlsx_path.is_file():
             abort(400, "No hay Excel master cargado todavía")
 
-        from .excel_io import list_rows, append_row
+        from .excel_io import list_rows
         # Validar cuenta existe
         accounts = {r.get("Code"): r
                      for r in list_rows(s.xlsx_path, "cuentas")
@@ -2426,11 +2487,27 @@ def create_app() -> Flask:
         existing_ccy = set(r.get("Code") for r in list_rows(s.xlsx_path, "monedas")
                             if r.get("Code"))
 
+        from openpyxl import load_workbook as _load_wb
+
+        # Headers de _carga_inicial:
+        #   Fecha | Cuenta | Activo | Qty | Unit Price | Price Currency
+        #   | Strategy | Description | Notes
         with excel_write_lock():
             backup_excel()
             n_assets = 0
             n_initial = 0
             warnings = []
+
+            wb = _load_wb(filename=str(s.xlsx_path))
+            if "_carga_inicial" not in wb.sheetnames:
+                # La hoja no existe — la creamos
+                try:
+                    from add_carga_inicial_sheet import add_hoja_carga_inicial
+                    add_hoja_carga_inicial(wb)
+                except Exception as e:
+                    abort(500, f"No pude crear hoja _carga_inicial: {e}")
+            ws_in = wb["_carga_inicial"]
+
             for p in positions:
                 ticker = (p.get("ticker") or "").strip()
                 qty = float(p.get("qty") or 0)
@@ -2439,6 +2516,9 @@ def create_app() -> Flask:
                 is_cash = bool(p.get("is_cash"))
                 cls = p.get("asset_class") or "OTHER"
                 name = p.get("name") or ticker
+                strategy = (p.get("strategy") or "").strip() or None
+                description = (p.get("description")
+                                 or f"Saldo inicial {ticker} ({broker_label})")
 
                 if not ticker or abs(qty) < 1e-9:
                     continue
@@ -2447,15 +2527,21 @@ def create_app() -> Flask:
                 if not is_cash and ticker not in existing_assets:
                     if create_missing:
                         try:
-                            append_row(s.xlsx_path, "especies", {
+                            # Cerrar el wb actual para que append_row no
+                            # sobreescriba lo que tenemos en memoria.
+                            wb.save(str(s.xlsx_path))
+                            from .excel_io import append_row as _append_row
+                            _append_row(s.xlsx_path, "especies", {
                                 "Ticker": ticker,
                                 "Name": name or ticker,
                                 "Asset Class": cls,
                                 "Currency": ccy,
-                                "Notes": f"Auto-importado de {broker}",
+                                "Notes": f"Auto-importado de {broker_label}",
                             })
                             existing_assets[ticker] = True
                             n_assets += 1
+                            wb = _load_wb(filename=str(s.xlsx_path))
+                            ws_in = wb["_carga_inicial"]
                         except Exception as e:
                             warnings.append(
                                 f"No pude crear asset {ticker}: {e}"
@@ -2474,57 +2560,68 @@ def create_app() -> Flask:
                     )
                     continue
 
-                # Append a `_carga_inicial`. La hoja tiene columnas:
-                #   Fecha | Cuenta | Activo | Qty | Unit Price | Currency | Notes
-                try:
-                    payload = {
-                        "Fecha": fecha,
-                        "Cuenta": account,
-                        "Activo": ticker,
-                        "Qty": qty,
-                        "Unit Price": avg if avg else (1.0 if is_cash else None),
-                        "Price Currency": ccy,
-                        "Description": (f"Saldo inicial {ticker} "
-                                         f"(auto-import {broker})"),
-                    }
-                    # _carga_inicial puede no estar en ALLOWED_SHEETS;
-                    # escribimos directo al workbook si hace falta.
-                    try:
-                        append_row(s.xlsx_path, "_carga_inicial", payload)
-                    except Exception:
-                        # Fallback: escribir en asientos_contables como
-                        # OPENING_BALANCE (compat con el flow viejo).
-                        from openpyxl import load_workbook
-                        wb = load_workbook(filename=str(s.xlsx_path))
-                        if "_carga_inicial" in wb.sheetnames:
-                            ws = wb["_carga_inicial"]
-                            ws.append([
-                                fecha, account, ticker, qty,
-                                avg if avg else (1.0 if is_cash else None),
-                                ccy, payload["Description"],
-                            ])
-                            wb.save(str(s.xlsx_path))
-                        else:
-                            raise
-                    n_initial += 1
-                except Exception as e:
-                    warnings.append(f"No pude escribir saldo {ticker}: {e}")
-                    continue
+                unit_price = avg if avg else (1.0 if is_cash else None)
+                price_currency = ccy if not is_cash else None
+                # Cash: el motor usa Activo=ARS/USB/etc y no necesita
+                # unit_price ni price_currency (es la propia moneda).
+                row_vals = [
+                    fecha,           # A: Fecha
+                    account,         # B: Cuenta
+                    ticker,          # C: Activo
+                    qty,             # D: Qty
+                    unit_price,      # E: Unit Price
+                    price_currency,  # F: Price Currency
+                    strategy or ("CASH" if is_cash else None),  # G: Strategy
+                    description,     # H: Description
+                    None,            # I: Notes
+                ]
+                # Append en la primera fila vacía después del header
+                next_row = ws_in.max_row + 1
+                # Buscar la primera fila realmente vacía (algunas hojas
+                # tienen filas con valores None que dejan max_row alto)
+                for r in range(5, ws_in.max_row + 2):
+                    if all(ws_in.cell(row=r, column=c).value in (None, "")
+                            for c in range(1, 10)):
+                        next_row = r
+                        break
+                for c, val in enumerate(row_vals, start=1):
+                    ws_in.cell(row=next_row, column=c, value=val)
+                n_initial += 1
+
+            wb.save(str(s.xlsx_path))
+
+            # Materializar las filas a `asientos_contables` como
+            # OPENING_BALANCE — sin esto, el motor nunca las ve.
+            asientos_stats = {}
+            try:
+                from cli.cargar_iniciales import generate_asientos
+                fx_csv = s.shared_data_dir / "fx_historico.csv"
+                asientos_stats = generate_asientos(
+                    s.xlsx_path,
+                    fecha_default=date.fromisoformat(fecha),
+                    dry_run=False,
+                    fx_csv_path=fx_csv,
+                )
+            except Exception as e:
+                warnings.append(
+                    f"generate_asientos falló: {type(e).__name__}: {e}"
+                )
 
             # Re-importar para que el motor procese la carga inicial
             stats = reimport_excel()
             prune_backups(keep_last=50)
 
-        return jsonify({
+        return {
             "ok": True,
-            "broker": broker,
             "account": account,
             "fecha": fecha,
             "n_assets_created": n_assets,
             "n_positions_written": n_initial,
+            "n_asientos_generated": (asientos_stats or {})
+                .get("filas_generadas_asientos", 0),
             "warnings": warnings,
             "import_stats": stats,
-        })
+        }
 
     # =========================================================================
     # Audit log per-user (read-only)

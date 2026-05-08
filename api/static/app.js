@@ -181,6 +181,11 @@
       method: "POST", json: fecha ? { fecha } : {},
     }),
 
+    // Carga manual de tenencias viejas (saldos de apertura)
+    cargaInicial: (payload) => API.req("/api/carga-inicial", {
+      method: "POST", json: payload,
+    }),
+
     // Audit log
     auditLog: (n = 100) => API.req(`/api/audit-log?n=${n}`, { noCache: true }),
 
@@ -1005,6 +1010,157 @@
           toast(`Error: ${e.message}`, "error");
         }
       }
+    },
+    async submitCargaInicial(_data, form) {
+      // Lee las posiciones del formulario y las manda a /api/carga-inicial.
+      // Estructura esperada del form:
+      //   account, fecha
+      //   pos_<i>_ticker, pos_<i>_qty, pos_<i>_unit_price, pos_<i>_currency,
+      //   pos_<i>_is_cash (checkbox), pos_<i>_asset_class, pos_<i>_name,
+      //   pos_<i>_strategy
+      const fd = new FormData(form);
+      const account = (fd.get("account") || "").trim();
+      const fecha = fd.get("fecha") || fmt.today();
+      if (!account) { toast("Elegí una cuenta", "error"); return; }
+
+      // Recolectar posiciones por índice
+      const byIdx = {};
+      for (const [k, v] of fd.entries()) {
+        const m = k.match(/^pos_(\d+)_(.+)$/);
+        if (!m) continue;
+        const i = m[1], field = m[2];
+        if (!byIdx[i]) byIdx[i] = {};
+        byIdx[i][field] = v;
+      }
+      const positions = [];
+      for (const i of Object.keys(byIdx).sort((a, b) => +a - +b)) {
+        const p = byIdx[i];
+        const ticker = (p.ticker || "").trim().toUpperCase();
+        const qty = parseFloat(p.qty);
+        if (!ticker || !qty || isNaN(qty)) continue;
+        const isCash = !!p.is_cash;
+        const ccy = (p.currency || "").trim().toUpperCase()
+                      || (isCash ? ticker : "ARS");
+        positions.push({
+          ticker,
+          qty,
+          unit_price: p.unit_price && !isCash ? parseFloat(p.unit_price) : null,
+          currency: ccy,
+          is_cash: isCash,
+          asset_class: (p.asset_class || "").trim() || (isCash ? "CASH" : "OTHER"),
+          name: (p.name || "").trim() || ticker,
+          strategy: (p.strategy || "").trim() || null,
+        });
+      }
+      if (positions.length === 0) {
+        toast("Agregá al menos una posición con ticker + qty", "error");
+        return;
+      }
+      try {
+        toast(`Cargando ${positions.length} saldos iniciales...`, "info");
+        const res = await API.cargaInicial({
+          account, fecha, positions, create_missing_assets: true,
+        });
+        let msg = `✓ ${res.n_positions_written} saldos cargados`;
+        if (res.n_assets_created) msg += `, ${res.n_assets_created} assets nuevos`;
+        if (res.n_asientos_generated) msg += ` (${res.n_asientos_generated} asientos)`;
+        toast(msg, "success");
+        if ((res.warnings || []).length) {
+          setTimeout(() => toast(
+            `${res.warnings.length} warnings — revisá audit log`, "info"
+          ), 1500);
+        }
+        invalidateMeta();
+        navigate("/");
+      } catch (e) {
+        toast(`Error: ${e.message}`, "error");
+      }
+    },
+    addCargaInicialRow() {
+      const tbody = document.getElementById("carga-positions");
+      if (!tbody) return;
+      const idx = tbody.children.length;
+      const row = document.createElement("div");
+      row.className = "card";
+      row.style.cssText = "padding: 10px; margin-bottom: 8px;";
+      row.innerHTML = `
+        <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:6px;">
+          <b style="font-size:13px;">Posición ${idx + 1}</b>
+          <button type="button" class="btn ghost" style="padding:2px 8px; font-size:11px;"
+                  onclick="this.closest('.card').remove();">✕</button>
+        </div>
+        <div class="field-row">
+          <div class="field">
+            <label style="font-size:11px;">Ticker / moneda *</label>
+            <input name="pos_${idx}_ticker" placeholder="AL30D / ARS / BTC" required
+                   style="text-transform:uppercase;">
+          </div>
+          <div class="field" style="display:flex; align-items:center; gap:6px;">
+            <label style="font-size:11px;">
+              <input type="checkbox" name="pos_${idx}_is_cash" style="width:auto;"
+                     onchange="
+                       const card = this.closest('.card');
+                       const isCash = this.checked;
+                       card.querySelector('[name=pos_${idx}_unit_price]').disabled = isCash;
+                       card.querySelector('[name=pos_${idx}_unit_price]').value = '';
+                     ">
+              Es cash (saldo en moneda)
+            </label>
+          </div>
+        </div>
+        <div class="field-row">
+          <div class="field">
+            <label style="font-size:11px;">Cantidad *</label>
+            <input type="number" step="any" name="pos_${idx}_qty" required>
+          </div>
+          <div class="field">
+            <label style="font-size:11px;">Precio unitario</label>
+            <input type="number" step="any" name="pos_${idx}_unit_price"
+                   placeholder="cost basis (no cash)">
+          </div>
+          <div class="field">
+            <label style="font-size:11px;">Moneda del precio</label>
+            <input name="pos_${idx}_currency" placeholder="ARS / USB / USD"
+                   style="text-transform:uppercase;">
+          </div>
+        </div>
+        <div class="field-row">
+          <div class="field">
+            <label style="font-size:11px;">Asset class (si es nuevo)</label>
+            <select name="pos_${idx}_asset_class">
+              <option value="">— autodetect —</option>
+              <option value="BOND_AR">BOND_AR (bonos AR)</option>
+              <option value="BOND_CORP_AR">BOND_CORP_AR (ON)</option>
+              <option value="BOND_US">BOND_US (bonos US)</option>
+              <option value="EQUITY_AR">EQUITY_AR (acciones AR)</option>
+              <option value="EQUITY_US">EQUITY_US / CEDEAR</option>
+              <option value="ETF">ETF</option>
+              <option value="FCI">FCI</option>
+              <option value="CRYPTO">CRYPTO</option>
+              <option value="STABLECOIN">STABLECOIN</option>
+              <option value="CASH">CASH</option>
+              <option value="OTHER">OTHER</option>
+            </select>
+          </div>
+          <div class="field">
+            <label style="font-size:11px;">Nombre (si es nuevo)</label>
+            <input name="pos_${idx}_name" placeholder="Bonar 2030">
+          </div>
+          <div class="field">
+            <label style="font-size:11px;">Strategy</label>
+            <select name="pos_${idx}_strategy">
+              <option value="">—</option>
+              <option value="BH">BH</option>
+              <option value="TRADING">TRADING</option>
+              <option value="CORE">CORE</option>
+              <option value="FCI">FCI</option>
+              <option value="CRYPTO">CRYPTO</option>
+              <option value="CASH">CASH</option>
+            </select>
+          </div>
+        </div>
+      `;
+      tbody.appendChild(row);
     },
     async updateDisplayName(data) {
       try {
@@ -4665,6 +4821,105 @@ python yfinance_loader.py</pre>
   });
 
   // ====================================================================
+  // /carga-inicial — Carga manual de tenencias viejas (saldos de apertura)
+  // ====================================================================
+  route("/carga-inicial", async () => {
+    const meta = await loadMeta();
+    const realAccounts = (meta.accounts || []).filter(c =>
+      !c.startsWith("caucion_") &&
+      !["external_income", "external_expense",
+        "interest_income", "interest_expense",
+        "opening_balance"].includes(c)
+    );
+    if (realAccounts.length === 0) {
+      return `${headerWithBack("📦 Cargar tenencias viejas", "/welcome")}
+        <main>
+          <section>
+            <div class="card">
+              <b>Primero creá al menos una cuenta.</b>
+              <div class="muted" style="font-size:13px; margin:6px 0 12px;">
+                Necesitás una cuenta destino (banco, broker, wallet) para
+                asignar los saldos de apertura.
+              </div>
+              <a href="#/cuentas" class="btn primary full">Ir a cuentas</a>
+            </div>
+          </section>
+        </main>`;
+    }
+
+    return `
+      ${headerWithBack("📦 Cargar tenencias viejas", "/welcome")}
+      <main>
+        <section>
+          <div class="card compact muted" style="font-size:13px;">
+            Cargá tu portfolio <b>como estaba</b> en la fecha que elijas
+            (saldos de apertura). El motor genera los asientos
+            <code>OPENING_BALANCE</code> automáticamente.
+            Después seguí cargando trades y movimientos normales.
+          </div>
+        </section>
+
+        <form data-action="submitCargaInicial">
+          <section>
+            <h2>1. ¿Dónde y cuándo?</h2>
+            <div class="field-row">
+              <div class="field">
+                <label>Cuenta destino *</label>
+                <select name="account" required>
+                  ${realAccounts.map(a =>
+                    `<option value="${escapeHtml(a)}">${escapeHtml(a)}</option>`
+                  ).join("")}
+                </select>
+              </div>
+              <div class="field">
+                <label>Fecha del saldo *</label>
+                <input type="date" name="fecha" value="${fmt.today()}" required>
+              </div>
+            </div>
+            <div class="muted" style="font-size:12px;">
+              Si tenés tenencias en varias cuentas, repetí este paso una
+              vez por cuenta.
+            </div>
+          </section>
+
+          <section>
+            <h2>2. Posiciones</h2>
+            <div id="carga-positions"></div>
+            <button type="button" class="btn ghost full"
+                    data-onclick="addCargaInicialRow" style="margin-bottom:10px;">
+              ➕ Agregar posición
+            </button>
+            <div class="muted" style="font-size:12px;">
+              Tickers existentes (<code>especies</code>): los reconoce solos.
+              Si cargás uno nuevo, completá Asset class + Nombre.
+              Para cash marcá la casilla y poné <code>ARS</code> /
+              <code>USB</code> / <code>USDT</code> como ticker.
+            </div>
+          </section>
+
+          <section>
+            <button type="submit" class="btn primary full" style="margin-top:8px;">
+              Guardar saldos de apertura
+            </button>
+            <div class="muted" style="font-size:11px; text-align:center; margin-top:6px;">
+              Genera asientos OPENING_BALANCE en <code>asientos_contables</code>
+              y re-importa el master.
+            </div>
+          </section>
+        </form>
+      </main>
+      <script>
+        // Auto-agregar la primera fila al renderizar
+        setTimeout(() => {
+          if (window._actions && window._actions.addCargaInicialRow) {
+            window._actions.addCargaInicialRow();
+          }
+        }, 50);
+      </script>
+    `;
+  });
+
+  // ====================================================================
   // /credentials — Configurar credenciales BYMA / CAFCI
   // ====================================================================
   route("/credentials", async () => {
@@ -4935,9 +5190,17 @@ python yfinance_loader.py</pre>
             hasBymaCreds)}
 
           ${step(3, "Cargar tus tenencias",
-            "Si ya tenías posiciones, podés <b>auto-importarlas</b> desde tu broker. Si arrancás de cero, cargá tu primer trade manualmente.",
-            "Auto-importar", "#/import",
+            "Si ya tenías posiciones, cargá los <b>saldos de apertura</b> a una fecha pasada (manual o auto-import). Después arrancan los trades normales.",
+            "Cargar tenencias viejas", "#/carga-inicial",
             hasTrades)}
+
+          <div class="card compact" style="margin: -6px 0 12px 0; background: var(--bg-soft);">
+            <div class="muted" style="font-size:12px;">
+              ¿Tenés API del broker? Auto-importá las posiciones desde
+              <a href="#/import">📥 Auto-import</a>. Sino, cargá manual
+              en el botón de arriba.
+            </div>
+          </div>
 
           ${step(4, "Refrescar precios y ver tu portfolio",
             "Apretá el botón de actualizar para que el motor recalcule todo.",
