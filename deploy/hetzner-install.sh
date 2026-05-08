@@ -14,10 +14,11 @@
 #
 # USO (ejecutá esto adentro del server, NO en tu PC):
 #   curl -fsSL https://raw.githubusercontent.com/<USER>/wealth_management_rodricor/main/deploy/hetzner-install.sh \
-#     | sudo bash -s -- DOMAIN EMAIL_SUPER
+#     | sudo bash -s -- DOMAIN EMAIL_SUPER [BRANCH]
 #
-# Ejemplo:
+# Ejemplos:
 #   sudo bash hetzner-install.sh wm.tudominio.com tu@email.com
+#   sudo bash hetzner-install.sh wm.tudominio.com tu@email.com claude/improve-app-design-13rIy
 #
 # Si todavía no tenés dominio: pasale tu IP pública con http://; el setup
 # va a saltar el HTTPS automático y vas a ver una warning del browser.
@@ -26,10 +27,11 @@ set -euo pipefail
 
 DOMAIN="${1:-}"
 SUPERADMIN_EMAIL="${2:-}"
+BRANCH="${3:-main}"
 
 if [ -z "$DOMAIN" ] || [ -z "$SUPERADMIN_EMAIL" ]; then
-  echo "USO: sudo bash hetzner-install.sh DOMAIN SUPERADMIN_EMAIL"
-  echo "Ej:  sudo bash hetzner-install.sh wm.tudominio.com tu@email.com"
+  echo "USO: sudo bash hetzner-install.sh DOMAIN SUPERADMIN_EMAIL [BRANCH]"
+  echo "Ej:  sudo bash hetzner-install.sh wm.tudominio.com tu@email.com main"
   exit 1
 fi
 
@@ -63,14 +65,17 @@ ufw allow 80/tcp
 ufw allow 443/tcp
 ufw --force enable
 
-echo "==> Clonando repo en /opt/wm"
+echo "==> Clonando repo en /opt/wm (branch=$BRANCH)"
 mkdir -p /opt/wm
 cd /opt/wm
 if [ -d ".git" ]; then
-  git pull
+  git fetch origin
+  git checkout "$BRANCH"
+  git pull origin "$BRANCH"
 else
   # NOTA: editá esta URL al repo correcto si forkeaste
-  git clone https://github.com/rodrigocorvalan93/wealth_management_rodricor.git .
+  git clone --branch "$BRANCH" \
+    https://github.com/rodrigocorvalan93/wealth_management_rodricor.git .
 fi
 
 echo "==> Generando .env"
