@@ -80,30 +80,178 @@ def _public_get(path: str, timeout: int = 15):
     return r.json()
 
 
-def _fetch_prices_usdt(symbols: list[str]) -> dict[str, float]:
-    """Devuelve {SYM: price_in_USDT} para los symbols crypto que tienen
-    par <SYM>USDT en Binance. Hace 1 sola llamada al ticker bulk.
+# Mapping de tickers comunes a IDs de CoinGecko (usado como fallback
+# cuando la API pública de Binance está geo-restringida o rate-limited).
+# Si tu ticker no está acá, agrégalo o el conector cae a None.
+COINGECKO_IDS = {
+    "BTC": "bitcoin",
+    "ETH": "ethereum",
+    "USDT": "tether",
+    "USDC": "usd-coin",
+    "BUSD": "binance-usd",
+    "DAI": "dai",
+    "SHIB": "shiba-inu",
+    "SOL": "solana",
+    "TRX": "tron",
+    "ETHW": "ethereum-pow-iou",
+    "BNB": "binancecoin",
+    "XRP": "ripple",
+    "ADA": "cardano",
+    "DOGE": "dogecoin",
+    "DOT": "polkadot",
+    "MATIC": "matic-network",
+    "AVAX": "avalanche-2",
+    "LINK": "chainlink",
+    "LTC": "litecoin",
+    "ATOM": "cosmos",
+    "UNI": "uniswap",
+    "BCH": "bitcoin-cash",
+    "XLM": "stellar",
+    "FIL": "filecoin",
+    "NEAR": "near",
+    "ARB": "arbitrum",
+    "OP": "optimism",
+    "APT": "aptos",
+    "PEPE": "pepe",
+    "WLD": "worldcoin-wld",
+    "INJ": "injective-protocol",
+    "TIA": "celestia",
+    "RUNE": "thorchain",
+    "FTM": "fantom",
+    "RNDR": "render-token",
+    "STX": "blockstack",
+    "GRT": "the-graph",
+    "ALGO": "algorand",
+    "AAVE": "aave",
+    "MKR": "maker",
+    "CRV": "curve-dao-token",
+    "LDO": "lido-dao",
+    "SAND": "the-sandbox",
+    "MANA": "decentraland",
+    "AXS": "axie-infinity",
+    "GALA": "gala",
+    "ENJ": "enjincoin",
+    "CHZ": "chiliz",
+    "VET": "vechain",
+    "ICP": "internet-computer",
+    "FLOW": "flow",
+    "EGLD": "elrond-erd-2",
+    "HBAR": "hedera-hashgraph",
+    "QNT": "quant-network",
+    "IMX": "immutable-x",
+}
 
-    Si el endpoint falla, devuelve {}; el caller usa avg_price=None.
-    """
-    if not symbols:
-        return {}
+
+def _fetch_prices_binance_bulk(symbols: list[str]) -> dict[str, float]:
+    """Bulk fetch via Binance /api/v3/ticker/price (sin auth). Devuelve
+    {SYM: price_USDT}. Si el endpoint falla, devuelve {}."""
     try:
-        # Endpoint bulk: devuelve TODOS los tickers (~1000 entradas).
-        # Filtramos client-side. Más eficiente que N llamadas individuales.
         all_tickers = _public_get("/api/v3/ticker/price")
-    except Exception:
+    except Exception as e:
+        print(f"[binance] bulk price fetch fallo: {type(e).__name__}: {e}")
         return {}
     by_sym = {}
     target_pairs = {f"{s}USDT": s for s in symbols}
-    for t in all_tickers:
-        pair = t.get("symbol", "")
-        if pair in target_pairs:
+    if isinstance(all_tickers, list):
+        for t in all_tickers:
+            pair = t.get("symbol", "") if isinstance(t, dict) else ""
+            if pair in target_pairs:
+                try:
+                    by_sym[target_pairs[pair]] = float(t["price"])
+                except (KeyError, ValueError, TypeError):
+                    pass
+    return by_sym
+
+
+def _fetch_prices_binance_per_symbol(symbols: list[str]) -> dict[str, float]:
+    """Fallback per-symbol cuando bulk falla. Más lento (N llamadas) pero
+    tolera respuestas parciales."""
+    by_sym = {}
+    for sym in symbols:
+        try:
+            r = _public_get(f"/api/v3/ticker/price?symbol={sym}USDT")
+            if isinstance(r, dict) and "price" in r:
+                by_sym[sym] = float(r["price"])
+        except Exception:
+            pass
+    return by_sym
+
+
+def _fetch_prices_coingecko(symbols: list[str]) -> dict[str, float]:
+    """Fallback FINAL via CoinGecko (sin geo-restriccion ni auth).
+    Mapea los symbols a coingecko IDs y llama /api/v3/simple/price.
+    Devuelve {SYM: price_USD}.
+
+    Solo cubre los tickers en COINGECKO_IDS. Para los desconocidos
+    el caller queda con None.
+    """
+    if not symbols:
+        return {}
+    import requests
+    cg_ids = {COINGECKO_IDS[s]: s for s in symbols if s in COINGECKO_IDS}
+    if not cg_ids:
+        return {}
+    ids_param = ",".join(cg_ids.keys())
+    try:
+        url = "https://api.coingecko.com/api/v3/simple/price"
+        r = requests.get(url, params={"ids": ids_param, "vs_currencies": "usd"},
+                          timeout=15)
+        r.raise_for_status()
+        data = r.json()
+    except Exception as e:
+        print(f"[binance] coingecko fallback fallo: {type(e).__name__}: {e}")
+        return {}
+    by_sym = {}
+    for cg_id, sym in cg_ids.items():
+        entry = data.get(cg_id) or {}
+        usd = entry.get("usd")
+        if usd:
             try:
-                by_sym[target_pairs[pair]] = float(t["price"])
-            except (KeyError, ValueError, TypeError):
+                by_sym[sym] = float(usd)
+            except (TypeError, ValueError):
                 pass
     return by_sym
+
+
+def _fetch_prices_usdt(symbols: list[str]) -> tuple[dict[str, float], str]:
+    """Cascada de intentos para conseguir precios USD-equivalentes:
+      1) Binance bulk ticker (más rápido, 1 llamada)
+      2) Binance per-symbol (si bulk falló)
+      3) CoinGecko (si Binance está geo-restricted)
+
+    Devuelve ({SYM: price}, source) donde source es 'binance-bulk',
+    'binance-per-sym', 'coingecko', o 'none' si nada funcionó.
+    """
+    if not symbols:
+        return ({}, "none")
+
+    # Intento 1: Binance bulk
+    by_sym = _fetch_prices_binance_bulk(symbols)
+    if len(by_sym) == len(symbols):
+        return (by_sym, "binance-bulk")
+
+    # Intento 2: completar con Binance per-symbol los faltantes
+    missing = [s for s in symbols if s not in by_sym]
+    if missing:
+        more = _fetch_prices_binance_per_symbol(missing)
+        by_sym.update(more)
+
+    if len(by_sym) == len(symbols):
+        source = "binance-bulk" if not missing else "binance-per-sym"
+        return (by_sym, source)
+
+    # Intento 3: CoinGecko para los que aún faltan
+    still_missing = [s for s in symbols if s not in by_sym]
+    if still_missing:
+        cg = _fetch_prices_coingecko(still_missing)
+        by_sym.update(cg)
+
+    if not by_sym:
+        return (by_sym, "none")
+    if len(by_sym) == len(symbols):
+        return (by_sym, "coingecko" if still_missing else "binance")
+    # Mezcla parcial
+    return (by_sym, "mixed")
 
 
 def fetch_positions(creds: dict) -> dict:
@@ -179,14 +327,23 @@ def fetch_positions(creds: dict) -> dict:
             "ccy": natural_ccy, "free": free, "locked": locked,
         })
 
-    # Segundo pass: bajar precios de los crypto symbols.
-    prices = _fetch_prices_usdt(crypto_syms) if crypto_syms else {}
-    if crypto_syms and not prices:
-        warnings.append(
-            "No pude bajar precios actuales de Binance (rate limit o red). "
-            "Las posiciones se importan con avg_price=None y aparecen en "
-            "0 hasta que cargues precios manualmente."
-        )
+    # Segundo pass: bajar precios de los crypto symbols (cascada Binance → CoinGecko).
+    prices, prices_source = _fetch_prices_usdt(crypto_syms) if crypto_syms else ({}, "none")
+    if crypto_syms:
+        if not prices:
+            warnings.append(
+                "No pude bajar precios de Binance ni de CoinGecko. "
+                "Las posiciones se importan con avg_price=None y van a "
+                "aparecer en 0 USD hasta que cargues precios manualmente."
+            )
+        else:
+            missing = [s for s in crypto_syms if s not in prices]
+            if missing:
+                warnings.append(
+                    f"Sin precio para: {', '.join(missing)}. Esos assets "
+                    f"se importan con avg_price=None. Agregalos en "
+                    f"engine/brokers/binance.py:COINGECKO_IDS."
+                )
 
     # Tercer pass: armar la lista final con precios.
     positions = []
@@ -230,6 +387,7 @@ def fetch_positions(creds: dict) -> dict:
         "positions": positions,
         "warnings": warnings,
         "prices_fetched": len(prices),
+        "prices_source": prices_source,
     }
 
 

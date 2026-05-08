@@ -2315,6 +2315,35 @@ def create_app() -> Flask:
 
                 event_id_base = f"OPEN-IMP-{broker.upper()}-" + _dt.now().strftime("%Y%m%dT%H%M%S")
 
+                # Dedup: borrar asientos previos con prefix OPEN-IMP-<BROKER>
+                # ASÍ no se duplican entries cada vez que el user re-importa.
+                # Mantenemos los OPEN-AUTO-* (los del CLI manual) intactos.
+                try:
+                    from openpyxl import load_workbook as _lw
+                    wb_pre = _lw(filename=str(s.xlsx_path))
+                    if "asientos_contables" in wb_pre.sheetnames:
+                        ws_pre = wb_pre["asientos_contables"]
+                        prefix = f"OPEN-IMP-{broker.upper()}-"
+                        rows_to_del = []
+                        for r_idx in range(5, ws_pre.max_row + 1):
+                            cell_val = ws_pre.cell(r_idx, 1).value
+                            if (cell_val and isinstance(cell_val, str)
+                                    and cell_val.startswith(prefix)):
+                                rows_to_del.append(r_idx)
+                        # Borrar de abajo arriba para no shiftar índices
+                        for r_idx in sorted(rows_to_del, reverse=True):
+                            ws_pre.delete_rows(r_idx)
+                        if rows_to_del:
+                            wb_pre.save(str(s.xlsx_path))
+                            details.append({
+                                "info": f"Removidas {len(rows_to_del)} filas "
+                                         f"de imports anteriores"
+                            })
+                except Exception as e:
+                    warnings.append(
+                        f"No pude limpiar imports anteriores: {e}"
+                    )
+
                 for idx, p in enumerate(positions):
                     ticker = (p.get("ticker") or "").strip()
                     qty = float(p.get("qty") or 0)
@@ -2437,7 +2466,21 @@ def create_app() -> Flask:
                     #   2. (opening_balance, asset) pierde qty
                     eid_ext = f"{event_id_base}-{idx:03d}-{ticker}"
                     asset_in_ledger = ticker
-                    unit_price = avg if avg else (1.0 if is_cash else None)
+                    # Placeholder: si no tenemos avg_price (edge case: ticker
+                    # desconocido o API caída), igual escribimos 1.0 para
+                    # que la posición aparezca en holdings. El warning
+                    # alerta al user que hay que cargar precio real.
+                    if avg:
+                        unit_price = avg
+                    elif is_cash:
+                        unit_price = 1.0
+                    else:
+                        unit_price = 1.0  # placeholder
+                        warnings.append(
+                            f"{ticker}: sin precio de mercado, registrado "
+                            f"con avg=1.0 (placeholder). Cargá el precio "
+                            f"real desde Cotizaciones o el cripto_loader."
+                        )
                     desc = f"Saldo inicial {ticker} (auto-import {broker})"
 
                     try:

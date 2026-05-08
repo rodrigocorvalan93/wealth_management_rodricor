@@ -4540,6 +4540,22 @@ python yfinance_loader.py</pre>
               <button class="btn ghost" onclick="document.querySelectorAll('input[name=imp]').forEach(c => c.checked = !c.checked)"
                       style="padding:4px 10px; font-size:11px;">Toggle todos</button>
             </div>
+            ${(() => {
+              const n_priced = positions.filter(p => p.avg_price != null).length;
+              const n_unpriced = positions.length - n_priced;
+              const src = preview.prices_source;
+              const srcLabel = src === "binance-bulk" ? "Binance bulk"
+                : src === "binance-per-sym" ? "Binance per-symbol"
+                : src === "coingecko" ? "CoinGecko (Binance falló)"
+                : src === "mixed" ? "mixed (Binance + CoinGecko)"
+                : src === "none" ? "❌ ninguna fuente respondió"
+                : src;
+              if (!src) return "";
+              return `<div class="muted" style="font-size:11px; margin-top:6px;">
+                💰 Precios: <b>${n_priced}</b> con precio · <b>${n_unpriced}</b> sin precio
+                · fuente: ${escapeHtml(srcLabel)}
+              </div>`;
+            })()}
             ${(preview.warnings || []).length > 0 ? `
               <div class="muted" style="font-size:12px; margin-top:6px;">
                 ⚠ ${preview.warnings.map(escapeHtml).join("; ")}
