@@ -479,49 +479,56 @@ def create_app() -> Flask:
     @app.get("/api/asset/<path:ticker>/history")
     def asset_history_endpoint(ticker):
         """Detalle histórico de un activo: primera compra, todas las
-        operaciones, evolución de precio + qty + market value, y métricas
-        de retorno desde la incorporación.
+        operaciones, evolución de precio + qty + market value, métricas
+        de retorno desde la incorporación, breakdown por cuenta y
+        contribución al portfolio.
 
-        Query: ?account=cocos (opcional, filtra por cuenta)
+        Query: ?account=cocos (opcional, filtra por cuenta para movimientos)
         """
         _require_auth(); _block_if_switched_mutation()
-        from engine.prices import get_price
+        from engine.prices import get_price, get_latest_price
         from engine.fx import convert as fx_convert, FxError
         anchor = _parse_query_anchor()
         account_filter = request.args.get("account")
         conn = db_conn()
         try:
-            # 1) Movimientos del activo (ordenados ascendente)
-            params = [ticker]
-            sql = """
-                SELECT m.movement_id, m.account, m.qty, m.unit_price,
-                       m.price_currency, e.event_date, e.event_type, e.description
+            # 1) Movimientos del activo (sin filtro account para totales,
+            #    con filtro solo si el caller pidió un account específico)
+            sql_all = """
+                SELECT m.movement_id, m.event_id, m.account, m.qty,
+                       m.unit_price, m.price_currency, e.event_date,
+                       e.event_type, e.description, e.source_sheet,
+                       e.source_row, e.external_id
                 FROM movements m
                 JOIN events e ON e.event_id = m.event_id
                 WHERE m.asset = ?
+                ORDER BY e.event_date ASC, m.movement_id ASC
             """
-            if account_filter:
-                sql += " AND m.account = ?"
-                params.append(account_filter)
-            sql += " ORDER BY e.event_date ASC, m.movement_id ASC"
-            cur = conn.execute(sql, params)
-            movements = [dict(r) for r in cur.fetchall()]
-            if not movements:
+            cur = conn.execute(sql_all, (ticker,))
+            all_movements = [dict(r) for r in cur.fetchall()]
+            if not all_movements:
                 return jsonify({"error": "asset sin movimientos"}), 404
+            if account_filter:
+                movements = [m for m in all_movements
+                             if m["account"] == account_filter]
+            else:
+                movements = all_movements
 
-            # 2) Datos del asset (currency, asset_class, name)
+            # 2) Datos del asset
             cur = conn.execute(
                 "SELECT name, asset_class, currency FROM assets WHERE ticker=?",
                 (ticker,),
             )
             row = cur.fetchone()
-            asset_info = dict(row) if row else {"name": ticker, "asset_class": "?",
-                                                 "currency": None}
+            asset_info = dict(row) if row else {"name": ticker,
+                                                  "asset_class": "?",
+                                                  "currency": None}
+            native_ccy = asset_info["currency"]
 
             first_date = movements[0]["event_date"][:10]
 
-            # 3) Posición actual (qty + avg_cost) — sin filtrar account si
-            #    queremos toda la posición consolidada
+            # 3) Posición actual consolidada (sumando todas las cuentas
+            #    si no hay filtro)
             qty = 0.0
             cost_acum = 0.0
             qty_buys = 0.0
@@ -534,16 +541,14 @@ def create_app() -> Flask:
 
             # 4) Serie de precios desde first_date hasta hoy
             cur = conn.execute(
-                """SELECT fecha, price, currency FROM prices
+                """SELECT fecha, price, currency, source FROM prices
                    WHERE ticker=? AND fecha >= ?
                    ORDER BY fecha ASC""",
                 (ticker, first_date),
             )
-            prices = [{"fecha": r["fecha"], "price": r["price"],
-                        "currency": r["currency"]} for r in cur.fetchall()]
+            prices = [dict(r) for r in cur.fetchall()]
 
-            # 5) Construir evolución: para cada precio, calcular qty_held,
-            #    market_value, unrealized_pnl
+            # 5) Evolución de la posición consolidada
             qty_by_date = []
             running_qty = 0.0
             for m in movements:
@@ -551,7 +556,6 @@ def create_app() -> Flask:
                 qty_by_date.append((m["event_date"][:10], running_qty))
 
             def qty_at(fecha_iso):
-                # qty acumulada al cierre de fecha_iso (incluye movimientos de ese día)
                 q = 0.0
                 for d, rq in qty_by_date:
                     if d <= fecha_iso:
@@ -564,18 +568,30 @@ def create_app() -> Flask:
             for p in prices:
                 q = qty_at(p["fecha"])
                 if q == 0 and not evolution:
-                    continue  # skip pre-position prices
-                mv_native = q * p["price"]
+                    continue
                 evolution.append({
-                    "fecha": p["fecha"],
-                    "price": p["price"],
-                    "currency": p["currency"],
-                    "qty": q,
-                    "mv_native": mv_native,
+                    "fecha": p["fecha"], "price": p["price"],
+                    "currency": p["currency"], "qty": q,
+                    "mv_native": q * p["price"],
                 })
 
-            # 6) Métricas: precio inicial (avg_cost), precio actual, %
-            current_price = prices[-1]["price"] if prices else (avg_cost or 0)
+            # 6) Precio actual + metadata de la fuente
+            latest_price_row = get_latest_price(conn, ticker)
+            if latest_price_row:
+                current_price = latest_price_row["price"]
+                price_meta = {
+                    "fecha": latest_price_row["fecha_efectiva"],
+                    "currency": latest_price_row["currency"],
+                    "source": latest_price_row.get("source") or "?",
+                    "fallback_used": latest_price_row.get("fallback_used", False),
+                }
+            else:
+                current_price = avg_cost or 0
+                price_meta = {
+                    "fecha": None, "currency": native_ccy,
+                    "source": "cost_basis_fallback", "fallback_used": True,
+                }
+
             return_pct = None
             if avg_cost and avg_cost > 0:
                 return_pct = (current_price - avg_cost) / avg_cost
@@ -584,13 +600,14 @@ def create_app() -> Flask:
                 if qty != 0 else 0.0
             )
 
-            # 7) PnL realizado del activo (desde fills)
+            # 7) PnL realizado del activo
             from engine.pnl import calculate_realized_pnl
             fills = [f for f in calculate_realized_pnl(conn) if f.asset == ticker]
             realized_pnl_total = sum(f.pnl_realizado for f in fills)
-            realized_currency = fills[0].currency if fills else asset_info["currency"]
+            realized_currency = (fills[0].currency if fills
+                                  else asset_info["currency"])
 
-            # 8) Días desde primera compra
+            # 8) Días held desde primera compra
             try:
                 from datetime import date as _date
                 d0 = _date.fromisoformat(first_date)
@@ -598,23 +615,139 @@ def create_app() -> Flask:
             except Exception:
                 days_held = None
 
+            # 9) TEA y TEM (anualizado y mensualizado del retorno)
+            tea = tem = None
+            if return_pct is not None and days_held and days_held > 0:
+                try:
+                    base = 1.0 + return_pct
+                    if base > 0:
+                        tea = base ** (365.0 / days_held) - 1.0
+                        tem = base ** (30.0 / days_held) - 1.0
+                except (OverflowError, ZeroDivisionError):
+                    pass
+
+            # 10) Período promedio de tenencia (para fills realizados)
+            avg_holding_period_days = None
+            if fills:
+                avg_holding_period_days = sum(
+                    f.holding_period_days for f in fills
+                ) / len(fills)
+
+            # 11) Breakdown POR CUENTA (sobre TODOS los movements, no
+            #     solo el filter)
+            from collections import defaultdict
+            acc_data = defaultdict(lambda: {
+                "qty": 0.0, "buy_cost": 0.0, "buy_qty": 0.0,
+                "first_date": None, "n_trades": 0,
+            })
+            for m in all_movements:
+                acc = m["account"]
+                d = m["event_date"][:10]
+                acc_data[acc]["qty"] += m["qty"]
+                if m["qty"] != 0:
+                    acc_data[acc]["n_trades"] += 1
+                if m["qty"] > 0 and m["unit_price"] is not None:
+                    acc_data[acc]["buy_cost"] += m["qty"] * m["unit_price"]
+                    acc_data[acc]["buy_qty"] += m["qty"]
+                if (acc_data[acc]["first_date"] is None
+                        or d < acc_data[acc]["first_date"]):
+                    acc_data[acc]["first_date"] = d
+
+            # Total mv en anchor para % de portfolio
+            from engine.holdings import calculate_holdings, total_pn
+            holdings = calculate_holdings(conn, anchor_currency=anchor)
+            tp = total_pn(holdings, anchor)
+            total_portfolio_anchor = tp.get("total_anchor", 0)
+
+            # Cargar account names + kinds
+            cur = conn.execute(
+                "SELECT code, name, kind, institution FROM accounts"
+            )
+            acc_meta = {r["code"]: dict(r) for r in cur.fetchall()}
+
+            # Convertir mv_native a anchor
+            def _to_anchor(value, from_ccy):
+                if value is None:
+                    return None
+                if from_ccy == anchor:
+                    return value
+                try:
+                    return fx_convert(conn, value, from_ccy, anchor,
+                                       _date.today(), fallback_days=14)
+                except FxError:
+                    return None
+
+            accounts_breakdown = []
+            for acc, data in acc_data.items():
+                if abs(data["qty"]) < 1e-9:
+                    continue
+                avg_acc = (data["buy_cost"] / data["buy_qty"]
+                            if data["buy_qty"] > 0 else None)
+                mv_native_acc = data["qty"] * current_price
+                mv_anchor_acc = _to_anchor(mv_native_acc, native_ccy)
+                am = acc_meta.get(acc, {})
+                accounts_breakdown.append({
+                    "account": acc,
+                    "account_name": am.get("name") or acc,
+                    "account_kind": am.get("kind"),
+                    "account_institution": am.get("institution"),
+                    "qty": data["qty"],
+                    "avg_cost": avg_acc,
+                    "mv_native": mv_native_acc,
+                    "mv_anchor": mv_anchor_acc,
+                    "first_date": data["first_date"],
+                    "n_trades": data["n_trades"],
+                })
+
+            # % por cuenta sobre el activo y sobre el portfolio total
+            total_mv_native_asset = sum(a["mv_native"] for a in accounts_breakdown
+                                         if a["mv_native"] is not None)
+            total_mv_anchor_asset = sum(a["mv_anchor"] for a in accounts_breakdown
+                                         if a["mv_anchor"] is not None)
+            for a in accounts_breakdown:
+                a["pct_of_asset"] = ((a["mv_native"] / total_mv_native_asset)
+                                      if (total_mv_native_asset
+                                          and a["mv_native"] is not None)
+                                      else 0)
+                a["pct_of_portfolio"] = ((a["mv_anchor"] / total_portfolio_anchor)
+                                          if (total_portfolio_anchor
+                                              and a["mv_anchor"] is not None)
+                                          else 0)
+            accounts_breakdown.sort(
+                key=lambda x: -(x["mv_anchor"] or 0)
+            )
+
             return jsonify({
                 "ticker": ticker,
                 "name": asset_info["name"],
                 "asset_class": asset_info["asset_class"],
-                "native_currency": asset_info["currency"],
+                "native_currency": native_ccy,
+                "anchor": anchor,
                 "first_purchase_date": first_date,
                 "days_held": days_held,
                 "current_qty": qty,
                 "avg_cost": avg_cost,
                 "current_price": current_price,
+                "current_price_meta": price_meta,
                 "unrealized_pnl_native": unrealized_native,
                 "return_pct": return_pct,
+                "tea": tea,
+                "tem": tem,
+                "avg_holding_period_days": avg_holding_period_days,
                 "realized_pnl_total": realized_pnl_total,
                 "realized_currency": realized_currency,
                 "n_trades": sum(1 for m in movements if m["qty"] != 0),
+                "n_accounts": len(accounts_breakdown),
+                # Posición consolidada vs portfolio
+                "mv_native_total": qty * current_price,
+                "mv_anchor_total": total_mv_anchor_asset,
+                "pct_of_portfolio": (total_mv_anchor_asset / total_portfolio_anchor
+                                      if total_portfolio_anchor else 0),
+                "accounts_breakdown": accounts_breakdown,
                 "movements": [
                     {
+                        "movement_id": m["movement_id"],
+                        "event_id": m["event_id"],
                         "fecha": m["event_date"][:10],
                         "account": m["account"],
                         "qty": m["qty"],
@@ -622,6 +755,9 @@ def create_app() -> Flask:
                         "currency": m["price_currency"],
                         "event_type": m["event_type"],
                         "description": m["description"],
+                        "source_sheet": m["source_sheet"],
+                        "source_row": m["source_row"],
+                        "external_id": m["external_id"],
                     }
                     for m in movements
                 ],
@@ -629,6 +765,135 @@ def create_app() -> Flask:
             })
         finally:
             conn.close()
+
+    @app.put("/api/asset/<path:ticker>/movement/<int:movement_id>")
+    def update_movement_endpoint(ticker, movement_id):
+        """Edita fecha (event_date) y/o costo (unit_price) de un movement.
+        Localiza la fila fuente en el Excel master (blotter, asientos_contables,
+        ingresos, etc.) y actualiza los campos correspondientes.
+
+        Body:
+          {"event_date": "2026-01-15", "unit_price": 95000.0}
+
+        Reglas por source_sheet:
+          - blotter: actualiza 'Trade Date' y 'Precio' en la fila con
+                     Trade ID = event.external_id (o Row ID si es null).
+          - asientos_contables: actualiza 'Fecha' y 'Unit Price' en TODAS
+                     las filas con Event ID = event.external_id (así los 2
+                     legs del asiento quedan sincronizados).
+          - resto: rechaza con 400 (no soportado todavía).
+        """
+        _require_auth(); _block_if_switched_mutation()
+        body = request.get_json(silent=True) or {}
+        new_date = body.get("event_date")
+        new_price = body.get("unit_price")
+        if new_date is None and new_price is None:
+            abort(400, "Pasá event_date y/o unit_price")
+
+        conn = db_conn()
+        try:
+            cur = conn.execute(
+                """SELECT m.movement_id, m.unit_price, e.event_id, e.external_id,
+                          e.source_sheet, e.source_row, e.event_date,
+                          e.event_type
+                   FROM movements m
+                   JOIN events e ON e.event_id = m.event_id
+                   WHERE m.movement_id=? AND m.asset=?""",
+                (movement_id, ticker),
+            )
+            mov = cur.fetchone()
+            if mov is None:
+                abort(404, f"Movement {movement_id} no encontrado para {ticker}")
+            sheet = mov["source_sheet"]
+            ext_id = mov["external_id"]
+            src_row = mov["source_row"]
+        finally:
+            conn.close()
+
+        s = get_settings()
+        from openpyxl import load_workbook
+        from datetime import date as _date
+
+        with excel_write_lock():
+            backup_excel()
+
+            wb = load_workbook(filename=str(s.xlsx_path))
+            if sheet not in wb.sheetnames:
+                abort(400, f"Sheet '{sheet}' no existe en el master")
+            ws = wb[sheet]
+            HEADER_ROW = 4
+            headers = {}
+            for c in range(1, ws.max_column + 1):
+                h = ws.cell(row=HEADER_ROW, column=c).value
+                if isinstance(h, str):
+                    headers[h.strip()] = c
+
+            # Mapping por sheet de qué columnas tocar
+            COL_MAP = {
+                "blotter": {
+                    "date_col": "Trade Date",
+                    "price_col": "Precio",
+                    "key_col": "Trade ID",
+                },
+                "asientos_contables": {
+                    "date_col": "Fecha",
+                    "price_col": "Unit Price",
+                    "key_col": "Event ID",
+                },
+            }
+            if sheet not in COL_MAP:
+                abort(400, f"Edición de movements desde '{sheet}' no soportada "
+                            f"(soportadas: {list(COL_MAP.keys())})")
+
+            cfg = COL_MAP[sheet]
+            date_col = headers.get(cfg["date_col"])
+            price_col = headers.get(cfg["price_col"])
+            key_col = headers.get(cfg["key_col"])
+
+            if not (date_col or price_col):
+                abort(400, "Sheet no tiene las columnas esperadas")
+
+            # Convertir new_date a date object si es string
+            new_date_obj = None
+            if new_date:
+                try:
+                    new_date_obj = _date.fromisoformat(str(new_date)[:10])
+                except ValueError:
+                    abort(400, "event_date debe ser YYYY-MM-DD")
+
+            n_updated = 0
+            # Estrategia 1: matchear por external_id en key_col (preferida)
+            if ext_id and key_col:
+                for r in range(HEADER_ROW + 1, ws.max_row + 1):
+                    cell_val = ws.cell(row=r, column=key_col).value
+                    if cell_val and str(cell_val).strip() == str(ext_id):
+                        if date_col and new_date_obj is not None:
+                            ws.cell(row=r, column=date_col, value=new_date_obj)
+                        if price_col and new_price is not None:
+                            ws.cell(row=r, column=price_col, value=float(new_price))
+                        n_updated += 1
+            # Estrategia 2: fallback a source_row (1 sola fila)
+            if n_updated == 0 and src_row:
+                r = int(src_row)
+                if date_col and new_date_obj is not None:
+                    ws.cell(row=r, column=date_col, value=new_date_obj)
+                if price_col and new_price is not None:
+                    ws.cell(row=r, column=price_col, value=float(new_price))
+                n_updated = 1
+
+            if n_updated == 0:
+                abort(400, f"No encontré la fila fuente para movement {movement_id}")
+
+            wb.save(str(s.xlsx_path))
+            stats = reimport_excel()
+
+        return jsonify({
+            "ok": True,
+            "movement_id": movement_id,
+            "rows_updated": n_updated,
+            "sheet": sheet,
+            "import_stats": stats,
+        })
 
     @app.get("/api/holdings-near-target")
     def holdings_near_target_endpoint():

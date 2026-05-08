@@ -894,6 +894,66 @@
         toast(`Error: ${e.message}`, "error");
       }
     },
+    async editMovement(arg) {
+      // arg = "ticker|movement_id|fecha|unit_price"
+      const [ticker, movementId, fecha, unitPrice] = arg.split("|");
+      const html = `
+        <div id="edit-mov-overlay" style="position:fixed; inset:0; background:rgba(0,0,0,0.55); z-index:300; display:flex; align-items:center; justify-content:center; padding:16px;">
+          <div class="card" style="max-width:380px; width:100%;">
+            <h2 style="margin:0 0 8px; font-size:14px; color: var(--muted); text-transform:uppercase;">
+              ✏️ Editar movement
+            </h2>
+            <div class="muted" style="font-size:12px; margin-bottom:12px;">
+              ${escapeHtml(ticker)} · #${escapeHtml(movementId)}
+            </div>
+            <form id="edit-mov-form">
+              <div class="field">
+                <label>Fecha</label>
+                <input type="date" name="event_date" value="${escapeHtml(fecha || "")}" required>
+              </div>
+              <div class="field">
+                <label>Costo (unit price)</label>
+                <input type="number" step="any" name="unit_price"
+                       value="${escapeHtml(unitPrice || "")}"
+                       placeholder="ej 95000.50">
+              </div>
+              <div style="display:flex; gap:8px; margin-top:12px;">
+                <button type="button" class="btn ghost" id="edit-mov-cancel"
+                        style="flex:1;">Cancelar</button>
+                <button type="submit" class="btn primary" style="flex:1;">Guardar</button>
+              </div>
+            </form>
+          </div>
+        </div>
+      `;
+      const wrap = document.createElement("div");
+      wrap.innerHTML = html;
+      document.body.appendChild(wrap.firstElementChild);
+      const overlay = document.getElementById("edit-mov-overlay");
+      const form = document.getElementById("edit-mov-form");
+      function close() { overlay.remove(); }
+      document.getElementById("edit-mov-cancel").onclick = close;
+      overlay.onclick = (e) => { if (e.target === overlay) close(); };
+      form.onsubmit = async (e) => {
+        e.preventDefault();
+        const fd = new FormData(form);
+        const body = {};
+        const d = fd.get("event_date");
+        const p = fd.get("unit_price");
+        if (d) body.event_date = String(d);
+        if (p !== null && String(p).trim() !== "") body.unit_price = parseFloat(p);
+        try {
+          await API.req(`/api/asset/${encodeURIComponent(ticker)}/movement/${encodeURIComponent(movementId)}`,
+            { method: "PUT", json: body });
+          toast("Movement actualizado ✓", "success");
+          close();
+          API._bustCache();
+          render();
+        } catch (err) {
+          toast(`Error: ${err.message}`, "error");
+        }
+      };
+    },
     async testBroker(brokerId) {
       try {
         toast(`Probando ${brokerId}...`, "info");
@@ -2808,45 +2868,84 @@
     const retSign = data.return_pct > 0 ? "+" : "";
     const ccy = data.native_currency || "";
 
+    const accBreakdown = data.accounts_breakdown || [];
+    const priceMeta = data.current_price_meta || {};
+    const anchor = data.anchor || "USD";
+
+    function fmtPct(v, dec = 2) {
+      return v == null ? "—" : (v * 100).toFixed(dec) + "%";
+    }
+
     return `
       ${headerWithBack(`📈 ${escapeHtml(data.ticker)}`, "/holdings")}
       <main>
         <div class="card" style="margin-bottom:12px;">
-          <div style="display:flex; justify-content:space-between; align-items:baseline;">
-            <div>
-              <div style="font-weight:700; font-size:18px;">${tickerHtml(data.ticker, data.asset_class)}</div>
+          <div style="display:flex; justify-content:space-between; align-items:baseline; gap:12px;">
+            <div style="min-width:0;">
+              <div style="font-weight:700; font-size:20px;">${tickerHtml(data.ticker, data.asset_class, data.name)}</div>
               <div class="muted" style="font-size:12px;">
                 ${escapeHtml(data.name || "")} ${data.asset_class ? "· " + escapeHtml(assetClassLabel(data.asset_class)) : ""}
               </div>
             </div>
             <div class="tabular ${retCls}" style="text-align:right;">
-              <div style="font-size:18px; font-weight:700;">
+              <div style="font-size:22px; font-weight:700;">
                 ${data.return_pct != null ? `${retSign}${(data.return_pct * 100).toFixed(2)}%` : "—"}
               </div>
-              <div class="muted" style="font-size:11px;">return desde compra</div>
+              <div class="muted" style="font-size:11px;">retorno directo</div>
             </div>
           </div>
         </div>
 
+        <!-- Cuadro principal: precio actual + costo + return + holding period -->
+        <div class="card" style="margin-bottom:12px;">
+          <div style="display:flex; justify-content:space-between; padding:6px 0;">
+            <span class="muted">Costo promedio</span>
+            <span class="tabular" style="font-weight:600;">${fmt.money(data.avg_cost, 4)} ${escapeHtml(ccy)}</span>
+          </div>
+          <div style="display:flex; justify-content:space-between; padding:6px 0; border-top:1px solid var(--border);">
+            <span class="muted">Precio actual</span>
+            <span class="tabular" style="font-weight:600;">${fmt.money(data.current_price, 4)} ${escapeHtml(ccy)}</span>
+          </div>
+          ${priceMeta.fecha ? `
+            <div class="muted" style="font-size:10px; text-align:right; margin-top:-4px;">
+              ${escapeHtml(priceMeta.fecha)}${priceMeta.source ? " · " + escapeHtml(priceMeta.source) : ""}
+              ${priceMeta.fallback_used ? ' · <span class="tag warn" style="font-size:9px;">fallback</span>' : ""}
+            </div>
+          ` : ""}
+          <div style="display:flex; justify-content:space-between; padding:6px 0; border-top:1px solid var(--border);">
+            <span class="muted">Tenencia desde</span>
+            <span class="tabular">
+              ${escapeHtml(data.first_purchase_date || "—")}
+              <span class="muted">${data.days_held != null ? "(" + data.days_held + " días)" : ""}</span>
+            </span>
+          </div>
+          ${data.avg_holding_period_days != null ? `
+            <div style="display:flex; justify-content:space-between; padding:6px 0; border-top:1px solid var(--border);">
+              <span class="muted">Período promedio (cerrados)</span>
+              <span class="tabular">${data.avg_holding_period_days.toFixed(0)} días</span>
+            </div>
+          ` : ""}
+        </div>
+
+        <!-- TEM / TEA / Qty / PnL no realizado -->
         <div class="kpi-grid" style="margin-bottom:12px;">
           <div class="kpi">
-            <div class="kpi-label">Desde</div>
-            <div class="kpi-value" style="font-size:16px;">${escapeHtml(data.first_purchase_date || "—")}</div>
-            <div class="kpi-currency muted">${data.days_held != null ? data.days_held + " días" : ""}</div>
+            <div class="kpi-label">TEM</div>
+            <div class="kpi-value tabular ${data.tem != null && data.tem > 0 ? 'positive' : data.tem != null && data.tem < 0 ? 'negative' : ''}" style="font-size:16px;">
+              ${fmtPct(data.tem)}
+            </div>
+            <div class="kpi-currency muted">tasa efectiva mensual</div>
           </div>
           <div class="kpi">
-            <div class="kpi-label">Qty actual</div>
+            <div class="kpi-label">TEA</div>
+            <div class="kpi-value tabular ${data.tea != null && data.tea > 0 ? 'positive' : data.tea != null && data.tea < 0 ? 'negative' : ''}" style="font-size:16px;">
+              ${fmtPct(data.tea)}
+            </div>
+            <div class="kpi-currency muted">tasa efectiva anual</div>
+          </div>
+          <div class="kpi">
+            <div class="kpi-label">Tenencia actual</div>
             <div class="kpi-value tabular" style="font-size:16px;">${fmt.money(data.current_qty, 4)}</div>
-            <div class="kpi-currency muted">${escapeHtml(ccy)}</div>
-          </div>
-          <div class="kpi">
-            <div class="kpi-label">Avg cost</div>
-            <div class="kpi-value tabular" style="font-size:16px;">${fmt.money(data.avg_cost, 4)}</div>
-            <div class="kpi-currency muted">${escapeHtml(ccy)}</div>
-          </div>
-          <div class="kpi">
-            <div class="kpi-label">Precio actual</div>
-            <div class="kpi-value tabular" style="font-size:16px;">${fmt.money(data.current_price, 4)}</div>
             <div class="kpi-currency muted">${escapeHtml(ccy)}</div>
           </div>
           <div class="kpi">
@@ -2856,14 +2955,65 @@
             </div>
             <div class="kpi-currency muted">${escapeHtml(ccy)}</div>
           </div>
-          <div class="kpi">
-            <div class="kpi-label">PnL realizado</div>
-            <div class="kpi-value tabular ${data.realized_pnl_total > 0 ? 'positive' : data.realized_pnl_total < 0 ? 'negative' : ''}" style="font-size:16px;">
-              ${fmt.money(data.realized_pnl_total, 0)}
+          ${data.realized_pnl_total ? `
+            <div class="kpi" style="grid-column: 1 / -1;">
+              <div class="kpi-label">PnL realizado total (${escapeHtml(data.realized_currency || "")})</div>
+              <div class="kpi-value tabular ${data.realized_pnl_total > 0 ? 'positive' : 'negative'}" style="font-size:18px;">
+                ${fmt.money(data.realized_pnl_total, 2)}
+              </div>
             </div>
-            <div class="kpi-currency muted">${escapeHtml(data.realized_currency || "")}</div>
-          </div>
+          ` : ""}
         </div>
+
+        <!-- Impacto en cartera -->
+        <section>
+          <h2>📊 Impacto en cartera (${accBreakdown.length} cuenta${accBreakdown.length !== 1 ? "s" : ""})</h2>
+          <div class="card" style="padding:0; overflow:hidden;">
+            <div style="padding:12px 16px; background: var(--card-hover); border-bottom:1px solid var(--border);">
+              <div style="display:flex; justify-content:space-between; align-items:baseline;">
+                <span style="font-weight:700; font-size:13px;">TOTAL</span>
+                <span class="tabular" style="font-weight:700; font-size:15px;">
+                  ${fmt.money(data.mv_anchor_total)} ${escapeHtml(anchor)}
+                  <span class="muted" style="font-size:11px; font-weight:400;">
+                    · ${fmtPct(data.pct_of_portfolio, 2)} del portfolio
+                  </span>
+                </span>
+              </div>
+            </div>
+            ${accBreakdown.length === 0 ? '<div class="muted" style="padding:16px;">Sin cuentas con saldo</div>' :
+              accBreakdown.map(a => `
+                <div style="padding:10px 16px; border-bottom:1px solid var(--border);">
+                  <div style="display:flex; justify-content:space-between; align-items:baseline;">
+                    <div style="min-width:0; flex:1;">
+                      <div style="font-weight:600; font-size:13px;">
+                        ${escapeHtml(a.account_name || a.account)}
+                        ${a.account_kind ? `<span class="muted" style="font-size:10px; font-weight:400;">${escapeHtml(a.account_kind.toLowerCase())}</span>` : ""}
+                      </div>
+                      <div class="muted" style="font-size:11px;">
+                        ${fmt.money(a.qty, 4)} ${escapeHtml(ccy)}
+                        ${a.avg_cost ? "· avg " + fmt.money(a.avg_cost, 4) : ""}
+                        ${a.first_date ? "· desde " + escapeHtml(a.first_date) : ""}
+                      </div>
+                    </div>
+                    <div class="right" style="white-space:nowrap;">
+                      <div class="tabular" style="font-weight:600;">
+                        ${fmt.money(a.mv_anchor)} ${escapeHtml(anchor)}
+                      </div>
+                      <div class="sub muted tabular">
+                        ${fmtPct(a.pct_of_asset, 1)} del activo
+                        · ${fmtPct(a.pct_of_portfolio, 2)} de cartera
+                      </div>
+                    </div>
+                  </div>
+                  <!-- Barra visual del % del activo -->
+                  <div style="height:4px; background:var(--border); border-radius:2px; margin-top:6px; overflow:hidden;">
+                    <div style="height:100%; background:var(--accent); width:${(a.pct_of_asset * 100).toFixed(1)}%;"></div>
+                  </div>
+                </div>
+              `).join("")
+            }
+          </div>
+        </section>
 
         ${evo.length >= 2 ? `
           <section>
@@ -2879,26 +3029,36 @@
 
         <section>
           <h2>📋 Operaciones (${movs.length})</h2>
-          <div class="card">
-            ${movs.length === 0 ? '<div class="muted">Sin operaciones</div>' :
+          <div class="card" style="padding:0;">
+            ${movs.length === 0 ? '<div class="muted" style="padding:16px;">Sin operaciones</div>' :
               movs.map(m => {
                 const isBuy = (m.qty || 0) > 0;
                 const sign = isBuy ? "+" : "";
                 const cls = isBuy ? "positive" : "negative";
+                const editable = m.source_sheet === "blotter" || m.source_sheet === "asientos_contables";
+                const movArg = `${data.ticker}|${m.movement_id}|${m.fecha}|${m.unit_price || ""}`;
                 return `
-                  <div style="display:flex; justify-content:space-between; padding:8px 0; border-bottom:1px solid var(--border);">
-                    <div>
-                      <div style="font-size:13px;">
-                        <span class="tag ${isBuy ? '' : 'danger'}" style="font-size:10px;">
-                          ${isBuy ? "BUY" : "SELL"}
-                        </span>
-                        ${escapeHtml(m.fecha)}
+                  <div style="padding:10px 16px; border-bottom:1px solid var(--border);">
+                    <div style="display:flex; justify-content:space-between; align-items:flex-start; gap:8px;">
+                      <div style="min-width:0; flex:1;">
+                        <div style="font-size:13px;">
+                          <span class="tag ${isBuy ? 'success' : 'danger'}" style="font-size:10px;">
+                            ${isBuy ? "BUY" : "SELL"}
+                          </span>
+                          ${escapeHtml(m.fecha)}
+                          <span class="muted" style="font-size:11px;">· ${escapeHtml(m.event_type || "")}</span>
+                        </div>
+                        <div class="muted" style="font-size:11px;">${escapeHtml(m.account)}${m.source_sheet ? " · " + escapeHtml(m.source_sheet) : ""}</div>
                       </div>
-                      <div class="muted" style="font-size:11px;">${escapeHtml(m.account)}</div>
-                    </div>
-                    <div class="right">
-                      <div class="tabular ${cls}">${sign}${fmt.money(m.qty, 4)}</div>
-                      ${m.unit_price ? `<div class="sub muted tabular">@ ${fmt.money(m.unit_price, 4)} ${escapeHtml(m.currency || ccy)}</div>` : ""}
+                      <div class="right" style="white-space:nowrap;">
+                        <div class="tabular ${cls}">${sign}${fmt.money(m.qty, 4)}</div>
+                        ${m.unit_price ? `<div class="sub muted tabular">@ ${fmt.money(m.unit_price, 4)} ${escapeHtml(m.currency || ccy)}</div>` : ""}
+                      </div>
+                      ${editable ? `
+                        <button class="btn ghost" data-onclick="editMovement"
+                                data-arg="${escapeHtml(movArg)}"
+                                style="padding:4px 8px; font-size:11px;">✏️</button>
+                      ` : ""}
                     </div>
                   </div>
                 `;
