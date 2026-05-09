@@ -1116,83 +1116,7 @@
       const row = document.createElement("div");
       row.className = "card";
       row.style.cssText = "padding: 10px; margin-bottom: 8px;";
-      row.innerHTML = `
-        <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:6px;">
-          <b style="font-size:13px;">Posición ${idx + 1}</b>
-          <button type="button" class="btn ghost" style="padding:2px 8px; font-size:11px;"
-                  onclick="this.closest('.card').remove();">✕</button>
-        </div>
-        <div class="field-row">
-          <div class="field">
-            <label style="font-size:11px;">Ticker / moneda *</label>
-            <input name="pos_${idx}_ticker" placeholder="AL30D / ARS / BTC" required
-                   style="text-transform:uppercase;">
-          </div>
-          <div class="field" style="display:flex; align-items:center; gap:6px;">
-            <label style="font-size:11px;">
-              <input type="checkbox" name="pos_${idx}_is_cash" style="width:auto;"
-                     onchange="
-                       const card = this.closest('.card');
-                       const isCash = this.checked;
-                       card.querySelector('[name=pos_${idx}_unit_price]').disabled = isCash;
-                       card.querySelector('[name=pos_${idx}_unit_price]').value = '';
-                     ">
-              Es cash (saldo en moneda)
-            </label>
-          </div>
-        </div>
-        <div class="field-row">
-          <div class="field">
-            <label style="font-size:11px;">Cantidad *</label>
-            <input type="number" step="any" name="pos_${idx}_qty" required>
-          </div>
-          <div class="field">
-            <label style="font-size:11px;">Precio unitario</label>
-            <input type="number" step="any" name="pos_${idx}_unit_price"
-                   placeholder="cost basis (no cash)">
-          </div>
-          <div class="field">
-            <label style="font-size:11px;">Moneda del precio</label>
-            <input name="pos_${idx}_currency" placeholder="ARS / USB / USD"
-                   style="text-transform:uppercase;">
-          </div>
-        </div>
-        <div class="field-row">
-          <div class="field">
-            <label style="font-size:11px;">Asset class (si es nuevo)</label>
-            <select name="pos_${idx}_asset_class">
-              <option value="">— autodetect —</option>
-              <option value="BOND_AR">BOND_AR (bonos AR)</option>
-              <option value="BOND_CORP_AR">BOND_CORP_AR (ON)</option>
-              <option value="BOND_US">BOND_US (bonos US)</option>
-              <option value="EQUITY_AR">EQUITY_AR (acciones AR)</option>
-              <option value="EQUITY_US">EQUITY_US / CEDEAR</option>
-              <option value="ETF">ETF</option>
-              <option value="FCI">FCI</option>
-              <option value="CRYPTO">CRYPTO</option>
-              <option value="STABLECOIN">STABLECOIN</option>
-              <option value="CASH">CASH</option>
-              <option value="OTHER">OTHER</option>
-            </select>
-          </div>
-          <div class="field">
-            <label style="font-size:11px;">Nombre (si es nuevo)</label>
-            <input name="pos_${idx}_name" placeholder="Bonar 2030">
-          </div>
-          <div class="field">
-            <label style="font-size:11px;">Strategy</label>
-            <select name="pos_${idx}_strategy">
-              <option value="">—</option>
-              <option value="BH">BH</option>
-              <option value="TRADING">TRADING</option>
-              <option value="CORE">CORE</option>
-              <option value="FCI">FCI</option>
-              <option value="CRYPTO">CRYPTO</option>
-              <option value="CASH">CASH</option>
-            </select>
-          </div>
-        </div>
-      `;
+      row.innerHTML = window._cargaInicialRowHtml(idx);
       tbody.appendChild(row);
     },
     async updateDisplayName(data) {
@@ -4859,6 +4783,90 @@ python yfinance_loader.py</pre>
     `;
   });
 
+  // Template de una fila del wizard /carga-inicial (extraído para que la
+  // primera fila renderice inline con el resto del HTML — innerHTML no
+  // ejecuta <script> tags, así que no podíamos auto-agregar via setTimeout)
+  window._cargaInicialRowHtml = function (idx) {
+    return `
+      <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:6px;">
+        <b style="font-size:13px;">Posición ${idx + 1}</b>
+        <button type="button" class="btn ghost" style="padding:2px 8px; font-size:11px;"
+                onclick="this.closest('.card').remove();">✕</button>
+      </div>
+      <div class="field-row">
+        <div class="field">
+          <label style="font-size:11px;">Ticker / moneda *</label>
+          <input name="pos_${idx}_ticker" placeholder="AL30D / ARS / BTC" required
+                 style="text-transform:uppercase;">
+        </div>
+        <div class="field" style="display:flex; align-items:center; gap:6px;">
+          <label style="font-size:11px;">
+            <input type="checkbox" name="pos_${idx}_is_cash" style="width:auto;"
+                   onchange="
+                     const card = this.closest('.card');
+                     const isCash = this.checked;
+                     const up = card.querySelector('[name=pos_${idx}_unit_price]');
+                     up.disabled = isCash;
+                     if (isCash) up.value = '';
+                   ">
+            Es cash (saldo en moneda)
+          </label>
+        </div>
+      </div>
+      <div class="field-row">
+        <div class="field">
+          <label style="font-size:11px;">Cantidad *</label>
+          <input type="number" step="any" name="pos_${idx}_qty" required>
+        </div>
+        <div class="field">
+          <label style="font-size:11px;">Precio unitario</label>
+          <input type="number" step="any" name="pos_${idx}_unit_price"
+                 placeholder="cost basis (no cash)">
+        </div>
+        <div class="field">
+          <label style="font-size:11px;">Moneda del precio</label>
+          <input name="pos_${idx}_currency" placeholder="ARS / USB / USD"
+                 style="text-transform:uppercase;">
+        </div>
+      </div>
+      <div class="field-row">
+        <div class="field">
+          <label style="font-size:11px;">Asset class (si es nuevo)</label>
+          <select name="pos_${idx}_asset_class">
+            <option value="">— autodetect —</option>
+            <option value="BOND_AR">BOND_AR (bonos AR)</option>
+            <option value="BOND_CORP_AR">BOND_CORP_AR (ON)</option>
+            <option value="BOND_US">BOND_US (bonos US)</option>
+            <option value="EQUITY_AR">EQUITY_AR (acciones AR)</option>
+            <option value="EQUITY_US">EQUITY_US / CEDEAR</option>
+            <option value="ETF">ETF</option>
+            <option value="FCI">FCI</option>
+            <option value="CRYPTO">CRYPTO</option>
+            <option value="STABLECOIN">STABLECOIN</option>
+            <option value="CASH">CASH</option>
+            <option value="OTHER">OTHER</option>
+          </select>
+        </div>
+        <div class="field">
+          <label style="font-size:11px;">Nombre (si es nuevo)</label>
+          <input name="pos_${idx}_name" placeholder="Bonar 2030">
+        </div>
+        <div class="field">
+          <label style="font-size:11px;">Strategy</label>
+          <select name="pos_${idx}_strategy">
+            <option value="">—</option>
+            <option value="BH">BH</option>
+            <option value="TRADING">TRADING</option>
+            <option value="CORE">CORE</option>
+            <option value="FCI">FCI</option>
+            <option value="CRYPTO">CRYPTO</option>
+            <option value="CASH">CASH</option>
+          </select>
+        </div>
+      </div>
+    `;
+  };
+
   // ====================================================================
   // /carga-inicial — Carga manual de tenencias viejas (saldos de apertura)
   // ====================================================================
@@ -4923,7 +4931,11 @@ python yfinance_loader.py</pre>
 
           <section>
             <h2>2. Posiciones</h2>
-            <div id="carga-positions"></div>
+            <div id="carga-positions">
+              <div class="card" style="padding:10px; margin-bottom:8px;">
+                ${window._cargaInicialRowHtml(0)}
+              </div>
+            </div>
             <button type="button" class="btn ghost full"
                     data-onclick="addCargaInicialRow" style="margin-bottom:10px;">
               ➕ Agregar posición
@@ -4947,14 +4959,6 @@ python yfinance_loader.py</pre>
           </section>
         </form>
       </main>
-      <script>
-        // Auto-agregar la primera fila al renderizar
-        setTimeout(() => {
-          if (window._actions && window._actions.addCargaInicialRow) {
-            window._actions.addCargaInicialRow();
-          }
-        }, 50);
-      </script>
     `;
   });
 
@@ -5267,9 +5271,14 @@ python yfinance_loader.py</pre>
   route("/welcome", async () => {
     const meta = await loadMeta();
     let blotter = [];
+    let asientos = [];
     try {
       const r = await API.listSheet("blotter");
       blotter = r.items || [];
+    } catch (_) {}
+    try {
+      const r = await API.listSheet("asientos_contables");
+      asientos = r.items || [];
     } catch (_) {}
     let cuentasReales = (meta.accounts || [])
       .filter(c => !["caucion_pasivo", "caucion_activo"].some(p => c.startsWith(p)))
@@ -5277,6 +5286,13 @@ python yfinance_loader.py</pre>
                      "interest_expense", "opening_balance"].includes(c));
     const hasAccounts = cuentasReales.length > 0;
     const hasTrades = (blotter || []).length > 0;
+    // "Tenencias cargadas" = trades nuevos O asientos de apertura
+    // (OPEN-AUTO-* desde carga inicial, RECON-* desde conciliación)
+    const hasOpeningAsientos = asientos.some(a => {
+      const eid = String(a["Event ID"] || "");
+      return eid.startsWith("OPEN-") || eid.startsWith("RECON-");
+    });
+    const hasHoldings = hasTrades || hasOpeningAsientos;
     const hasCreds = (await API.getCredentials().catch(() => ({}))).configured || {};
     const hasBymaCreds = !!hasCreds.byma_user;
 
@@ -5324,7 +5340,7 @@ python yfinance_loader.py</pre>
           ${step(3, "Cargar tus tenencias",
             "Si ya tenías posiciones, cargá los <b>saldos de apertura</b> a una fecha pasada (manual o auto-import). Después arrancan los trades normales.",
             "Cargar tenencias viejas", "#/carga-inicial",
-            hasTrades)}
+            hasHoldings)}
 
           <div class="card compact" style="margin: -6px 0 12px 0; background: var(--bg-soft);">
             <div class="muted" style="font-size:12px;">
@@ -5337,7 +5353,7 @@ python yfinance_loader.py</pre>
           ${step(4, "Refrescar precios y ver tu portfolio",
             "Apretá el botón de actualizar para que el motor recalcule todo.",
             "Ir al dashboard", "#/",
-            hasAccounts && hasTrades)}
+            hasAccounts && hasHoldings)}
         </section>
 
         <section>

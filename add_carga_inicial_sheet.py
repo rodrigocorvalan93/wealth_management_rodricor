@@ -44,8 +44,15 @@ BORDER_THIN = Border(
 )
 
 
-def add_hoja_carga_inicial(wb):
-    """Agrega la hoja _carga_inicial al workbook."""
+def add_hoja_carga_inicial(wb, with_examples: bool = True):
+    """Agrega la hoja _carga_inicial al workbook.
+
+    Si `with_examples` es True (default), la hoja viene con 9 filas de
+    ejemplo para mostrar el formato. Para creación programática vía API
+    conviene `with_examples=False` — sino esas filas se procesan como
+    asientos reales y aparecen como ghost positions en el portfolio del
+    usuario apenas corre el wizard de carga inicial.
+    """
     if "_carga_inicial" in wb.sheetnames:
         return False
 
@@ -88,6 +95,11 @@ def add_hoja_carga_inicial(wb):
 
     # Filas ejemplo (solo cuentas que existen en el template default)
     from datetime import date
+    if not with_examples:
+        # Validación + freeze + filter sin filas
+        ws.freeze_panes = "A5"
+        ws.auto_filter.ref = "A4:I500"
+        return True
     examples = [
         # Activos con cost basis
         (date(2026, 4, 30), "cocos",            "AL30D",            500,    65.50,    "USB",  "BH",       "1000 AL30D Cocos",       "ejemplo activo bono"),

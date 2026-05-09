@@ -1625,14 +1625,17 @@ def create_app() -> Flask:
         # Generar master con build_master + add_carga_inicial
         from build_master import build_master
         try:
-            from add_carga_inicial_sheet import add_carga_inicial_sheet
+            from add_carga_inicial_sheet import add_hoja_carga_inicial
         except ImportError:
-            add_carga_inicial_sheet = None
+            add_hoja_carga_inicial = None
 
         try:
             build_master(new_settings.xlsx_path)
-            if add_carga_inicial_sheet:
-                add_carga_inicial_sheet(new_settings.xlsx_path)
+            if add_hoja_carga_inicial:
+                from openpyxl import load_workbook as _wb
+                _wb_h = _wb(filename=str(new_settings.xlsx_path))
+                add_hoja_carga_inicial(_wb_h, with_examples=False)
+                _wb_h.save(str(new_settings.xlsx_path))
             # Limpiar las filas de ejemplo de TODAS las hojas de eventos
             # (blotter, ingresos, gastos, etc) para que el user nuevo arranque
             # con master vacío, listo para que cargue su data inicial.
@@ -1831,12 +1834,15 @@ def create_app() -> Flask:
             if not new_settings.xlsx_path.is_file():
                 from build_master import build_master
                 try:
-                    from add_carga_inicial_sheet import add_carga_inicial_sheet
+                    from add_carga_inicial_sheet import add_hoja_carga_inicial as _add_ci
                 except ImportError:
-                    add_carga_inicial_sheet = None
+                    _add_ci = None
                 build_master(new_settings.xlsx_path)
-                if add_carga_inicial_sheet:
-                    add_carga_inicial_sheet(new_settings.xlsx_path)
+                if _add_ci:
+                    from openpyxl import load_workbook as _wb
+                    _wb_h = _wb(filename=str(new_settings.xlsx_path))
+                    _add_ci(_wb_h, with_examples=False)
+                    _wb_h.save(str(new_settings.xlsx_path))
                 _blank_event_sheets(new_settings.xlsx_path)
                 # Auto-import para crear la DB
                 try:
@@ -2500,10 +2506,12 @@ def create_app() -> Flask:
 
             wb = _load_wb(filename=str(s.xlsx_path))
             if "_carga_inicial" not in wb.sheetnames:
-                # La hoja no existe — la creamos
+                # La hoja no existe — la creamos sin filas de ejemplo (las
+                # filas de ejemplo del template default se procesarían como
+                # asientos reales y aparecerían como ghost positions)
                 try:
                     from add_carga_inicial_sheet import add_hoja_carga_inicial
-                    add_hoja_carga_inicial(wb)
+                    add_hoja_carga_inicial(wb, with_examples=False)
                 except Exception as e:
                     abort(500, f"No pude crear hoja _carga_inicial: {e}")
             ws_in = wb["_carga_inicial"]
@@ -2692,15 +2700,26 @@ def create_app() -> Flask:
                     """,
                     (acc["code"],),
                 )
-                saldos = []
+                saldos_by_moneda = {}
                 for r in cur2.fetchall():
                     saldo = float(r["saldo"] or 0)
-                    if abs(saldo) < 1e-6:
+                    saldos_by_moneda[r["asset"]] = saldo
+
+                # Asegurar que la moneda nativa de la cuenta aparezca aún si
+                # tiene saldo 0 — el user puede querer iniciar conciliación
+                # desde cero.
+                if acc.get("currency"):
+                    saldos_by_moneda.setdefault(acc["currency"], 0.0)
+
+                saldos = []
+                for moneda, saldo in sorted(saldos_by_moneda.items()):
+                    # Saltar saldos cero EXCEPTO la moneda nativa (para que
+                    # cuentas vacías sigan apareciendo).
+                    if abs(saldo) < 1e-6 and moneda != acc.get("currency"):
                         continue
-                    # Última conciliación de esa (cuenta, moneda)
                     cur3 = conn.execute(
                         """
-                        SELECT e.event_date, e.description
+                        SELECT e.event_date
                         FROM events e
                         JOIN movements m2 ON m2.event_id = e.id
                         WHERE m2.account = ? AND m2.asset = ?
@@ -2709,11 +2728,11 @@ def create_app() -> Flask:
                         ORDER BY e.event_date DESC, e.id DESC
                         LIMIT 1
                         """,
-                        (acc["code"], r["asset"]),
+                        (acc["code"], moneda),
                     )
                     last = cur3.fetchone()
                     saldos.append({
-                        "moneda": r["asset"],
+                        "moneda": moneda,
                         "saldo_calculado": round(saldo, 6),
                         "last_recon_date": last["event_date"] if last else None,
                     })
@@ -2978,12 +2997,15 @@ def create_app() -> Flask:
         try:
             from build_master import build_master
             try:
-                from add_carga_inicial_sheet import add_carga_inicial_sheet
+                from add_carga_inicial_sheet import add_hoja_carga_inicial as _add_ci
             except ImportError:
-                add_carga_inicial_sheet = None
+                _add_ci = None
             build_master(s.xlsx_path)
-            if add_carga_inicial_sheet:
-                add_carga_inicial_sheet(s.xlsx_path)
+            if _add_ci:
+                from openpyxl import load_workbook as _wb
+                _wb_h = _wb(filename=str(s.xlsx_path))
+                _add_ci(_wb_h, with_examples=False)
+                _wb_h.save(str(s.xlsx_path))
             _blank_event_sheets(s.xlsx_path)
             try:
                 stats = reimport_excel()
