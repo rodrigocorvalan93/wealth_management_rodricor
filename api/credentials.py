@@ -181,10 +181,19 @@ def delete_credentials(user_id: str) -> bool:
     return False
 
 
-def list_supported_fields() -> list[dict]:
+SUPERADMIN_ONLY_FIELDS = {"cafci_token"}
+
+
+def list_supported_fields(is_superadmin: bool = False) -> list[dict]:
     """Devuelve metadata de las credenciales soportadas para que la UI
-    arme el form."""
-    return [
+    arme el form.
+
+    Si `is_superadmin` es False, oculta las credenciales globales que
+    sólo el superadmin puede configurar (ej. token de CAFCI — los datos
+    de CAFCI son compartidos entre todos los users, así que la baja la
+    dispara únicamente el superadmin).
+    """
+    fields = [
         {
             "key": "byma_user",
             "label": "BYMA / OMS user",
@@ -208,10 +217,11 @@ def list_supported_fields() -> list[dict]:
         },
         {
             "key": "cafci_token",
-            "label": "CAFCI Bearer token",
+            "label": "CAFCI Bearer token (solo superadmin)",
             "type": "password",
             "secret": True,
-            "help": "Token del API de CAFCI para precios de FCIs. Incluí 'Bearer ' al principio.",
+            "superadmin_only": True,
+            "help": "Token del API de CAFCI para precios de FCIs. Incluí 'Bearer ' al principio. Los precios bajados se comparten entre todos los users.",
         },
         {
             "key": "binance_api_key",
@@ -242,3 +252,6 @@ def list_supported_fields() -> list[dict]:
             "help": "ID numérico de tu Flex Query. Configurá una query con secciones 'Open Positions' y 'Trades' en IBKR → Reports → Flex Queries.",
         },
     ]
+    if not is_superadmin:
+        fields = [f for f in fields if not f.get("superadmin_only")]
+    return fields

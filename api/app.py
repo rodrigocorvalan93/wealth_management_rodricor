@@ -380,6 +380,7 @@ def create_app() -> Flask:
         return jsonify({
             "user_id": g.active_user_id,
             "is_admin": g.is_admin,
+            "is_superadmin": getattr(g, "is_superadmin", False),
             "is_switched": g.is_switched,
             "auth_user_id": g.auth_user.user_id if g.auth_user else None,
             "auth_user_display_name": g.auth_user.display_name if g.auth_user else None,
@@ -1624,14 +1625,17 @@ def create_app() -> Flask:
         # Generar master con build_master + add_carga_inicial
         from build_master import build_master
         try:
-            from add_carga_inicial_sheet import add_carga_inicial_sheet
+            from add_carga_inicial_sheet import add_hoja_carga_inicial
         except ImportError:
-            add_carga_inicial_sheet = None
+            add_hoja_carga_inicial = None
 
         try:
             build_master(new_settings.xlsx_path)
-            if add_carga_inicial_sheet:
-                add_carga_inicial_sheet(new_settings.xlsx_path)
+            if add_hoja_carga_inicial:
+                from openpyxl import load_workbook as _wb
+                _wb_h = _wb(filename=str(new_settings.xlsx_path))
+                add_hoja_carga_inicial(_wb_h, with_examples=False)
+                _wb_h.save(str(new_settings.xlsx_path))
             # Limpiar las filas de ejemplo de TODAS las hojas de eventos
             # (blotter, ingresos, gastos, etc) para que el user nuevo arranque
             # con master vacío, listo para que cargue su data inicial.
@@ -1830,12 +1834,15 @@ def create_app() -> Flask:
             if not new_settings.xlsx_path.is_file():
                 from build_master import build_master
                 try:
-                    from add_carga_inicial_sheet import add_carga_inicial_sheet
+                    from add_carga_inicial_sheet import add_hoja_carga_inicial as _add_ci
                 except ImportError:
-                    add_carga_inicial_sheet = None
+                    _add_ci = None
                 build_master(new_settings.xlsx_path)
-                if add_carga_inicial_sheet:
-                    add_carga_inicial_sheet(new_settings.xlsx_path)
+                if _add_ci:
+                    from openpyxl import load_workbook as _wb
+                    _wb_h = _wb(filename=str(new_settings.xlsx_path))
+                    _add_ci(_wb_h, with_examples=False)
+                    _wb_h.save(str(new_settings.xlsx_path))
                 _blank_event_sheets(new_settings.xlsx_path)
                 # Auto-import para crear la DB
                 try:
@@ -2071,12 +2078,19 @@ def create_app() -> Flask:
 
         El response es {"fields": [...], "configured": {key: True}}.
         Los valores secretos NUNCA se devuelven via API.
+        Los campos marcados como superadmin_only sólo aparecen si el caller
+        es superadmin (ej. cafci_token).
         """
         _require_auth(); _block_if_switched_mutation()
+        is_super = bool(getattr(g, "is_superadmin", False))
         existing = creds.get_credentials(g.active_user_id)
+        fields = creds.list_supported_fields(is_superadmin=is_super)
+        visible_keys = {f["key"] for f in fields}
         return jsonify({
-            "fields": creds.list_supported_fields(),
-            "configured": {k: True for k, v in existing.items() if v},
+            "fields": fields,
+            "configured": {k: True for k, v in existing.items()
+                            if v and k in visible_keys},
+            "is_superadmin": is_super,
         })
 
     @app.put("/api/credentials")
@@ -2085,11 +2099,20 @@ def create_app() -> Flask:
 
         - Pasar value="" o null borra esa credencial.
         - Solo se aceptan keys de creds.CRED_FIELDS.
+        - Las credenciales marcadas como superadmin_only (ej cafci_token)
+          sólo pueden modificarlas los superadmins.
         """
         _require_auth(); _block_if_switched_mutation()
         body = request.get_json(silent=True) or {}
         if not isinstance(body, dict):
             abort(400, "Body debe ser JSON object")
+        is_super = bool(getattr(g, "is_superadmin", False))
+        if not is_super:
+            forbidden = creds.SUPERADMIN_ONLY_FIELDS & set(body.keys())
+            if forbidden:
+                abort(403,
+                      f"Credenciales {sorted(forbidden)} sólo las puede "
+                      "configurar el superadmin.")
         result = creds.set_credentials(g.active_user_id, body)
         return jsonify({"updated": True, "configured": result})
 
@@ -2157,6 +2180,129 @@ def create_app() -> Flask:
             stats = reimport_excel()
         return jsonify({"loader_rc": rc, "n_tickers": len(tickers),
                         "import_stats": stats})
+
+    @app.post("/api/loaders/cafci")
+    def loader_cafci_endpoint():
+        """Corre el cafci_loader.run() — SOLO superadmin.
+
+        El token de CAFCI se lee de las credenciales del superadmin.
+        El CSV resultante (data/precios_cafci.csv) es compartido entre
+        todos los users, así que cualquier user que re-importe su Excel
+        después de esta llamada va a ver los precios actualizados.
+
+        Body opcional:
+          {"fecha": "2026-04-30"}  — backfill de un día específico
+                                     (default: último reporte diario)
+        """
+        _require_superadmin(); _block_if_switched_mutation()
+        c = creds.get_credentials(g.active_user_id)
+        token = c.get("cafci_token")
+        if not token:
+            abort(400, "Falta el token de CAFCI. Cargalo en /credentials.")
+
+        body = request.get_json(silent=True) or {}
+        fecha = (body.get("fecha") or "").strip() or None
+        if fecha:
+            try:
+                date.fromisoformat(fecha)
+            except ValueError:
+                abort(400, f"Fecha inválida: {fecha} (esperado YYYY-MM-DD)")
+
+        repo_root = Path(__file__).resolve().parent.parent
+        fcis_file = repo_root / "fcis_cafci.txt"
+        if not fcis_file.is_file():
+            abort(500, f"No encuentro {fcis_file}")
+
+        s = get_settings()
+        # cafci_loader.run() lee el token de os.environ["CAFCI_TOKEN"]
+        prev_token = os.environ.get("CAFCI_TOKEN")
+        os.environ["CAFCI_TOKEN"] = token
+        try:
+            from cafci_loader import run as cafci_run
+            rc = cafci_run(
+                fcis_file=fcis_file,
+                output_dir=s.shared_data_dir,
+                fecha=fecha,
+                dry_run=False,
+                use_xlsx_currency=True,
+                xlsx_path=s.xlsx_path,
+            )
+        except Exception as e:
+            abort(500, f"CAFCI loader falló: {type(e).__name__}: {e}")
+        finally:
+            if prev_token is None:
+                os.environ.pop("CAFCI_TOKEN", None)
+            else:
+                os.environ["CAFCI_TOKEN"] = prev_token
+
+        if rc != 0:
+            abort(500, "CAFCI loader devolvió error (revisá logs)")
+
+        # Re-importar el Excel del superadmin para que vea los nuevos
+        # precios inmediatamente. El resto de los users tomará los
+        # precios cuando ellos disparen un re-import.
+        stats = None
+        if s.xlsx_path.is_file():
+            with excel_write_lock():
+                stats = reimport_excel()
+        return jsonify({
+            "loader_rc": rc,
+            "fecha": fecha or "daily",
+            "import_stats": stats,
+            "shared": True,
+        })
+
+    @app.post("/api/loaders/cripto")
+    def loader_cripto_endpoint():
+        """Refresca precios cripto desde CoinGecko (API pública, sin auth).
+
+        Disponible para todos los users autenticados — el CSV resultante
+        (data/precios_cripto.csv) es compartido.
+
+        Body opcional:
+          {"tickers": ["BTC","ETH","USDT"]}   — override de tickers
+        """
+        _require_auth(); _block_if_switched_mutation()
+        body = request.get_json(silent=True) or {}
+        tickers = body.get("tickers")
+        if tickers and not isinstance(tickers, list):
+            abort(400, "tickers debe ser una lista")
+
+        from cripto_loader import (
+            upsert_current as cripto_upsert,
+            DEFAULT_TICKERS as CRIPTO_DEFAULT,
+            TICKER_TO_COINGECKO,
+        )
+        if not tickers:
+            tickers = list(CRIPTO_DEFAULT)
+        tickers = [t.strip().upper() for t in tickers if t and t.strip()]
+        # Filtrar tickers desconocidos para CoinGecko
+        unknown = [t for t in tickers if t not in TICKER_TO_COINGECKO]
+        tickers = [t for t in tickers if t in TICKER_TO_COINGECKO]
+        if not tickers:
+            abort(400, "Ningún ticker reconocido por CoinGecko. "
+                       f"Soportados: {sorted(TICKER_TO_COINGECKO.keys())}")
+
+        s = get_settings()
+        out_path = s.shared_data_dir / "precios_cripto.csv"
+        try:
+            n = cripto_upsert(out_path, tickers)
+        except Exception as e:
+            abort(502, f"CoinGecko falló: {type(e).__name__}: {e}")
+
+        # Re-import para que el user actual vea los precios nuevos
+        # (solo si tiene un master cargado — un user fresh todavía no)
+        stats = None
+        if s.xlsx_path.is_file():
+            with excel_write_lock():
+                stats = reimport_excel()
+        return jsonify({
+            "n_prices": n,
+            "tickers": tickers,
+            "unknown_skipped": unknown,
+            "import_stats": stats,
+            "shared": True,
+        })
 
     # =========================================================================
     # Auto-import de tenencias desde brokers (Cocos / Binance / IBKR)
@@ -2259,9 +2405,9 @@ def create_app() -> Flask:
             "create_missing_assets": true            # crear assets nuevos en `especies`
           }
 
-        Crea filas en la hoja `_carga_inicial` del Excel master (que
-        el motor procesa via cli.cargar_iniciales para generar asientos
-        de OPENING_BALANCE). Devuelve cuántas filas escribió.
+        Crea filas en la hoja `_carga_inicial` del Excel master, las
+        materializa como OPENING_BALANCE en `asientos_contables`
+        (vía cli.cargar_iniciales.generate_asientos) y re-importa.
         """
         _require_auth(); _block_if_switched_mutation()
         body = request.get_json(silent=True) or {}
@@ -2272,11 +2418,67 @@ def create_app() -> Flask:
         if not account or not positions:
             abort(400, "account y positions son requeridos")
 
+        result = _write_carga_inicial(
+            account=account, fecha=fecha, positions=positions,
+            create_missing=create_missing, broker_label=broker,
+        )
+        result["broker"] = broker
+        return jsonify(result)
+
+    @app.post("/api/carga-inicial")
+    def carga_inicial_manual():
+        """Carga manual de tenencias viejas (saldos de apertura).
+
+        Mismo contrato que /api/import/<broker>/apply pero sin broker:
+        el user arma la lista de posiciones a mano (desde el wizard).
+
+        Body:
+          {
+            "account": "cocos",
+            "fecha": "2026-05-06",
+            "positions": [
+              {"ticker":"AL30D","qty":500,"unit_price":65.5,"currency":"USB",
+               "asset_class":"BOND_AR","name":"Bonar 2030",
+               "is_cash":false,"strategy":"BH"},
+              {"ticker":"ARS","qty":200000,"is_cash":true,"currency":"ARS"},
+              ...
+            ],
+            "create_missing_assets": true
+          }
+        """
+        _require_auth(); _block_if_switched_mutation()
+        body = request.get_json(silent=True) or {}
+        account = (body.get("account") or "").strip()
+        fecha = body.get("fecha") or date.today().isoformat()
+        positions = body.get("positions") or []
+        create_missing = bool(body.get("create_missing_assets", True))
+        if not account or not positions:
+            abort(400, "account y positions son requeridos")
+
+        # Aceptar 'unit_price' (manual) o 'avg_price' (broker preview)
+        for p in positions:
+            if "unit_price" in p and "avg_price" not in p:
+                p["avg_price"] = p["unit_price"]
+
+        result = _write_carga_inicial(
+            account=account, fecha=fecha, positions=positions,
+            create_missing=create_missing, broker_label="manual",
+        )
+        return jsonify(result)
+
+    def _write_carga_inicial(account, fecha, positions, create_missing,
+                              broker_label):
+        """Escribe filas a `_carga_inicial`, las materializa como
+        OPENING_BALANCE en `asientos_contables` (via cli.cargar_iniciales)
+        y re-importa el Excel.
+
+        Usado tanto por /api/import/<broker>/apply como por la carga manual.
+        """
         s = get_settings()
         if not s.xlsx_path.is_file():
             abort(400, "No hay Excel master cargado todavía")
 
-        from .excel_io import list_rows, append_row
+        from .excel_io import list_rows
         # Validar cuenta existe
         accounts = {r.get("Code"): r
                      for r in list_rows(s.xlsx_path, "cuentas")
@@ -2291,11 +2493,29 @@ def create_app() -> Flask:
         existing_ccy = set(r.get("Code") for r in list_rows(s.xlsx_path, "monedas")
                             if r.get("Code"))
 
+        from openpyxl import load_workbook as _load_wb
+
+        # Headers de _carga_inicial:
+        #   Fecha | Cuenta | Activo | Qty | Unit Price | Price Currency
+        #   | Strategy | Description | Notes
         with excel_write_lock():
             backup_excel()
             n_assets = 0
             n_initial = 0
             warnings = []
+
+            wb = _load_wb(filename=str(s.xlsx_path))
+            if "_carga_inicial" not in wb.sheetnames:
+                # La hoja no existe — la creamos sin filas de ejemplo (las
+                # filas de ejemplo del template default se procesarían como
+                # asientos reales y aparecerían como ghost positions)
+                try:
+                    from add_carga_inicial_sheet import add_hoja_carga_inicial
+                    add_hoja_carga_inicial(wb, with_examples=False)
+                except Exception as e:
+                    abort(500, f"No pude crear hoja _carga_inicial: {e}")
+            ws_in = wb["_carga_inicial"]
+
             for p in positions:
                 ticker = (p.get("ticker") or "").strip()
                 qty = float(p.get("qty") or 0)
@@ -2304,6 +2524,9 @@ def create_app() -> Flask:
                 is_cash = bool(p.get("is_cash"))
                 cls = p.get("asset_class") or "OTHER"
                 name = p.get("name") or ticker
+                strategy = (p.get("strategy") or "").strip() or None
+                description = (p.get("description")
+                                 or f"Saldo inicial {ticker} ({broker_label})")
 
                 if not ticker or abs(qty) < 1e-9:
                     continue
@@ -2312,15 +2535,21 @@ def create_app() -> Flask:
                 if not is_cash and ticker not in existing_assets:
                     if create_missing:
                         try:
-                            append_row(s.xlsx_path, "especies", {
+                            # Cerrar el wb actual para que append_row no
+                            # sobreescriba lo que tenemos en memoria.
+                            wb.save(str(s.xlsx_path))
+                            from .excel_io import append_row as _append_row
+                            _append_row(s.xlsx_path, "especies", {
                                 "Ticker": ticker,
                                 "Name": name or ticker,
                                 "Asset Class": cls,
                                 "Currency": ccy,
-                                "Notes": f"Auto-importado de {broker}",
+                                "Notes": f"Auto-importado de {broker_label}",
                             })
                             existing_assets[ticker] = True
                             n_assets += 1
+                            wb = _load_wb(filename=str(s.xlsx_path))
+                            ws_in = wb["_carga_inicial"]
                         except Exception as e:
                             warnings.append(
                                 f"No pude crear asset {ticker}: {e}"
@@ -2339,55 +2568,347 @@ def create_app() -> Flask:
                     )
                     continue
 
-                # Append a `_carga_inicial`. La hoja tiene columnas:
-                #   Fecha | Cuenta | Activo | Qty | Unit Price | Currency | Notes
-                try:
-                    payload = {
-                        "Fecha": fecha,
-                        "Cuenta": account,
-                        "Activo": ticker,
-                        "Qty": qty,
-                        "Unit Price": avg if avg else (1.0 if is_cash else None),
-                        "Price Currency": ccy,
-                        "Description": (f"Saldo inicial {ticker} "
-                                         f"(auto-import {broker})"),
-                    }
-                    # _carga_inicial puede no estar en ALLOWED_SHEETS;
-                    # escribimos directo al workbook si hace falta.
-                    try:
-                        append_row(s.xlsx_path, "_carga_inicial", payload)
-                    except Exception:
-                        # Fallback: escribir en asientos_contables como
-                        # OPENING_BALANCE (compat con el flow viejo).
-                        from openpyxl import load_workbook
-                        wb = load_workbook(filename=str(s.xlsx_path))
-                        if "_carga_inicial" in wb.sheetnames:
-                            ws = wb["_carga_inicial"]
-                            ws.append([
-                                fecha, account, ticker, qty,
-                                avg if avg else (1.0 if is_cash else None),
-                                ccy, payload["Description"],
-                            ])
-                            wb.save(str(s.xlsx_path))
-                        else:
-                            raise
-                    n_initial += 1
-                except Exception as e:
-                    warnings.append(f"No pude escribir saldo {ticker}: {e}")
-                    continue
+                unit_price = avg if avg else (1.0 if is_cash else None)
+                price_currency = ccy if not is_cash else None
+                # Cash: el motor usa Activo=ARS/USB/etc y no necesita
+                # unit_price ni price_currency (es la propia moneda).
+                row_vals = [
+                    fecha,           # A: Fecha
+                    account,         # B: Cuenta
+                    ticker,          # C: Activo
+                    qty,             # D: Qty
+                    unit_price,      # E: Unit Price
+                    price_currency,  # F: Price Currency
+                    strategy or ("CASH" if is_cash else None),  # G: Strategy
+                    description,     # H: Description
+                    None,            # I: Notes
+                ]
+                # Append en la primera fila vacía después del header
+                next_row = ws_in.max_row + 1
+                # Buscar la primera fila realmente vacía (algunas hojas
+                # tienen filas con valores None que dejan max_row alto)
+                for r in range(5, ws_in.max_row + 2):
+                    if all(ws_in.cell(row=r, column=c).value in (None, "")
+                            for c in range(1, 10)):
+                        next_row = r
+                        break
+                for c, val in enumerate(row_vals, start=1):
+                    ws_in.cell(row=next_row, column=c, value=val)
+                n_initial += 1
+
+            wb.save(str(s.xlsx_path))
+
+            # Materializar las filas a `asientos_contables` como
+            # OPENING_BALANCE — sin esto, el motor nunca las ve.
+            asientos_stats = {}
+            try:
+                from cli.cargar_iniciales import generate_asientos
+                fx_csv = s.shared_data_dir / "fx_historico.csv"
+                asientos_stats = generate_asientos(
+                    s.xlsx_path,
+                    fecha_default=date.fromisoformat(fecha),
+                    dry_run=False,
+                    fx_csv_path=fx_csv,
+                )
+            except Exception as e:
+                warnings.append(
+                    f"generate_asientos falló: {type(e).__name__}: {e}"
+                )
 
             # Re-importar para que el motor procese la carga inicial
             stats = reimport_excel()
             prune_backups(keep_last=50)
 
-        return jsonify({
+        return {
             "ok": True,
-            "broker": broker,
             "account": account,
             "fecha": fecha,
             "n_assets_created": n_assets,
             "n_positions_written": n_initial,
+            "n_asientos_generated": (asientos_stats or {})
+                .get("filas_generadas_asientos", 0),
             "warnings": warnings,
+            "import_stats": stats,
+        }
+
+    # =========================================================================
+    # Conciliación de cash bancario
+    # =========================================================================
+    #
+    # Modelo: el motor calcula saldo de cada (cuenta_cash, moneda) sumando
+    # los movements del ledger. El user puede reportar el saldo REAL del
+    # banco/wallet/broker, y la API genera un asiento ACCOUNTING_ADJUSTMENT
+    # que cierra el delta. Idempotente por Event ID
+    # `RECON-{cuenta}-{moneda}-{fecha}` — re-cargar el mismo (cuenta, moneda,
+    # fecha) reemplaza el asiento previo.
+    #
+    # La contracuenta del ajuste es `opening_balance` (boundary, no entra en
+    # P&L ni en holdings). Eso evita inflar/deflar las cuentas de
+    # external_income / external_expense con ajustes técnicos.
+
+    CASH_KINDS = ("CASH_BANK", "CASH_BROKER", "CASH_WALLET", "CASH_PHYSICAL")
+
+    @app.get("/api/conciliacion/cash")
+    def conciliacion_get():
+        """Lista cuentas de cash con su saldo calculado por moneda y la
+        última conciliación registrada (si existe).
+
+        Response:
+          {
+            "accounts": [
+              {
+                "cuenta": "cocos",
+                "name": "Cocos broker",
+                "kind": "CASH_BROKER",
+                "currency": "ARS",   # default currency (puede haber otras)
+                "saldos": [
+                  {"moneda": "ARS", "saldo": 12345.67,
+                   "last_recon_date": "2026-04-30",
+                   "last_recon_real": 12500.00},
+                  ...
+                ]
+              }, ...
+            ]
+          }
+        """
+        _require_auth(); _block_if_switched_mutation()
+        s = get_settings()
+        if not s.db_path.is_file():
+            return jsonify({"accounts": []})
+        conn = db_conn()
+        try:
+            placeholders = ",".join("?" for _ in CASH_KINDS)
+            cur = conn.execute(
+                f"SELECT code, name, kind, currency FROM accounts "
+                f"WHERE kind IN ({placeholders}) "
+                f"ORDER BY kind, code",
+                CASH_KINDS,
+            )
+            cuentas = [dict(r) for r in cur.fetchall()]
+
+            accounts = []
+            for acc in cuentas:
+                # Saldos por asset (filtrar solo monedas — los assets no-cash
+                # no aplican para conciliación de banco)
+                cur2 = conn.execute(
+                    """
+                    SELECT m.asset, COALESCE(SUM(m.qty), 0) as saldo
+                    FROM movements m
+                    WHERE m.account = ?
+                      AND m.asset IN (SELECT code FROM currencies)
+                    GROUP BY m.asset
+                    """,
+                    (acc["code"],),
+                )
+                saldos_by_moneda = {}
+                for r in cur2.fetchall():
+                    saldo = float(r["saldo"] or 0)
+                    saldos_by_moneda[r["asset"]] = saldo
+
+                # Asegurar que la moneda nativa de la cuenta aparezca aún si
+                # tiene saldo 0 — el user puede querer iniciar conciliación
+                # desde cero.
+                if acc.get("currency"):
+                    saldos_by_moneda.setdefault(acc["currency"], 0.0)
+
+                saldos = []
+                for moneda, saldo in sorted(saldos_by_moneda.items()):
+                    # Saltar saldos cero EXCEPTO la moneda nativa (para que
+                    # cuentas vacías sigan apareciendo).
+                    if abs(saldo) < 1e-6 and moneda != acc.get("currency"):
+                        continue
+                    cur3 = conn.execute(
+                        """
+                        SELECT e.event_date
+                        FROM events e
+                        JOIN movements m2 ON m2.event_id = e.id
+                        WHERE m2.account = ? AND m2.asset = ?
+                          AND e.type = 'ACCOUNTING_ADJUSTMENT'
+                          AND e.external_id LIKE 'RECON-%'
+                        ORDER BY e.event_date DESC, e.id DESC
+                        LIMIT 1
+                        """,
+                        (acc["code"], moneda),
+                    )
+                    last = cur3.fetchone()
+                    saldos.append({
+                        "moneda": moneda,
+                        "saldo_calculado": round(saldo, 6),
+                        "last_recon_date": last["event_date"] if last else None,
+                    })
+                if saldos:
+                    accounts.append({
+                        "cuenta": acc["code"],
+                        "name": acc["name"],
+                        "kind": acc["kind"],
+                        "currency": acc["currency"],
+                        "saldos": saldos,
+                    })
+            return jsonify({"accounts": accounts})
+        finally:
+            conn.close()
+
+    @app.post("/api/conciliacion/cash")
+    def conciliacion_post():
+        """Carga un saldo real de una cuenta cash y genera/actualiza el
+        asiento de ajuste necesario para cerrar el delta.
+
+        Body:
+          {
+            "cuenta": "cocos",
+            "moneda": "ARS",
+            "fecha": "2026-05-09",          # default: hoy
+            "saldo_real": 12500.00,
+            "notes": "..."                   # opcional
+          }
+        """
+        _require_auth(); _block_if_switched_mutation()
+        body = request.get_json(silent=True) or {}
+        cuenta = (body.get("cuenta") or "").strip()
+        moneda = (body.get("moneda") or "").strip().upper()
+        fecha = body.get("fecha") or date.today().isoformat()
+        saldo_raw = body.get("saldo_real")
+        notes = (body.get("notes") or "").strip()
+
+        if not cuenta or not moneda or saldo_raw is None:
+            abort(400, "cuenta, moneda y saldo_real son requeridos")
+        try:
+            saldo_real = float(saldo_raw)
+        except (TypeError, ValueError):
+            abort(400, "saldo_real debe ser numérico")
+        try:
+            date.fromisoformat(fecha)
+        except ValueError:
+            abort(400, f"fecha inválida: {fecha} (YYYY-MM-DD)")
+
+        s = get_settings()
+        if not s.xlsx_path.is_file():
+            abort(400, "No hay Excel master cargado todavía")
+
+        # Validaciones contra la DB actual + saldo calculado
+        conn = db_conn()
+        try:
+            cur = conn.execute("SELECT kind FROM accounts WHERE code=?", (cuenta,))
+            row = cur.fetchone()
+            if not row:
+                abort(400, f"Cuenta '{cuenta}' no existe")
+            if row["kind"] not in CASH_KINDS:
+                abort(400, f"Cuenta '{cuenta}' no es de cash (kind={row['kind']})")
+            cur = conn.execute(
+                "SELECT 1 FROM accounts WHERE code='opening_balance' LIMIT 1"
+            )
+            if not cur.fetchone():
+                abort(400, "Falta la cuenta técnica `opening_balance` en "
+                           "tu hoja `cuentas`. Agregala (kind=OPENING_BALANCE) "
+                           "antes de conciliar.")
+            cur = conn.execute(
+                "SELECT 1 FROM currencies WHERE code=? LIMIT 1", (moneda,)
+            )
+            if not cur.fetchone():
+                abort(400, f"Moneda '{moneda}' no existe en `monedas`")
+
+            # Saldo calculado al fecha — sumamos qty de movements cuyo
+            # event.event_date <= fecha. Excluimos asientos previos del
+            # mismo Event ID porque estamos por reemplazarlos.
+            event_id = f"RECON-{cuenta}-{moneda}-{fecha}".upper()
+            cur = conn.execute(
+                """
+                SELECT COALESCE(SUM(m.qty), 0) AS saldo
+                FROM movements m
+                JOIN events e ON e.id = m.event_id
+                WHERE m.account = ? AND m.asset = ?
+                  AND e.event_date <= ?
+                  AND COALESCE(e.external_id, '') <> ?
+                """,
+                (cuenta, moneda, fecha, event_id),
+            )
+            saldo_calculado = float(cur.fetchone()["saldo"] or 0)
+        finally:
+            conn.close()
+
+        delta = round(saldo_real - saldo_calculado, 6)
+        if abs(delta) < 1e-6:
+            return jsonify({
+                "ok": True,
+                "cuenta": cuenta, "moneda": moneda, "fecha": fecha,
+                "saldo_calculado": saldo_calculado,
+                "saldo_real": saldo_real,
+                "delta": 0.0,
+                "asiento_generado": False,
+                "message": "Sin diferencias — no se generó asiento.",
+            })
+
+        description = (
+            f"Conciliación {cuenta} {moneda}: real={saldo_real:.2f} "
+            f"vs calc={saldo_calculado:.2f} (Δ={delta:+.2f})"
+        )
+        if notes:
+            description = f"{description} — {notes[:140]}"
+
+        from openpyxl import load_workbook as _load_wb
+        with excel_write_lock():
+            backup_excel()
+            wb = _load_wb(filename=str(s.xlsx_path))
+            if "asientos_contables" not in wb.sheetnames:
+                abort(500, "Hoja asientos_contables no existe en el master")
+            ws = wb["asientos_contables"]
+            headers = [c.value for c in ws[4]]
+            col = {str(h).strip(): i + 1
+                    for i, h in enumerate(headers) if h}
+            required = ("Event ID", "Fecha", "Description",
+                         "Cuenta", "Activo", "Qty")
+            missing = [h for h in required if h not in col]
+            if missing:
+                abort(500, f"asientos_contables sin columnas: {missing}")
+
+            # Borrar filas previas con el mismo Event ID (idempotencia)
+            rows_to_delete = []
+            for r in range(5, ws.max_row + 1):
+                eid = ws.cell(row=r, column=col["Event ID"]).value
+                if eid and isinstance(eid, str) and \
+                        eid.strip().upper() == event_id:
+                    rows_to_delete.append(r)
+            for r in sorted(rows_to_delete, reverse=True):
+                ws.delete_rows(r, 1)
+
+            # Apendear las dos filas (cuenta + opening_balance)
+            for cuenta_mov, qty_mov, mov_notes in [
+                (cuenta, delta, "Ajuste por saldo bancario reportado"),
+                ("opening_balance", -delta, "Contracuenta de conciliación"),
+            ]:
+                # Buscar primera fila vacía (en lugar de usar max_row,
+                # que puede ser alto si hay celdas con None pero borradas)
+                next_row = ws.max_row + 1
+                for r in range(5, ws.max_row + 2):
+                    if all(ws.cell(row=r, column=c).value in (None, "")
+                            for c in range(1, len(headers) + 1)):
+                        next_row = r
+                        break
+                fields = {
+                    "Event ID": event_id,
+                    "Fecha": fecha,
+                    "Description": description,
+                    "Cuenta": cuenta_mov,
+                    "Activo": moneda,
+                    "Qty": qty_mov,
+                    "Notes": mov_notes,
+                }
+                for h, val in fields.items():
+                    if h in col:
+                        ws.cell(row=next_row, column=col[h], value=val)
+
+            wb.save(str(s.xlsx_path))
+            stats = reimport_excel()
+            prune_backups(keep_last=50)
+
+        return jsonify({
+            "ok": True,
+            "cuenta": cuenta, "moneda": moneda, "fecha": fecha,
+            "saldo_calculado": saldo_calculado,
+            "saldo_real": saldo_real,
+            "delta": delta,
+            "asiento_generado": True,
+            "event_id": event_id,
             "import_stats": stats,
         })
 
@@ -2476,12 +2997,15 @@ def create_app() -> Flask:
         try:
             from build_master import build_master
             try:
-                from add_carga_inicial_sheet import add_carga_inicial_sheet
+                from add_carga_inicial_sheet import add_hoja_carga_inicial as _add_ci
             except ImportError:
-                add_carga_inicial_sheet = None
+                _add_ci = None
             build_master(s.xlsx_path)
-            if add_carga_inicial_sheet:
-                add_carga_inicial_sheet(s.xlsx_path)
+            if _add_ci:
+                from openpyxl import load_workbook as _wb
+                _wb_h = _wb(filename=str(s.xlsx_path))
+                _add_ci(_wb_h, with_examples=False)
+                _wb_h.save(str(s.xlsx_path))
             _blank_event_sheets(s.xlsx_path)
             try:
                 stats = reimport_excel()
