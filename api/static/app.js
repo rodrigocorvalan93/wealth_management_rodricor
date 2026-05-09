@@ -186,6 +186,12 @@
       method: "POST", json: payload,
     }),
 
+    // Conciliación de cash bancario
+    conciliacionList: () => API.req("/api/conciliacion/cash", { noCache: true }),
+    conciliacionSubmit: (payload) => API.req("/api/conciliacion/cash", {
+      method: "POST", json: payload,
+    }),
+
     // Audit log
     auditLog: (n = 100) => API.req(`/api/audit-log?n=${n}`, { noCache: true }),
 
@@ -1072,6 +1078,33 @@
         }
         invalidateMeta();
         navigate("/");
+      } catch (e) {
+        toast(`Error: ${e.message}`, "error");
+      }
+    },
+    async submitConciliacion(_data, form) {
+      const fd = new FormData(form);
+      const payload = {
+        cuenta: fd.get("cuenta"),
+        moneda: fd.get("moneda"),
+        fecha: fd.get("fecha") || fmt.today(),
+        saldo_real: parseFloat(fd.get("saldo_real")),
+        notes: fd.get("notes") || null,
+      };
+      if (!payload.cuenta || !payload.moneda || isNaN(payload.saldo_real)) {
+        toast("Completá cuenta, moneda y saldo real", "error"); return;
+      }
+      try {
+        toast("Conciliando saldo...", "info");
+        const res = await API.conciliacionSubmit(payload);
+        if (!res.asiento_generado) {
+          toast("✓ Sin diferencias — todo cuadra", "success");
+        } else {
+          const sign = res.delta >= 0 ? "+" : "";
+          toast(`✓ Δ=${sign}${fmt.money(res.delta, 2)} ajustado`, "success");
+        }
+        API._bustCache();
+        navigate("/conciliacion");
       } catch (e) {
         toast(`Error: ${e.message}`, "error");
       }
@@ -4361,6 +4394,12 @@ python yfinance_loader.py</pre>
           <a href="#/import" class="btn primary full" style="margin-bottom:8px">
             📥 Auto-importar tenencias
           </a>
+          <a href="#/carga-inicial" class="btn ghost full" style="margin-bottom:8px">
+            📦 Cargar tenencias viejas (manual)
+          </a>
+          <a href="#/conciliacion" class="btn ghost full" style="margin-bottom:8px">
+            🏦 Conciliar cash bancario
+          </a>
           <button class="btn ghost full" data-onclick="runByma" style="margin-bottom:8px">
             🔄 Refrescar precios BYMA
           </button>
@@ -4916,6 +4955,99 @@ python yfinance_loader.py</pre>
           }
         }, 50);
       </script>
+    `;
+  });
+
+  // ====================================================================
+  // /conciliacion — Conciliación de cash bancario
+  // ====================================================================
+  route("/conciliacion", async () => {
+    let data;
+    try { data = await API.conciliacionList(); }
+    catch (e) {
+      return `${headerWithBack("🏦 Conciliación de cash", "/settings")}
+        <main><div class="card">${escapeHtml(e.message)}</div></main>`;
+    }
+    const accounts = data.accounts || [];
+    if (accounts.length === 0) {
+      return `${headerWithBack("🏦 Conciliación de cash", "/settings")}
+        <main>
+          <section>
+            <div class="card muted">
+              No hay cuentas de cash con saldo todavía. Cargá tenencias
+              primero desde <a href="#/carga-inicial">/carga-inicial</a>.
+            </div>
+          </section>
+        </main>
+        ${bottomNav("/settings")}`;
+    }
+
+    function row(acc, s) {
+      const id = `${acc.cuenta}-${s.moneda}`.replace(/\W/g, "_");
+      const lastTxt = s.last_recon_date
+        ? `Última conciliación: ${escapeHtml(s.last_recon_date)}`
+        : `Sin conciliaciones previas`;
+      return `
+        <div class="card" style="margin-bottom:10px;">
+          <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:6px;">
+            <div>
+              <div style="font-weight:700;">${escapeHtml(acc.name || acc.cuenta)}</div>
+              <div class="muted" style="font-size:11px;">
+                <code>${escapeHtml(acc.cuenta)}</code> · ${escapeHtml(acc.kind)} · <b>${escapeHtml(s.moneda)}</b>
+              </div>
+            </div>
+            <div class="right">
+              <div class="amount tabular">${fmt.money(s.saldo_calculado, 2)}</div>
+              <div class="sub muted" style="font-size:11px;">calculado</div>
+            </div>
+          </div>
+          <div class="muted" style="font-size:11px; margin-bottom:8px;">${lastTxt}</div>
+          <form data-action="submitConciliacion">
+            <input type="hidden" name="cuenta" value="${escapeHtml(acc.cuenta)}">
+            <input type="hidden" name="moneda" value="${escapeHtml(s.moneda)}">
+            <div class="field-row">
+              <div class="field">
+                <label style="font-size:11px;">Saldo real (${escapeHtml(s.moneda)}) *</label>
+                <input type="number" step="any" name="saldo_real" required
+                       placeholder="${fmt.money(s.saldo_calculado, 2)}">
+              </div>
+              <div class="field">
+                <label style="font-size:11px;">Fecha</label>
+                <input type="date" name="fecha" value="${fmt.today()}">
+              </div>
+            </div>
+            <div class="field">
+              <label style="font-size:11px;">Notas (opcional)</label>
+              <input name="notes" placeholder="ej: extracto del banco al cierre">
+            </div>
+            <button type="submit" class="btn primary full" style="margin-top:6px;">
+              Conciliar saldo
+            </button>
+          </form>
+        </div>
+      `;
+    }
+
+    return `
+      ${headerWithBack("🏦 Conciliación de cash", "/settings")}
+      <main>
+        <section>
+          <div class="card compact muted" style="font-size:13px;">
+            Cargá el saldo <b>real</b> de tu banco / broker / wallet
+            (extracto, app del banco, etc). El motor compara con lo que
+            tiene calculado y, si hay diferencia, genera un asiento de
+            ajuste contra <code>opening_balance</code> para que cuadre.
+            Re-cargar el mismo (cuenta, moneda, fecha) reemplaza el
+            ajuste anterior.
+          </div>
+        </section>
+        ${accounts.map(acc => `
+          <section>
+            ${acc.saldos.map(s => row(acc, s)).join("")}
+          </section>
+        `).join("")}
+      </main>
+      ${bottomNav("/settings")}
     `;
   });
 

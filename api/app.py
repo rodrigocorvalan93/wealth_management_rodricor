@@ -2624,6 +2624,276 @@ def create_app() -> Flask:
         }
 
     # =========================================================================
+    # Conciliación de cash bancario
+    # =========================================================================
+    #
+    # Modelo: el motor calcula saldo de cada (cuenta_cash, moneda) sumando
+    # los movements del ledger. El user puede reportar el saldo REAL del
+    # banco/wallet/broker, y la API genera un asiento ACCOUNTING_ADJUSTMENT
+    # que cierra el delta. Idempotente por Event ID
+    # `RECON-{cuenta}-{moneda}-{fecha}` — re-cargar el mismo (cuenta, moneda,
+    # fecha) reemplaza el asiento previo.
+    #
+    # La contracuenta del ajuste es `opening_balance` (boundary, no entra en
+    # P&L ni en holdings). Eso evita inflar/deflar las cuentas de
+    # external_income / external_expense con ajustes técnicos.
+
+    CASH_KINDS = ("CASH_BANK", "CASH_BROKER", "CASH_WALLET", "CASH_PHYSICAL")
+
+    @app.get("/api/conciliacion/cash")
+    def conciliacion_get():
+        """Lista cuentas de cash con su saldo calculado por moneda y la
+        última conciliación registrada (si existe).
+
+        Response:
+          {
+            "accounts": [
+              {
+                "cuenta": "cocos",
+                "name": "Cocos broker",
+                "kind": "CASH_BROKER",
+                "currency": "ARS",   # default currency (puede haber otras)
+                "saldos": [
+                  {"moneda": "ARS", "saldo": 12345.67,
+                   "last_recon_date": "2026-04-30",
+                   "last_recon_real": 12500.00},
+                  ...
+                ]
+              }, ...
+            ]
+          }
+        """
+        _require_auth(); _block_if_switched_mutation()
+        s = get_settings()
+        if not s.db_path.is_file():
+            return jsonify({"accounts": []})
+        conn = db_conn()
+        try:
+            placeholders = ",".join("?" for _ in CASH_KINDS)
+            cur = conn.execute(
+                f"SELECT code, name, kind, currency FROM accounts "
+                f"WHERE kind IN ({placeholders}) "
+                f"ORDER BY kind, code",
+                CASH_KINDS,
+            )
+            cuentas = [dict(r) for r in cur.fetchall()]
+
+            accounts = []
+            for acc in cuentas:
+                # Saldos por asset (filtrar solo monedas — los assets no-cash
+                # no aplican para conciliación de banco)
+                cur2 = conn.execute(
+                    """
+                    SELECT m.asset, COALESCE(SUM(m.qty), 0) as saldo
+                    FROM movements m
+                    WHERE m.account = ?
+                      AND m.asset IN (SELECT code FROM currencies)
+                    GROUP BY m.asset
+                    """,
+                    (acc["code"],),
+                )
+                saldos = []
+                for r in cur2.fetchall():
+                    saldo = float(r["saldo"] or 0)
+                    if abs(saldo) < 1e-6:
+                        continue
+                    # Última conciliación de esa (cuenta, moneda)
+                    cur3 = conn.execute(
+                        """
+                        SELECT e.event_date, e.description
+                        FROM events e
+                        JOIN movements m2 ON m2.event_id = e.id
+                        WHERE m2.account = ? AND m2.asset = ?
+                          AND e.type = 'ACCOUNTING_ADJUSTMENT'
+                          AND e.external_id LIKE 'RECON-%'
+                        ORDER BY e.event_date DESC, e.id DESC
+                        LIMIT 1
+                        """,
+                        (acc["code"], r["asset"]),
+                    )
+                    last = cur3.fetchone()
+                    saldos.append({
+                        "moneda": r["asset"],
+                        "saldo_calculado": round(saldo, 6),
+                        "last_recon_date": last["event_date"] if last else None,
+                    })
+                if saldos:
+                    accounts.append({
+                        "cuenta": acc["code"],
+                        "name": acc["name"],
+                        "kind": acc["kind"],
+                        "currency": acc["currency"],
+                        "saldos": saldos,
+                    })
+            return jsonify({"accounts": accounts})
+        finally:
+            conn.close()
+
+    @app.post("/api/conciliacion/cash")
+    def conciliacion_post():
+        """Carga un saldo real de una cuenta cash y genera/actualiza el
+        asiento de ajuste necesario para cerrar el delta.
+
+        Body:
+          {
+            "cuenta": "cocos",
+            "moneda": "ARS",
+            "fecha": "2026-05-09",          # default: hoy
+            "saldo_real": 12500.00,
+            "notes": "..."                   # opcional
+          }
+        """
+        _require_auth(); _block_if_switched_mutation()
+        body = request.get_json(silent=True) or {}
+        cuenta = (body.get("cuenta") or "").strip()
+        moneda = (body.get("moneda") or "").strip().upper()
+        fecha = body.get("fecha") or date.today().isoformat()
+        saldo_raw = body.get("saldo_real")
+        notes = (body.get("notes") or "").strip()
+
+        if not cuenta or not moneda or saldo_raw is None:
+            abort(400, "cuenta, moneda y saldo_real son requeridos")
+        try:
+            saldo_real = float(saldo_raw)
+        except (TypeError, ValueError):
+            abort(400, "saldo_real debe ser numérico")
+        try:
+            date.fromisoformat(fecha)
+        except ValueError:
+            abort(400, f"fecha inválida: {fecha} (YYYY-MM-DD)")
+
+        s = get_settings()
+        if not s.xlsx_path.is_file():
+            abort(400, "No hay Excel master cargado todavía")
+
+        # Validaciones contra la DB actual + saldo calculado
+        conn = db_conn()
+        try:
+            cur = conn.execute("SELECT kind FROM accounts WHERE code=?", (cuenta,))
+            row = cur.fetchone()
+            if not row:
+                abort(400, f"Cuenta '{cuenta}' no existe")
+            if row["kind"] not in CASH_KINDS:
+                abort(400, f"Cuenta '{cuenta}' no es de cash (kind={row['kind']})")
+            cur = conn.execute(
+                "SELECT 1 FROM accounts WHERE code='opening_balance' LIMIT 1"
+            )
+            if not cur.fetchone():
+                abort(400, "Falta la cuenta técnica `opening_balance` en "
+                           "tu hoja `cuentas`. Agregala (kind=OPENING_BALANCE) "
+                           "antes de conciliar.")
+            cur = conn.execute(
+                "SELECT 1 FROM currencies WHERE code=? LIMIT 1", (moneda,)
+            )
+            if not cur.fetchone():
+                abort(400, f"Moneda '{moneda}' no existe en `monedas`")
+
+            # Saldo calculado al fecha — sumamos qty de movements cuyo
+            # event.event_date <= fecha. Excluimos asientos previos del
+            # mismo Event ID porque estamos por reemplazarlos.
+            event_id = f"RECON-{cuenta}-{moneda}-{fecha}".upper()
+            cur = conn.execute(
+                """
+                SELECT COALESCE(SUM(m.qty), 0) AS saldo
+                FROM movements m
+                JOIN events e ON e.id = m.event_id
+                WHERE m.account = ? AND m.asset = ?
+                  AND e.event_date <= ?
+                  AND COALESCE(e.external_id, '') <> ?
+                """,
+                (cuenta, moneda, fecha, event_id),
+            )
+            saldo_calculado = float(cur.fetchone()["saldo"] or 0)
+        finally:
+            conn.close()
+
+        delta = round(saldo_real - saldo_calculado, 6)
+        if abs(delta) < 1e-6:
+            return jsonify({
+                "ok": True,
+                "cuenta": cuenta, "moneda": moneda, "fecha": fecha,
+                "saldo_calculado": saldo_calculado,
+                "saldo_real": saldo_real,
+                "delta": 0.0,
+                "asiento_generado": False,
+                "message": "Sin diferencias — no se generó asiento.",
+            })
+
+        description = (
+            f"Conciliación {cuenta} {moneda}: real={saldo_real:.2f} "
+            f"vs calc={saldo_calculado:.2f} (Δ={delta:+.2f})"
+        )
+        if notes:
+            description = f"{description} — {notes[:140]}"
+
+        from openpyxl import load_workbook as _load_wb
+        with excel_write_lock():
+            backup_excel()
+            wb = _load_wb(filename=str(s.xlsx_path))
+            if "asientos_contables" not in wb.sheetnames:
+                abort(500, "Hoja asientos_contables no existe en el master")
+            ws = wb["asientos_contables"]
+            headers = [c.value for c in ws[4]]
+            col = {str(h).strip(): i + 1
+                    for i, h in enumerate(headers) if h}
+            required = ("Event ID", "Fecha", "Description",
+                         "Cuenta", "Activo", "Qty")
+            missing = [h for h in required if h not in col]
+            if missing:
+                abort(500, f"asientos_contables sin columnas: {missing}")
+
+            # Borrar filas previas con el mismo Event ID (idempotencia)
+            rows_to_delete = []
+            for r in range(5, ws.max_row + 1):
+                eid = ws.cell(row=r, column=col["Event ID"]).value
+                if eid and isinstance(eid, str) and \
+                        eid.strip().upper() == event_id:
+                    rows_to_delete.append(r)
+            for r in sorted(rows_to_delete, reverse=True):
+                ws.delete_rows(r, 1)
+
+            # Apendear las dos filas (cuenta + opening_balance)
+            for cuenta_mov, qty_mov, mov_notes in [
+                (cuenta, delta, "Ajuste por saldo bancario reportado"),
+                ("opening_balance", -delta, "Contracuenta de conciliación"),
+            ]:
+                # Buscar primera fila vacía (en lugar de usar max_row,
+                # que puede ser alto si hay celdas con None pero borradas)
+                next_row = ws.max_row + 1
+                for r in range(5, ws.max_row + 2):
+                    if all(ws.cell(row=r, column=c).value in (None, "")
+                            for c in range(1, len(headers) + 1)):
+                        next_row = r
+                        break
+                fields = {
+                    "Event ID": event_id,
+                    "Fecha": fecha,
+                    "Description": description,
+                    "Cuenta": cuenta_mov,
+                    "Activo": moneda,
+                    "Qty": qty_mov,
+                    "Notes": mov_notes,
+                }
+                for h, val in fields.items():
+                    if h in col:
+                        ws.cell(row=next_row, column=col[h], value=val)
+
+            wb.save(str(s.xlsx_path))
+            stats = reimport_excel()
+            prune_backups(keep_last=50)
+
+        return jsonify({
+            "ok": True,
+            "cuenta": cuenta, "moneda": moneda, "fecha": fecha,
+            "saldo_calculado": saldo_calculado,
+            "saldo_real": saldo_real,
+            "delta": delta,
+            "asiento_generado": True,
+            "event_id": event_id,
+            "import_stats": stats,
+        })
+
+    # =========================================================================
     # Audit log per-user (read-only)
     # =========================================================================
 
