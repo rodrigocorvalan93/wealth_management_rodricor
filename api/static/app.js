@@ -180,6 +180,15 @@
     runCafci: (fecha) => API.req("/api/loaders/cafci", {
       method: "POST", json: fecha ? { fecha } : {},
     }),
+    runFx: (dias) => API.req("/api/loaders/fx", {
+      method: "POST", json: dias ? { dias } : {},
+    }),
+    runYfinance: (tickers) => API.req("/api/loaders/yfinance", {
+      method: "POST", json: tickers ? { tickers } : {},
+    }),
+    runAllLoaders: () => API.req("/api/loaders/all", {
+      method: "POST", json: {},
+    }),
 
     // Carga manual de tenencias viejas (saldos de apertura)
     cargaInicial: (payload) => API.req("/api/carga-inicial", {
@@ -1015,6 +1024,53 @@
         } else {
           toast(`Error: ${e.message}`, "error");
         }
+      }
+    },
+    async runFx() {
+      try {
+        toast("Bajando FX (USD/USB/A3500 + EUR/BRL/...)", "info");
+        const res = await API.runFx();
+        toast(`✓ FX refrescado (${res.yf_fx_currencies || 0} monedas foráneas)`,
+              "success");
+        API._bustCache();
+        render();
+      } catch (e) {
+        toast(`Error FX: ${e.message}`, "error");
+      }
+    },
+    async runYfinance() {
+      try {
+        toast("Bajando precios US (Yahoo Finance)...", "info");
+        const res = await API.runYfinance();
+        toast(`✓ ${res.n_prices} precios US refrescados (${(res.tickers||[]).length} tickers)`,
+              "success");
+        API._bustCache();
+        render();
+      } catch (e) {
+        toast(`Error yfinance: ${e.message}`, "error");
+      }
+    },
+    async runAllLoaders() {
+      try {
+        toast("Refrescando TODO (FX + cripto + US + CAFCI)... ~30-60s",
+              "info");
+        const res = await API.runAllLoaders();
+        const r = res.results || {};
+        const summary = Object.entries(r).map(([k, v]) =>
+          v.ok ? `✓ ${k}` : `✗ ${k}`
+        ).join(" · ");
+        toast(summary || "Done", "success");
+        const failed = Object.entries(r).filter(([_, v]) => !v.ok);
+        if (failed.length) {
+          setTimeout(() => {
+            toast(failed.map(([k, v]) => `${k}: ${v.error}`).join(" | "),
+                  "error");
+          }, 1500);
+        }
+        API._bustCache();
+        render();
+      } catch (e) {
+        toast(`Error: ${e.message}`, "error");
       }
     },
     async submitCargaInicial(_data, form) {
@@ -3238,6 +3294,16 @@
     return `
       ${headerWithBack("Nueva especie", "/especies")}
       <main>
+        <section>
+          <div class="card compact muted" style="font-size:12px;">
+            <b>Convención de tickers</b><br>
+            • Bonos / acciones AR locales (BYMA): <code>AL30D</code>, <code>GGAL</code>, <code>YPF</code>...<br>
+            • CEDEAR de una US (en BYMA, ARS): sufijo <code>_AR</code> → <code>AAPL_AR</code>, <code>MSFT_AR</code>.<br>
+            • Acción US directa (NASDAQ/NYSE, USD): sufijo <code>_US</code> → <code>AAPL_US</code>, <code>MSFT_US</code>.<br>
+            • FCI: el ticker que pongas tiene que matchear con la línea correspondiente de <code>fcis_cafci.txt</code>.<br>
+            • Cripto: el símbolo (<code>BTC</code>, <code>ETH</code>, <code>USDT</code>, ...).
+          </div>
+        </section>
         <form data-action="createEspecie">
           ${especieFormFields({}, false)}
           <button type="submit" class="btn primary full">Guardar</button>
@@ -4324,11 +4390,24 @@ python yfinance_loader.py</pre>
           <a href="#/conciliacion" class="btn ghost full" style="margin-bottom:8px">
             🏦 Conciliar cash bancario
           </a>
+          <button class="btn primary full" data-onclick="runAllLoaders" style="margin-bottom:8px">
+            ⚡ Refrescar TODOS los precios ahora
+          </button>
+          <div class="muted" style="font-size:11px; margin: -4px 0 10px 0;">
+            FX (CCL/MEP/A3500 + EUR/BRL) · cripto (CoinGecko) · equities US (Yahoo)${cfg && cfg.is_superadmin ? " · CAFCI" : ""}.
+            Auto-refresh cada 4h en el server.
+          </div>
           <button class="btn ghost full" data-onclick="runByma" style="margin-bottom:8px">
-            🔄 Refrescar precios BYMA
+            🔄 Refrescar BYMA (acciones / bonos AR)
+          </button>
+          <button class="btn ghost full" data-onclick="runFx" style="margin-bottom:8px">
+            💱 Refrescar FX (CCL / MEP / EUR / BRL...)
           </button>
           <button class="btn ghost full" data-onclick="runCripto" style="margin-bottom:8px">
             🪙 Refrescar precios cripto
+          </button>
+          <button class="btn ghost full" data-onclick="runYfinance" style="margin-bottom:8px">
+            📈 Refrescar US (Yahoo: AAPL, MSFT, ETFs...)
           </button>
           ${cfg && cfg.is_superadmin ? `
             <button class="btn ghost full" data-onclick="runCafci" style="margin-bottom:8px">
@@ -5116,20 +5195,41 @@ python yfinance_loader.py</pre>
 
         <section>
           <h2>Refrescar precios ahora</h2>
-          <button class="btn ghost full" data-onclick="runByma" style="margin-bottom:8px;">
-            🔄 Bajar precios BYMA (acciones, bonos, CEDEARs)
+          <button class="btn primary full" data-onclick="runAllLoaders" style="margin-bottom:8px;">
+            ⚡ Refrescar TODOS los precios
           </button>
           <div class="muted" style="font-size:12px; margin-bottom:14px;">
-            Usa los tickers del archivo <code>tickers_byma.txt</code> del repo.
-            Requiere credenciales BYMA configuradas.
+            Corre FX + cripto + equities US${isSuper ? " + CAFCI" : ""} en serie.
+            En el server hay un cron que lo hace solo cada 4h.
+          </div>
+
+          <button class="btn ghost full" data-onclick="runByma" style="margin-bottom:8px;">
+            🔄 BYMA (acciones, bonos AR, CEDEARs)
+          </button>
+          <div class="muted" style="font-size:12px; margin-bottom:14px;">
+            Usa <code>tickers_byma.txt</code> y tus credenciales BYMA del form.
+          </div>
+
+          <button class="btn ghost full" data-onclick="runFx" style="margin-bottom:8px;">
+            💱 FX (CCL / MEP / A3500 + EUR/BRL/...)
+          </button>
+          <div class="muted" style="font-size:12px; margin-bottom:14px;">
+            Dolarapi.com + BCRA + Yahoo Finance. Sin auth.
           </div>
 
           <button class="btn ghost full" data-onclick="runCripto" style="margin-bottom:8px;">
-            🪙 Bajar precios cripto (CoinGecko)
+            🪙 Cripto (CoinGecko)
           </button>
           <div class="muted" style="font-size:12px; margin-bottom:14px;">
-            BTC, ETH, SOL, USDT, USDC y más. API pública, sin credenciales.
-            Los precios se comparten entre todos los users.
+            BTC, ETH, SOL, USDT, USDC y más. API pública.
+          </div>
+
+          <button class="btn ghost full" data-onclick="runYfinance" style="margin-bottom:8px;">
+            📈 Equities US (Yahoo Finance)
+          </button>
+          <div class="muted" style="font-size:12px; margin-bottom:14px;">
+            Toma los tickers <code>EQUITY_US</code>, <code>ETF</code>, <code>REIT</code>
+            de tus <code>especies</code> (ej AAPL_US → AAPL en Yahoo).
           </div>
 
           ${isSuper ? `
