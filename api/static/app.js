@@ -141,6 +141,24 @@
 
     prices: () => API.req("/api/prices"),
     fxRates: () => API.req("/api/fx-rates"),
+    priceHistory: (ticker, n=180) =>
+      API.req(`/api/prices/${encodeURIComponent(ticker)}/history?n=${n}`,
+              { noCache: true }),
+    priceUpsert: (ticker, payload) =>
+      API.req(`/api/prices/${encodeURIComponent(ticker)}`,
+              { method: "PUT", json: payload }),
+    priceDelete: (ticker, fecha) =>
+      API.req(`/api/prices/${encodeURIComponent(ticker)}?fecha=${fecha}`,
+              { method: "DELETE" }),
+    fxHistory: (moneda, base="ARS", n=180) =>
+      API.req(`/api/fx-rates/${encodeURIComponent(moneda)}/history?base=${base}&n=${n}`,
+              { noCache: true }),
+    fxUpsert: (moneda, payload) =>
+      API.req(`/api/fx-rates/${encodeURIComponent(moneda)}`,
+              { method: "PUT", json: payload }),
+    fxDelete: (moneda, fecha, base="ARS") =>
+      API.req(`/api/fx-rates/${encodeURIComponent(moneda)}?fecha=${fecha}&base=${base}`,
+              { method: "DELETE" }),
     cash: (anchor) => API.req(`/api/cash?anchor=${anchor || API.anchor()}`),
     config: () => API.req("/api/config"),
     reportHtml: (anchor) => API.req(`/api/report/html?anchor=${anchor || API.anchor()}`),
@@ -1134,6 +1152,67 @@
         }
         invalidateMeta();
         navigate("/");
+      } catch (e) {
+        toast(`Error: ${e.message}`, "error");
+      }
+    },
+    async upsertPrice(data, form) {
+      const ticker = form.dataset.ticker;
+      try {
+        await API.priceUpsert(ticker, {
+          fecha: data.fecha,
+          price: parseFloat(data.price),
+          currency: (data.currency || "").toUpperCase(),
+          note: data.note || null,
+        });
+        toast(`✓ Precio guardado para ${ticker} en ${data.fecha}`, "success");
+        API._bustCache();
+        navigate(`/cotizaciones/precio/${encodeURIComponent(ticker)}`);
+      } catch (e) {
+        toast(`Error: ${e.message}`, "error");
+      }
+    },
+    async deleteManualPrice(arg) {
+      // arg = "ticker|fecha"
+      const [ticker, fecha] = (arg || "").split("|");
+      if (!ticker || !fecha) return;
+      if (!confirm(`Borrar el precio MANUAL de ${ticker} en ${fecha}?`)) return;
+      try {
+        await API.priceDelete(ticker, fecha);
+        toast("✓ Borrado", "success");
+        API._bustCache();
+        render();
+      } catch (e) {
+        toast(`Error: ${e.message}`, "error");
+      }
+    },
+    async upsertFx(data, form) {
+      const moneda = form.dataset.moneda;
+      const base = form.dataset.base || "ARS";
+      try {
+        await API.fxUpsert(moneda, {
+          fecha: data.fecha,
+          rate: parseFloat(data.rate),
+          base,
+          note: data.note || null,
+        });
+        toast(`✓ FX ${moneda}/${base} guardado en ${data.fecha}`, "success");
+        API._bustCache();
+        navigate(`/cotizaciones/fx/${encodeURIComponent(moneda)}/${encodeURIComponent(base)}`);
+      } catch (e) {
+        toast(`Error: ${e.message}`, "error");
+      }
+    },
+    async deleteManualFx(arg) {
+      // arg = "moneda|fecha|base"
+      const [moneda, fecha, base] = (arg || "").split("|");
+      if (!moneda || !fecha) return;
+      if (!confirm(`Borrar FX manual ${moneda}/${base} en ${fecha}?`)) return;
+      try {
+        await API.fxDelete(moneda, fecha, base);
+        toast("✓ Borrado", "success");
+        API._bustCache();
+        render();
       } catch (e) {
         toast(`Error: ${e.message}`, "error");
       }
@@ -3470,7 +3549,8 @@
                   </tr>
                 </thead>
                 <tbody>${fxRates.map(r => `
-                  <tr style="border-bottom: 1px solid var(--border);">
+                  <tr style="border-bottom: 1px solid var(--border); cursor: pointer;"
+                      onclick="window.location.hash='#/cotizaciones/fx/${encodeURIComponent(r.moneda)}/${encodeURIComponent(r.base || 'ARS')}'">
                     <td style="padding: 4px;"><b>${escapeHtml(r.moneda)}</b></td>
                     <td style="padding: 4px; text-align:right;" class="tabular">${fmt.money(r.rate, 4)}</td>
                     <td style="padding: 4px;">${escapeHtml(r.base)}</td>
@@ -3490,7 +3570,8 @@
                 <div style="font-weight: 600; color: var(--navy); margin-bottom: 6px;">${escapeHtml(cls)} (${byClass[cls].length})</div>
                 <table style="width:100%; font-size: 13px;">
                   <tbody>${byClass[cls].map(p => `
-                    <tr style="border-bottom: 1px solid var(--border);">
+                    <tr style="border-bottom: 1px solid var(--border); cursor: pointer;"
+                        onclick="window.location.hash='#/cotizaciones/precio/${encodeURIComponent(p.ticker)}'">
                       <td style="padding: 4px;"><b>${escapeHtml(p.ticker)}</b><br><span class="muted" style="font-size:11px;">${escapeHtml(p.name || "")}</span></td>
                       <td style="padding: 4px; text-align:right;" class="tabular">${fmt.money(p.price, 4)} <span class="muted" style="font-size:11px;">${escapeHtml(p.currency)}</span></td>
                       <td style="padding: 4px; text-align:right; font-size:11px;" class="muted">${escapeHtml(p.fecha)}<br>${escapeHtml(p.source)}</td>
@@ -3499,6 +3580,207 @@
                 </table>
               </div>
             `).join("")
+          }
+        </section>
+      </main>
+    `;
+  });
+
+  // ====================================================================
+  // /cotizaciones/precio/:ticker — historial + edit (sólo superadmin)
+  // ====================================================================
+  route("/cotizaciones/precio/:ticker", async ({ ticker }) => {
+    let data, cfg;
+    try {
+      [data, cfg] = await Promise.all([
+        API.priceHistory(ticker, 365),
+        API.config().catch(() => ({})),
+      ]);
+    } catch (e) {
+      return `${headerWithBack("📈 " + ticker, "/cotizaciones")}
+        <main><div class="card">${escapeHtml(e.message)}</div></main>`;
+    }
+    const items = data.items || [];
+    const isSuper = !!(cfg && cfg.is_superadmin);
+    const title = `📈 ${data.name || ticker} (${ticker})`;
+
+    return `
+      ${headerWithBack(title, "/cotizaciones")}
+      <main>
+        <section>
+          <div class="card compact muted" style="font-size:12px;">
+            ${data.asset_class ? escapeHtml(data.asset_class) + " · " : ""}
+            ${items.length} cotizaciones (más recientes primero).
+            ${isSuper ? "Sos superadmin: podés sobrescribir cualquier valor abajo." : ""}
+          </div>
+        </section>
+
+        ${isSuper ? `
+        <section>
+          <h2>Editar / agregar precio</h2>
+          <form data-action="upsertPrice" data-ticker="${escapeHtml(ticker)}">
+            <div class="field-row">
+              <div class="field">
+                <label>Fecha *</label>
+                <input type="date" name="fecha" value="${fmt.today()}" required>
+              </div>
+              <div class="field">
+                <label>Precio *</label>
+                <input type="number" step="any" name="price" required>
+              </div>
+              <div class="field">
+                <label>Moneda *</label>
+                <input name="currency" required style="text-transform:uppercase;"
+                       value="${escapeHtml((items[0] && items[0].currency) || 'USD')}">
+              </div>
+            </div>
+            <div class="field">
+              <label>Nota (opcional)</label>
+              <input name="note" placeholder="ej: corrección de feed BYMA">
+            </div>
+            <button type="submit" class="btn primary full" style="margin-top:6px;">
+              Guardar precio manual
+            </button>
+            <div class="muted" style="font-size:11px; margin-top:6px;">
+              Se escribe a <code>data/precios_manual.csv</code>. Si la
+              (fecha, ticker) ya existía, la pisa. El loader automático
+              (BYMA / cripto / yfinance) NO la borra después.
+            </div>
+          </form>
+        </section>
+        ` : ""}
+
+        <section>
+          <h2>Historial</h2>
+          ${items.length === 0
+            ? '<div class="card muted">Sin cotizaciones todavía.</div>'
+            : `<div class="card" style="padding:0;">
+                <table style="width:100%; font-size: 13px;">
+                  <thead>
+                    <tr style="border-bottom: 1px solid var(--border);">
+                      <th style="text-align:left; padding: 6px;">Fecha</th>
+                      <th style="text-align:right; padding: 6px;">Precio</th>
+                      <th style="text-align:left; padding: 6px;">Moneda</th>
+                      <th style="text-align:left; padding: 6px; font-size:11px;">Fuente</th>
+                      ${isSuper ? '<th></th>' : ''}
+                    </tr>
+                  </thead>
+                  <tbody>${items.map(p => `
+                    <tr style="border-bottom: 1px solid var(--border);">
+                      <td style="padding: 6px;" class="tabular">${escapeHtml(p.fecha)}</td>
+                      <td style="padding: 6px; text-align:right;" class="tabular">
+                        ${fmt.money(p.price, 6)}
+                        ${p.is_manual ? '<span class="tag warn" style="font-size:9px; margin-left:4px;">manual</span>' : ''}
+                      </td>
+                      <td style="padding: 6px;">${escapeHtml(p.currency)}</td>
+                      <td style="padding: 6px; font-size:11px;" class="muted">${escapeHtml(p.source)}</td>
+                      ${isSuper && p.is_manual ? `
+                        <td style="padding: 6px;">
+                          <button class="btn ghost" style="padding:2px 8px; font-size:11px;"
+                                  data-onclick="deleteManualPrice"
+                                  data-arg="${escapeHtml(ticker + '|' + p.fecha)}">✕</button>
+                        </td>
+                      ` : isSuper ? '<td></td>' : ''}
+                    </tr>
+                  `).join("")}</tbody>
+                </table>
+              </div>`
+          }
+        </section>
+      </main>
+    `;
+  });
+
+  // ====================================================================
+  // /cotizaciones/fx/:moneda/:base — historial FX + edit (sólo superadmin)
+  // ====================================================================
+  route("/cotizaciones/fx/:moneda/:base", async ({ moneda, base }) => {
+    let data, cfg;
+    try {
+      [data, cfg] = await Promise.all([
+        API.fxHistory(moneda, base, 365),
+        API.config().catch(() => ({})),
+      ]);
+    } catch (e) {
+      return `${headerWithBack(`💱 ${moneda}/${base}`, "/cotizaciones")}
+        <main><div class="card">${escapeHtml(e.message)}</div></main>`;
+    }
+    const items = data.items || [];
+    const isSuper = !!(cfg && cfg.is_superadmin);
+
+    return `
+      ${headerWithBack(`💱 ${moneda} / ${base}`, "/cotizaciones")}
+      <main>
+        <section>
+          <div class="card compact muted" style="font-size:12px;">
+            <b>1 ${escapeHtml(moneda)} = N ${escapeHtml(base)}</b> ·
+            ${items.length} cotizaciones.
+            ${isSuper ? "Sos superadmin: podés sobrescribir abajo." : ""}
+          </div>
+        </section>
+
+        ${isSuper ? `
+        <section>
+          <h2>Editar / agregar FX rate</h2>
+          <form data-action="upsertFx" data-moneda="${escapeHtml(moneda)}" data-base="${escapeHtml(base)}">
+            <div class="field-row">
+              <div class="field">
+                <label>Fecha *</label>
+                <input type="date" name="fecha" value="${fmt.today()}" required>
+              </div>
+              <div class="field">
+                <label>Rate (1 ${escapeHtml(moneda)} = N ${escapeHtml(base)}) *</label>
+                <input type="number" step="any" name="rate" required>
+              </div>
+            </div>
+            <div class="field">
+              <label>Nota (opcional)</label>
+              <input name="note" placeholder="ej: MEP de cierre BYMA">
+            </div>
+            <button type="submit" class="btn primary full" style="margin-top:6px;">
+              Guardar FX manual
+            </button>
+            <div class="muted" style="font-size:11px; margin-top:6px;">
+              Se escribe a <code>data/fx_manual.csv</code>. Pisa el FX
+              automático del loader para esa (fecha, moneda, base).
+            </div>
+          </form>
+        </section>
+        ` : ""}
+
+        <section>
+          <h2>Historial</h2>
+          ${items.length === 0
+            ? '<div class="card muted">Sin FX cargado todavía.</div>'
+            : `<div class="card" style="padding:0;">
+                <table style="width:100%; font-size: 13px;">
+                  <thead>
+                    <tr style="border-bottom: 1px solid var(--border);">
+                      <th style="text-align:left; padding: 6px;">Fecha</th>
+                      <th style="text-align:right; padding: 6px;">Rate</th>
+                      <th style="text-align:left; padding: 6px; font-size:11px;">Fuente</th>
+                      ${isSuper ? '<th></th>' : ''}
+                    </tr>
+                  </thead>
+                  <tbody>${items.map(r => `
+                    <tr style="border-bottom: 1px solid var(--border);">
+                      <td style="padding: 6px;" class="tabular">${escapeHtml(r.fecha)}</td>
+                      <td style="padding: 6px; text-align:right;" class="tabular">
+                        ${fmt.money(r.rate, 4)}
+                        ${r.is_manual ? '<span class="tag warn" style="font-size:9px; margin-left:4px;">manual</span>' : ''}
+                      </td>
+                      <td style="padding: 6px; font-size:11px;" class="muted">${escapeHtml(r.source)}</td>
+                      ${isSuper && r.is_manual ? `
+                        <td style="padding: 6px;">
+                          <button class="btn ghost" style="padding:2px 8px; font-size:11px;"
+                                  data-onclick="deleteManualFx"
+                                  data-arg="${escapeHtml(moneda + '|' + r.fecha + '|' + base)}">✕</button>
+                        </td>
+                      ` : isSuper ? '<td></td>' : ''}
+                    </tr>
+                  `).join("")}</tbody>
+                </table>
+              </div>`
           }
         </section>
       </main>

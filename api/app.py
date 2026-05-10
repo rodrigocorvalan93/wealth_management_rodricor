@@ -1348,6 +1348,323 @@ def create_app() -> Flask:
         finally:
             conn.close()
 
+    # =========================================================================
+    # Historial de precios + FX (lectura para todos, edición sólo superadmin)
+    # =========================================================================
+    #
+    # Modelo:
+    # - Los precios automáticos viven en data/precios_<source>.csv y se
+    #   importan a la tabla `prices` del sqlite en cada reimport.
+    # - Las correcciones manuales del superadmin se guardan en
+    #   data/precios_manual.csv y se cargan ÚLTIMO en auto_load_all → pisan
+    #   lo que vino del loader automático para esa (fecha, ticker).
+    # - Mismo patrón para FX con data/fx_manual.csv.
+
+    PRICES_MANUAL_CSV = "precios_manual.csv"
+    FX_MANUAL_CSV = "fx_manual.csv"
+
+    def _read_manual_csv(path, key_cols):
+        import csv as _csv
+        rows = []
+        if not path.is_file():
+            return rows
+        with open(path, encoding="utf-8", newline="") as f:
+            reader = _csv.DictReader(f)
+            for r in reader:
+                rows.append({k: (v or "").strip() for k, v in r.items()})
+        return rows
+
+    def _write_manual_csv(path, rows, header):
+        import csv as _csv
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "w", encoding="utf-8", newline="") as f:
+            w = _csv.DictWriter(f, fieldnames=header)
+            w.writeheader()
+            for r in rows:
+                w.writerow({h: r.get(h, "") for h in header})
+
+    def _upsert_manual_price(fecha, ticker, price, currency, source_note):
+        s = get_settings()
+        path = s.shared_data_dir / PRICES_MANUAL_CSV
+        header = ["fecha", "ticker", "price", "currency", "source"]
+        rows = _read_manual_csv(path, ("fecha", "ticker"))
+        rows = [r for r in rows if not (r.get("fecha") == fecha
+                                         and r.get("ticker") == ticker)]
+        rows.append({
+            "fecha": fecha,
+            "ticker": ticker,
+            "price": f"{float(price):.6f}",
+            "currency": currency,
+            "source": f"manual ({source_note})" if source_note else "manual",
+        })
+        _write_manual_csv(path, rows, header)
+
+    def _delete_manual_price(fecha, ticker):
+        s = get_settings()
+        path = s.shared_data_dir / PRICES_MANUAL_CSV
+        if not path.is_file():
+            return False
+        header = ["fecha", "ticker", "price", "currency", "source"]
+        rows = _read_manual_csv(path, ("fecha", "ticker"))
+        before = len(rows)
+        rows = [r for r in rows if not (r.get("fecha") == fecha
+                                         and r.get("ticker") == ticker)]
+        _write_manual_csv(path, rows, header)
+        return before != len(rows)
+
+    def _upsert_manual_fx(fecha, moneda, rate, base, source_note):
+        s = get_settings()
+        path = s.shared_data_dir / FX_MANUAL_CSV
+        header = ["fecha", "moneda", "rate", "base", "source"]
+        rows = _read_manual_csv(path, ("fecha", "moneda", "base"))
+        rows = [r for r in rows if not (r.get("fecha") == fecha
+                                         and r.get("moneda") == moneda
+                                         and (r.get("base") or "ARS") == base)]
+        rows.append({
+            "fecha": fecha,
+            "moneda": moneda,
+            "rate": f"{float(rate):.6f}",
+            "base": base,
+            "source": f"manual ({source_note})" if source_note else "manual",
+        })
+        _write_manual_csv(path, rows, header)
+
+    def _delete_manual_fx(fecha, moneda, base):
+        s = get_settings()
+        path = s.shared_data_dir / FX_MANUAL_CSV
+        if not path.is_file():
+            return False
+        header = ["fecha", "moneda", "rate", "base", "source"]
+        rows = _read_manual_csv(path, ("fecha", "moneda", "base"))
+        before = len(rows)
+        rows = [r for r in rows if not (r.get("fecha") == fecha
+                                         and r.get("moneda") == moneda
+                                         and (r.get("base") or "ARS") == base)]
+        _write_manual_csv(path, rows, header)
+        return before != len(rows)
+
+    @app.get("/api/prices/<ticker>/history")
+    def prices_history(ticker):
+        """Devuelve el historial de cotizaciones de un ticker (todas las
+        fechas que tenga la DB). Query: ?n=180 (default) limita a las N
+        más recientes.
+
+        Cada fila incluye `is_manual: bool` para que la UI pueda diferenciar
+        las que vienen del loader automático de las que el superadmin pisó.
+        """
+        _require_auth(); _block_if_switched_mutation()
+        try:
+            n = int(request.args.get("n", "180"))
+        except ValueError:
+            n = 180
+        n = max(1, min(n, 5000))
+
+        s = get_settings()
+        # Cargar lo que hay en precios_manual.csv para flagear is_manual
+        manual_keys = set()
+        manual_path = s.shared_data_dir / PRICES_MANUAL_CSV
+        if manual_path.is_file():
+            for r in _read_manual_csv(manual_path, ("fecha", "ticker")):
+                if r.get("ticker") == ticker:
+                    manual_keys.add(r.get("fecha"))
+
+        conn = db_conn()
+        try:
+            rows = conn.execute(
+                """SELECT p.fecha, p.price, p.currency, p.source,
+                          a.name, a.asset_class
+                   FROM prices p
+                   LEFT JOIN assets a ON a.ticker = p.ticker
+                   WHERE p.ticker = ?
+                   ORDER BY p.fecha DESC
+                   LIMIT ?""",
+                (ticker, n),
+            ).fetchall()
+            if not rows:
+                return jsonify({"ticker": ticker, "items": [], "n": 0})
+            return jsonify({
+                "ticker": ticker,
+                "name": rows[0]["name"] or "",
+                "asset_class": rows[0]["asset_class"] or "",
+                "n": len(rows),
+                "items": [
+                    {
+                        "fecha": r["fecha"],
+                        "price": r["price"],
+                        "currency": r["currency"],
+                        "source": r["source"] or "",
+                        "is_manual": r["fecha"] in manual_keys,
+                    } for r in rows
+                ],
+            })
+        finally:
+            conn.close()
+
+    @app.put("/api/prices/<ticker>")
+    def prices_upsert(ticker):
+        """Crea o sobrescribe un precio (sólo superadmin).
+
+        Body: {"fecha":"YYYY-MM-DD","price":123.45,"currency":"USD","note":"..."}
+
+        Escribe a data/precios_manual.csv (loaded LAST en auto_load_all,
+        así pisa al loader automático). Re-importa el master del caller.
+        """
+        _require_superadmin(); _block_if_switched_mutation()
+        body = request.get_json(silent=True) or {}
+        fecha = (body.get("fecha") or "").strip()
+        try:
+            date.fromisoformat(fecha)
+        except ValueError:
+            abort(400, f"fecha inválida: {fecha} (YYYY-MM-DD)")
+        try:
+            price = float(body.get("price"))
+        except (TypeError, ValueError):
+            abort(400, "price debe ser numérico")
+        if price <= 0:
+            abort(400, "price debe ser > 0")
+        currency = (body.get("currency") or "").strip().upper()
+        if not currency:
+            abort(400, "currency es requerido")
+        note = (body.get("note") or "").strip()[:80]
+
+        _upsert_manual_price(fecha, ticker, price, currency, note)
+        s = get_settings()
+        stats = None
+        if s.xlsx_path.is_file():
+            with excel_write_lock():
+                stats = reimport_excel()
+        return jsonify({
+            "ok": True, "ticker": ticker, "fecha": fecha,
+            "price": price, "currency": currency,
+            "import_stats": stats,
+        })
+
+    @app.delete("/api/prices/<ticker>")
+    def prices_delete(ticker):
+        """Borra un precio MANUAL (sólo superadmin). Query: ?fecha=YYYY-MM-DD.
+
+        Sólo se borra si la fila vino de precios_manual.csv. Si era de
+        un loader automático, el siguiente loader la vuelve a poner —
+        para suprimirla de verdad hay que correr la edición y poner
+        un valor que se quiera mantener.
+        """
+        _require_superadmin(); _block_if_switched_mutation()
+        fecha = (request.args.get("fecha") or "").strip()
+        try:
+            date.fromisoformat(fecha)
+        except ValueError:
+            abort(400, f"fecha inválida: {fecha} (YYYY-MM-DD)")
+        ok = _delete_manual_price(fecha, ticker)
+        s = get_settings()
+        stats = None
+        if s.xlsx_path.is_file():
+            with excel_write_lock():
+                stats = reimport_excel()
+        return jsonify({
+            "ok": True, "ticker": ticker, "fecha": fecha,
+            "deleted_manual": ok, "import_stats": stats,
+        })
+
+    @app.get("/api/fx-rates/<moneda>/history")
+    def fx_history(moneda):
+        """Historial FX para una moneda. Query: ?base=ARS&n=180."""
+        _require_auth(); _block_if_switched_mutation()
+        base = (request.args.get("base") or "ARS").strip().upper()
+        try:
+            n = int(request.args.get("n", "180"))
+        except ValueError:
+            n = 180
+        n = max(1, min(n, 5000))
+
+        s = get_settings()
+        manual_keys = set()
+        manual_path = s.shared_data_dir / FX_MANUAL_CSV
+        if manual_path.is_file():
+            for r in _read_manual_csv(manual_path, ("fecha", "moneda", "base")):
+                if r.get("moneda") == moneda and \
+                        (r.get("base") or "ARS") == base:
+                    manual_keys.add(r.get("fecha"))
+
+        conn = db_conn()
+        try:
+            rows = conn.execute(
+                """SELECT fecha, rate, source
+                   FROM fx_rates
+                   WHERE moneda = ? AND base = ?
+                   ORDER BY fecha DESC
+                   LIMIT ?""",
+                (moneda, base, n),
+            ).fetchall()
+            return jsonify({
+                "moneda": moneda, "base": base,
+                "n": len(rows),
+                "items": [
+                    {
+                        "fecha": r["fecha"],
+                        "rate": r["rate"],
+                        "source": r["source"] or "",
+                        "is_manual": r["fecha"] in manual_keys,
+                    } for r in rows
+                ],
+            })
+        finally:
+            conn.close()
+
+    @app.put("/api/fx-rates/<moneda>")
+    def fx_upsert(moneda):
+        """Crea o sobrescribe un FX rate (sólo superadmin).
+
+        Body: {"fecha":"YYYY-MM-DD","rate":1485.0,"base":"ARS","note":"..."}
+        Escribe a data/fx_manual.csv. Re-importa el master del caller.
+        """
+        _require_superadmin(); _block_if_switched_mutation()
+        body = request.get_json(silent=True) or {}
+        fecha = (body.get("fecha") or "").strip()
+        try:
+            date.fromisoformat(fecha)
+        except ValueError:
+            abort(400, f"fecha inválida: {fecha} (YYYY-MM-DD)")
+        try:
+            rate = float(body.get("rate"))
+        except (TypeError, ValueError):
+            abort(400, "rate debe ser numérico")
+        if rate <= 0:
+            abort(400, "rate debe ser > 0")
+        base = (body.get("base") or "ARS").strip().upper()
+        note = (body.get("note") or "").strip()[:80]
+
+        _upsert_manual_fx(fecha, moneda, rate, base, note)
+        s = get_settings()
+        stats = None
+        if s.xlsx_path.is_file():
+            with excel_write_lock():
+                stats = reimport_excel()
+        return jsonify({
+            "ok": True, "moneda": moneda, "base": base, "fecha": fecha,
+            "rate": rate, "import_stats": stats,
+        })
+
+    @app.delete("/api/fx-rates/<moneda>")
+    def fx_delete(moneda):
+        """Borra un FX rate MANUAL (sólo superadmin)."""
+        _require_superadmin(); _block_if_switched_mutation()
+        fecha = (request.args.get("fecha") or "").strip()
+        base = (request.args.get("base") or "ARS").strip().upper()
+        try:
+            date.fromisoformat(fecha)
+        except ValueError:
+            abort(400, f"fecha inválida: {fecha} (YYYY-MM-DD)")
+        ok = _delete_manual_fx(fecha, moneda, base)
+        s = get_settings()
+        stats = None
+        if s.xlsx_path.is_file():
+            with excel_write_lock():
+                stats = reimport_excel()
+        return jsonify({
+            "ok": True, "moneda": moneda, "base": base, "fecha": fecha,
+            "deleted_manual": ok, "import_stats": stats,
+        })
+
     @app.get("/api/cash")
     def cash_endpoint():
         """Saldos cash por cuenta (todas las monedas).
