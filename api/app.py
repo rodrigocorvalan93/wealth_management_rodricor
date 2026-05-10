@@ -2304,6 +2304,298 @@ def create_app() -> Flask:
             "shared": True,
         })
 
+    @app.post("/api/loaders/fx")
+    def loader_fx_endpoint():
+        """Refresca cotizaciones FX (USD/CCL, USB/MEP, USD_OFICIAL/A3500)
+        desde dolarapi.com + BCRA. Sin auth. Compartido entre todos los
+        users.
+
+        Body opcional:
+          {"dias": 7}   — backfill de los últimos N días desde
+                          argentinadatos. Default: solo el día.
+        """
+        _require_auth(); _block_if_switched_mutation()
+        body = request.get_json(silent=True) or {}
+        dias = body.get("dias")
+        try:
+            dias = int(dias) if dias else None
+        except (TypeError, ValueError):
+            abort(400, "dias debe ser entero")
+
+        s = get_settings()
+        try:
+            from fx_loader import run as fx_run
+            rc = fx_run(
+                output_dir=s.shared_data_dir,
+                dias=dias,
+                desde=None,
+                dry_run=False,
+            )
+        except Exception as e:
+            abort(502, f"FX loader falló: {type(e).__name__}: {e}")
+        if rc != 0:
+            abort(500, "FX loader devolvió error (revisá logs del server)")
+
+        # FX foráneo (EUR, BRL, GBP, etc) desde Yahoo Finance — best effort
+        yf_n = 0
+        try:
+            from yfinance_fx_loader import (
+                upsert_current as yf_fx_upsert,
+                DEFAULT_CURRENCIES as YF_FX_DEFAULT,
+            )
+            # Filtrar a las monedas que están en `monedas` del master del user
+            wanted = set(YF_FX_DEFAULT)
+            if s.xlsx_path.is_file():
+                try:
+                    from .excel_io import list_rows
+                    user_currencies = {
+                        str(r.get("Code") or "").strip().upper()
+                        for r in list_rows(s.xlsx_path, "monedas")
+                        if r.get("Code")
+                    }
+                    wanted &= user_currencies or wanted
+                except Exception:
+                    pass
+            if wanted:
+                yf_n = yf_fx_upsert(
+                    s.shared_data_dir / "fx_historico.csv",
+                    sorted(wanted),
+                )
+        except Exception as e:
+            print(f"[fx] WARN yfinance_fx_loader falló: {e}")
+
+        stats = None
+        if s.xlsx_path.is_file():
+            with excel_write_lock():
+                stats = reimport_excel()
+        return jsonify({
+            "loader_rc": rc,
+            "yf_fx_currencies": yf_n,
+            "import_stats": stats,
+            "shared": True,
+        })
+
+    @app.post("/api/loaders/yfinance")
+    def loader_yfinance_endpoint():
+        """Refresca precios de equities US (Yahoo Finance, sin auth).
+
+        Toma los tickers de `especies` cuyo Asset Class es EQUITY_US,
+        ETF, REIT, EQUITY_GLOBAL. Convierte ticker_US → ticker yahoo
+        (ej AAPL_US → AAPL).
+
+        Body opcional:
+          {"tickers": ["AAPL","MSFT"]}   — override
+        """
+        _require_auth(); _block_if_switched_mutation()
+        body = request.get_json(silent=True) or {}
+        tickers = body.get("tickers")
+        if tickers and not isinstance(tickers, list):
+            abort(400, "tickers debe ser una lista")
+
+        s = get_settings()
+        if not tickers:
+            if not s.xlsx_path.is_file():
+                abort(400, "No hay Excel master cargado. Pasá 'tickers' "
+                           "explícito o cargá tu master primero.")
+            try:
+                from .excel_io import list_rows
+                YF_CLASSES = {"EQUITY_US", "ETF", "REIT", "EQUITY_GLOBAL"}
+                tickers = sorted({
+                    str(r.get("Ticker") or "").strip()
+                    for r in list_rows(s.xlsx_path, "especies")
+                    if r.get("Ticker") and
+                       (r.get("Asset Class") or "").strip() in YF_CLASSES
+                })
+                tickers = [t for t in tickers if t]
+            except Exception as e:
+                abort(500, f"No pude leer especies: {e}")
+        if not tickers:
+            return jsonify({
+                "n_prices": 0,
+                "tickers": [],
+                "message": "No hay tickers US/ETF/REIT en `especies`",
+                "shared": True,
+            })
+
+        try:
+            from yfinance_loader import upsert_current as yf_upsert
+            n = yf_upsert(
+                s.shared_data_dir / "precios_us.csv",
+                tickers,
+            )
+        except Exception as e:
+            abort(502, f"yfinance falló: {type(e).__name__}: {e}")
+
+        stats = None
+        if s.xlsx_path.is_file():
+            with excel_write_lock():
+                stats = reimport_excel()
+        return jsonify({
+            "n_prices": n,
+            "tickers": tickers,
+            "import_stats": stats,
+            "shared": True,
+        })
+
+    @app.post("/api/loaders/all")
+    def loader_all_endpoint():
+        """Corre todos los loaders sin auth (FX + cripto + yfinance) y,
+        si el caller es superadmin con creds, también CAFCI.
+
+        BYMA queda excluido porque depende de las creds personales del
+        user — se sigue corriendo desde el botón individual.
+
+        Devuelve un dict por loader con su resultado / error.
+        """
+        _require_auth(); _block_if_switched_mutation()
+        is_super = bool(getattr(g, "is_superadmin", False))
+        s = get_settings()
+        results = {}
+
+        # --- FX (dolarapi + BCRA) ---
+        try:
+            from fx_loader import run as fx_run
+            rc = fx_run(output_dir=s.shared_data_dir, dias=None,
+                         desde=None, dry_run=False)
+            results["fx"] = {"ok": rc == 0, "rc": rc}
+        except Exception as e:
+            results["fx"] = {"ok": False, "error": f"{type(e).__name__}: {e}"}
+
+        # --- FX foráneo (yfinance) ---
+        try:
+            from yfinance_fx_loader import (
+                upsert_current as yf_fx_upsert,
+                DEFAULT_CURRENCIES as YF_FX_DEFAULT,
+            )
+            wanted = set(YF_FX_DEFAULT)
+            if s.xlsx_path.is_file():
+                try:
+                    from .excel_io import list_rows
+                    user_currencies = {
+                        str(r.get("Code") or "").strip().upper()
+                        for r in list_rows(s.xlsx_path, "monedas")
+                        if r.get("Code")
+                    }
+                    wanted &= user_currencies or wanted
+                except Exception:
+                    pass
+            n = yf_fx_upsert(
+                s.shared_data_dir / "fx_historico.csv",
+                sorted(wanted),
+            ) if wanted else 0
+            results["yfinance_fx"] = {"ok": True, "n_currencies": n}
+        except Exception as e:
+            results["yfinance_fx"] = {"ok": False,
+                                       "error": f"{type(e).__name__}: {e}"}
+
+        # --- Cripto (CoinGecko) ---
+        try:
+            from cripto_loader import (
+                upsert_current as cripto_upsert,
+                DEFAULT_TICKERS as CRIPTO_DEFAULT,
+                TICKER_TO_COINGECKO,
+            )
+            tickers = list(CRIPTO_DEFAULT)
+            # Agregar los cripto que el user tenga en `especies`
+            if s.xlsx_path.is_file():
+                try:
+                    from .excel_io import list_rows
+                    CRYPTO_CLASSES = {"CRYPTO", "STABLECOIN"}
+                    user_cripto = {
+                        str(r.get("Ticker") or "").strip().upper()
+                        for r in list_rows(s.xlsx_path, "especies")
+                        if r.get("Ticker") and
+                           (r.get("Asset Class") or "").strip() in CRYPTO_CLASSES
+                    }
+                    tickers = sorted(set(tickers) | user_cripto)
+                except Exception:
+                    pass
+            tickers = [t for t in tickers if t in TICKER_TO_COINGECKO]
+            n = cripto_upsert(
+                s.shared_data_dir / "precios_cripto.csv",
+                tickers,
+            ) if tickers else 0
+            results["cripto"] = {"ok": True, "n_prices": n}
+        except Exception as e:
+            results["cripto"] = {"ok": False,
+                                  "error": f"{type(e).__name__}: {e}"}
+
+        # --- yfinance equities US ---
+        try:
+            us_tickers = []
+            if s.xlsx_path.is_file():
+                from .excel_io import list_rows
+                YF_CLASSES = {"EQUITY_US", "ETF", "REIT", "EQUITY_GLOBAL"}
+                us_tickers = sorted({
+                    str(r.get("Ticker") or "").strip()
+                    for r in list_rows(s.xlsx_path, "especies")
+                    if r.get("Ticker") and
+                       (r.get("Asset Class") or "").strip() in YF_CLASSES
+                })
+                us_tickers = [t for t in us_tickers if t]
+            if us_tickers:
+                from yfinance_loader import upsert_current as yf_upsert
+                n = yf_upsert(
+                    s.shared_data_dir / "precios_us.csv",
+                    us_tickers,
+                )
+                results["yfinance"] = {"ok": True, "n_prices": n,
+                                        "n_tickers": len(us_tickers)}
+            else:
+                results["yfinance"] = {"ok": True, "n_prices": 0,
+                                        "message": "Sin tickers US"}
+        except Exception as e:
+            results["yfinance"] = {"ok": False,
+                                    "error": f"{type(e).__name__}: {e}"}
+
+        # --- CAFCI (solo superadmin con token) ---
+        if is_super:
+            c = creds.get_credentials(g.active_user_id)
+            if c.get("cafci_token"):
+                try:
+                    repo_root = Path(__file__).resolve().parent.parent
+                    fcis_file = repo_root / "fcis_cafci.txt"
+                    if fcis_file.is_file():
+                        prev_token = os.environ.get("CAFCI_TOKEN")
+                        os.environ["CAFCI_TOKEN"] = c["cafci_token"]
+                        try:
+                            from cafci_loader import run as cafci_run
+                            rc = cafci_run(
+                                fcis_file=fcis_file,
+                                output_dir=s.shared_data_dir,
+                                fecha=None,
+                                dry_run=False,
+                                use_xlsx_currency=True,
+                                xlsx_path=s.xlsx_path,
+                            )
+                            results["cafci"] = {"ok": rc == 0, "rc": rc}
+                        finally:
+                            if prev_token is None:
+                                os.environ.pop("CAFCI_TOKEN", None)
+                            else:
+                                os.environ["CAFCI_TOKEN"] = prev_token
+                    else:
+                        results["cafci"] = {"ok": False,
+                                             "error": "fcis_cafci.txt no existe"}
+                except Exception as e:
+                    results["cafci"] = {"ok": False,
+                                         "error": f"{type(e).__name__}: {e}"}
+            else:
+                results["cafci"] = {"ok": False,
+                                     "error": "Sin token CAFCI configurado"}
+
+        # Re-import si hay master
+        import_stats = None
+        if s.xlsx_path.is_file():
+            with excel_write_lock():
+                import_stats = reimport_excel()
+
+        return jsonify({
+            "results": results,
+            "import_stats": import_stats,
+            "is_superadmin": is_super,
+        })
+
     # =========================================================================
     # Auto-import de tenencias desde brokers (Cocos / Binance / IBKR)
     # =========================================================================
