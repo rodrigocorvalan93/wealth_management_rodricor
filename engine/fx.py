@@ -237,7 +237,9 @@ def auto_load_fx(conn, data_dir: str | Path = "data") -> int:
     """
     n = 0
     base = Path(data_dir)
-    for fname in ("fx_historico.csv", "fx_foreign.csv"):
+    # `fx_manual.csv` se carga ÚLTIMO para que las correcciones manuales del
+    # superadmin pisen lo que vino de los loaders automáticos.
+    for fname in ("fx_historico.csv", "fx_foreign.csv", "fx_manual.csv"):
         p = base / fname
         if p.is_file():
             n += import_fx_csv(conn, p)

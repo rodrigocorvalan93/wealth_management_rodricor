@@ -1020,6 +1020,7 @@ def import_all(db_path: str | Path, xlsx_path: str | Path,
                  Si es None, intenta auto-cargar `<data_dir>/fx_historico.csv`.
     """
     from .schema import init_db
+    import sqlite3 as _sqlite3
     if fecha_corte is None:
         fecha_corte = date.today()
 
@@ -1027,8 +1028,49 @@ def import_all(db_path: str | Path, xlsx_path: str | Path,
     print(f"[importer] XLSX: {xlsx_path}")
     print(f"[importer] Fecha de corte (para recurrentes): {fecha_corte}")
 
+    # Preservar snapshots del PN (equity curve) antes de recrear la DB.
+    # Sin esto, cada reimport borra el historial de snapshots y la curva
+    # arranca de cero. Las otras tablas se regeneran del Excel y de los
+    # CSVs de precios/FX, así que no hay que preservar nada más.
+    db_path_obj = Path(db_path)
+    preserved_snapshots = []
+    if db_path_obj.is_file():
+        try:
+            old_conn = _sqlite3.connect(str(db_path_obj))
+            old_conn.row_factory = _sqlite3.Row
+            cur = old_conn.execute(
+                """SELECT fecha, account, anchor_currency, mv_anchor,
+                          investible_only, notes
+                   FROM pn_snapshots"""
+            )
+            preserved_snapshots = [dict(r) for r in cur.fetchall()]
+            old_conn.close()
+            if preserved_snapshots:
+                print(f"[importer] preservando {len(preserved_snapshots)} "
+                      f"snapshots de PN antes del reimport")
+        except _sqlite3.OperationalError:
+            # Tabla no existe todavía (DB primera vez) — OK.
+            pass
+
     # Recrear DB para idempotencia
     conn = init_db(db_path, drop_existing=True)
+
+    # Restaurar snapshots
+    if preserved_snapshots:
+        try:
+            for s in preserved_snapshots:
+                conn.execute(
+                    """INSERT OR REPLACE INTO pn_snapshots
+                       (fecha, account, anchor_currency, mv_anchor,
+                        investible_only, notes)
+                       VALUES (?, ?, ?, ?, ?, ?)""",
+                    (s["fecha"], s["account"], s["anchor_currency"],
+                     s["mv_anchor"], s["investible_only"], s.get("notes")),
+                )
+            conn.commit()
+        except Exception as e:
+            print(f"[importer] WARN no pude restaurar snapshots: {e}")
+
     wb = load_workbook(filename=str(xlsx_path), data_only=True)
 
     stats = {}

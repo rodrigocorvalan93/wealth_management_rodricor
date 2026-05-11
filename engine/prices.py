@@ -180,6 +180,9 @@ def auto_load_all(conn, data_dir="data"):
         "cafci":    data_dir / "precios_cafci.csv",
         "cripto":   data_dir / "precios_cripto.csv",
         "yfinance": data_dir / "precios_us.csv",
+        # `manual` siempre se carga ÚLTIMO para que las correcciones del
+        # superadmin pisen lo que vino de los loaders automáticos.
+        "manual":   data_dir / "precios_manual.csv",
     }
 
     stats = {}
