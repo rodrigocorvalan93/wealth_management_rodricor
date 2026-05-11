@@ -72,7 +72,7 @@ from .state import (
     DEFAULT_USER_ID,
 )
 from . import credentials as creds
-from . import audit, ratelimit
+from . import audit, ratelimit, jobs as bg_jobs
 from . import auth as auth_mod
 from .users import (
     load_users, resolve_user_by_token, get_active_user,
@@ -2950,31 +2950,23 @@ def create_app() -> Flask:
                                  "error": f"{type(e).__name__}: {e}"}), 200
         return jsonify(test_fn(c))
 
-    @app.post("/api/import/<broker>/preview")
-    def import_preview(broker):
-        """Trae las posiciones del broker y las devuelve SIN escribir nada.
+    def _fetch_and_annotate_preview(user_id: str, broker: str) -> dict:
+        """Trabajo sincrónico de la preview: fetch al broker + match contra
+        `especies`/`monedas` del Excel del user. Usado tanto por el endpoint
+        sync como por el background job.
 
-        Body opcional:
-          {"match_assets": true}  → si True, marca cuáles tickers ya
-                                    existen en `especies` del Excel
-                                    para que la UI los pueda diferenciar
-                                    de los nuevos.
+        No depende del request context — usa user_id explícito.
         """
-        _require_auth(); _block_if_switched_mutation()
         from engine import brokers
+        from .state import get_user_settings
         mod = brokers.get(broker)
         if mod is None:
-            abort(404, f"Broker '{broker}' no soportado")
-        c = creds.get_credentials(g.active_user_id)
-        try:
-            result = mod.fetch_positions(c)
-        except (ValueError, PermissionError) as e:
-            abort(400, str(e))
-        except Exception as e:
-            abort(502, f"Error del broker: {type(e).__name__}: {e}")
+            raise ValueError(f"Broker '{broker}' no soportado")
+        c = creds.get_credentials(user_id)
+        result = mod.fetch_positions(c)
 
         # Match contra `especies` para flagear assets desconocidos
-        s = get_settings()
+        s = get_user_settings(user_id)
         existing_tickers = set()
         existing_currencies = set()
         try:
@@ -2995,7 +2987,66 @@ def create_app() -> Flask:
                 p["known"] = t in existing_currencies
             else:
                 p["known"] = t in existing_tickers
+        return result
+
+    @app.post("/api/import/<broker>/preview")
+    def import_preview(broker):
+        """Trae las posiciones del broker y las devuelve SIN escribir nada.
+
+        Endpoint SINCRÓNICO — para brokers rápidos (Cocos, Binance). Para
+        IBKR que puede tardar > timeout del proxy, usar el endpoint async
+        (preview/start + jobs/<id>).
+
+        Body opcional:
+          {"match_assets": true}  → si True, marca cuáles tickers ya
+                                    existen en `especies` del Excel
+                                    para que la UI los pueda diferenciar
+                                    de los nuevos.
+        """
+        _require_auth(); _block_if_switched_mutation()
+        from engine import brokers
+        if brokers.get(broker) is None:
+            abort(404, f"Broker '{broker}' no soportado")
+        try:
+            result = _fetch_and_annotate_preview(g.active_user_id, broker)
+        except (ValueError, PermissionError) as e:
+            abort(400, str(e))
+        except Exception as e:
+            abort(502, f"Error del broker: {type(e).__name__}: {e}")
         return jsonify(result)
+
+    @app.post("/api/import/<broker>/preview/start")
+    def import_preview_start(broker):
+        """Arranca preview en background y devuelve job_id para pollear.
+
+        Resuelve el problema de IBKR Flex tardando > 60s y matando el worker
+        de gunicorn. El cliente pollea GET /api/import/jobs/<job_id> hasta
+        que status="done" o "error".
+        """
+        _require_auth(); _block_if_switched_mutation()
+        from engine import brokers
+        if brokers.get(broker) is None:
+            abort(404, f"Broker '{broker}' no soportado")
+        user_id = g.active_user_id
+        job_id = bg_jobs.create_job(
+            user_id=user_id,
+            kind=f"import_preview:{broker}",
+            fn=lambda: _fetch_and_annotate_preview(user_id, broker),
+        )
+        return jsonify({"job_id": job_id, "status": "pending"})
+
+    @app.get("/api/import/jobs/<job_id>")
+    def import_job_status(job_id):
+        """Devuelve el estado del job. Status: pending|done|error.
+
+        Si done, `result` tiene la preview completa. Si error, `error` tiene
+        el mensaje. Frontend hace polling hasta que cambie de pending.
+        """
+        _require_auth()
+        job = bg_jobs.get_job(g.active_user_id, job_id)
+        if job is None:
+            abort(404, f"Job {job_id} no encontrado")
+        return jsonify(job)
 
     @app.post("/api/import/<broker>/apply")
     def import_apply(broker):
@@ -3712,6 +3763,9 @@ def create_app() -> Flask:
     @app.errorhandler(403)
     @app.errorhandler(404)
     @app.errorhandler(500)
+    @app.errorhandler(502)
+    @app.errorhandler(503)
+    @app.errorhandler(504)
     def err(e):
         return jsonify({
             "error": True,

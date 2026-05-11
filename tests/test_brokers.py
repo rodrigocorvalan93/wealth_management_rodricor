@@ -219,3 +219,79 @@ def test_registry_has_all_brokers():
     assert len(meta) == 3
     for b in meta:
         assert "name" in b and "needs" in b and "icon" in b
+
+
+def test_ibkr_error_code_1001_has_hint():
+    """1001 es transitorio ("Statement could not be generated at this time")
+    y el usuario debe ver un mensaje claro."""
+    from engine.brokers.ibkr_flex import _IBKR_ERROR_HINTS
+    assert "1001" in _IBKR_ERROR_HINTS
+    hint = _IBKR_ERROR_HINTS["1001"]
+    assert "transitorio" in hint.lower() or "reintentá" in hint.lower()
+
+
+# =============================================================================
+# Background jobs (api/jobs.py)
+# =============================================================================
+
+def test_jobs_create_and_get(tmp_path, monkeypatch):
+    """Smoke test del background job: arranca, se completa, se puede leer."""
+    import time
+    monkeypatch.setenv("WM_BASE_DIR", str(tmp_path))
+    from api.state import reset_settings
+    reset_settings()
+    from api import jobs
+
+    job_id = jobs.create_job("testuser", "test_kind", lambda: {"hello": "world"})
+    assert job_id and len(job_id) == 16
+
+    # Esperar a que el thread termine (es síncrono y rápido)
+    for _ in range(50):
+        st = jobs.get_job("testuser", job_id)
+        if st and st["status"] != "pending":
+            break
+        time.sleep(0.05)
+
+    st = jobs.get_job("testuser", job_id)
+    assert st is not None
+    assert st["status"] == "done"
+    assert st["result"] == {"hello": "world"}
+    assert st["error"] is None
+
+
+def test_jobs_error_captured(tmp_path, monkeypatch):
+    """Si el fn raisea, el job queda en status=error con mensaje."""
+    import time
+    monkeypatch.setenv("WM_BASE_DIR", str(tmp_path))
+    from api.state import reset_settings
+    reset_settings()
+    from api import jobs
+
+    def boom():
+        raise RuntimeError("something failed")
+
+    job_id = jobs.create_job("testuser", "test_err", boom)
+    for _ in range(50):
+        st = jobs.get_job("testuser", job_id)
+        if st and st["status"] != "pending":
+            break
+        time.sleep(0.05)
+
+    st = jobs.get_job("testuser", job_id)
+    assert st["status"] == "error"
+    assert "RuntimeError" in st["error"]
+    assert "something failed" in st["error"]
+
+
+def test_jobs_invalid_id_returns_none(tmp_path, monkeypatch):
+    """job_id que no es hex no debe permitir path traversal."""
+    monkeypatch.setenv("WM_BASE_DIR", str(tmp_path))
+    from api.state import reset_settings
+    reset_settings()
+    from api import jobs
+
+    assert jobs.get_job("testuser", "../../etc/passwd") is None
+    assert jobs.get_job("testuser", "not-hex-XYZ") is None
+    assert jobs.get_job("testuser", "") is None
+    # Un hex válido pero inexistente devuelve None tranqui
+    assert jobs.get_job("testuser", "0123456789abcdef") is None

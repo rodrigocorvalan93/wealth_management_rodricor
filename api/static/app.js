@@ -208,6 +208,16 @@
       method: "POST", json: {},
     }),
 
+    // Import async — arranca un job en background y devuelve job_id
+    startImportPreview: (broker) => API.req(
+      `/api/import/${encodeURIComponent(broker)}/preview/start`,
+      { method: "POST", json: {} },
+    ),
+    getImportJob: (jobId) => API.req(
+      `/api/import/jobs/${encodeURIComponent(jobId)}`,
+      { noCache: true },
+    ),
+
     // Carga manual de tenencias viejas (saldos de apertura)
     cargaInicial: (payload) => API.req("/api/carga-inicial", {
       method: "POST", json: payload,
@@ -5033,11 +5043,31 @@ python yfinance_loader.py</pre>
   // ====================================================================
   // /import/:broker — Preview + apply de un broker específico
   // ====================================================================
+  // Poll de un background job. IBKR Flex tarda 30-90s y excede el timeout
+  // del proxy si se hace sync — el server arranca un thread y nosotros
+  // polleamos hasta done/error.
+  async function pollImportJob(jobId, { maxSeconds = 180 } = {}) {
+    const start = Date.now();
+    // Escalado: 500ms, 1s, 2s, 2s, 2s, ... (snappier para brokers rápidos)
+    const intervals = [500, 1000, 2000];
+    let i = 0;
+    while (Date.now() - start < maxSeconds * 1000) {
+      const job = await API.getImportJob(jobId);
+      if (job.status === "done") return job.result;
+      if (job.status === "error") throw new Error(job.error || "Job falló sin mensaje");
+      const wait = intervals[Math.min(i, intervals.length - 1)];
+      i++;
+      await new Promise(r => setTimeout(r, wait));
+    }
+    throw new Error(`Timeout (${maxSeconds}s) esperando el broker — reintentá en 1-2 min`);
+  }
+
   route("/import/:broker", async ({ broker }) => {
     let preview, meta;
     try {
+      const started = await API.startImportPreview(broker);
       [preview, meta] = await Promise.all([
-        API.req(`/api/import/${broker}/preview`, { method: "POST", json: {} }),
+        pollImportJob(started.job_id),
         loadMeta(),
       ]);
     } catch (e) {
@@ -5045,8 +5075,9 @@ python yfinance_loader.py</pre>
         <main>
           <div class="card">
             <div style="font-weight:700; margin-bottom:8px;">No pude bajar las posiciones.</div>
-            <div class="muted" style="font-size:13px;">${escapeHtml(e.message)}</div>
+            <div class="muted" style="font-size:13px; white-space:pre-wrap;">${escapeHtml(e.message)}</div>
             <a href="#/credentials" class="btn ghost full" style="margin-top:12px;">Revisar credenciales</a>
+            <a href="#/import/${escapeHtml(broker)}" class="btn primary full" style="margin-top:8px;">🔄 Reintentar</a>
           </div>
         </main>`;
     }
