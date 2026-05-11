@@ -46,7 +46,11 @@ from typing import Any, Callable, Optional
 
 
 _MAX_JOB_AGE_SECONDS = 3600   # 1 hora
-_STUCK_AFTER_SECONDS = 300    # un job "pending" sin updates > 5 min → stuck
+# El job de import de IBKR puede tardar ~4 min con los retries de 1001:
+# 1001 backoffs [20, 60, 120] + _get_report polling (max 72s) + requests.
+# 8 min cubre el peor caso con margen para no marcar como stuck a algo
+# que sigue funcionando.
+_STUCK_AFTER_SECONDS = 480
 
 
 def _jobs_dir(user_id: str) -> Path:

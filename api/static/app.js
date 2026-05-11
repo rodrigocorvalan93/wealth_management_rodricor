@@ -5046,7 +5046,7 @@ python yfinance_loader.py</pre>
   // Poll de un background job. IBKR Flex tarda 30-90s y excede el timeout
   // del proxy si se hace sync — el server arranca un thread y nosotros
   // polleamos hasta done/error.
-  async function pollImportJob(jobId, { maxSeconds = 180 } = {}) {
+  async function pollImportJob(jobId, { maxSeconds = 420 } = {}) {
     const start = Date.now();
     // Escalado: 500ms, 1s, 2s, 2s, 2s, ... (snappier para brokers rápidos)
     const intervals = [500, 1000, 2000];
