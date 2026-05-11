@@ -42,6 +42,9 @@ DEFAULT_GET_URL = ("https://gdcdyn.interactivebrokers.com/"
 # Error codes documentados de IBKR Flex. Mapping → mensaje útil.
 # Source: IBKR Flex Web Service API Reference.
 _IBKR_ERROR_HINTS = {
+    "1001": ("IBKR no puede generar el reporte ahora mismo (transitorio). "
+              "Esperá 2-5 minutos y reintentá. Suele pasar después de "
+              "crear/editar una Flex Query o en horario de mantenimiento."),
     "1003": ("Statement is not available. Verifica que tu Flex Query "
               "esté guardada y configurada con el período correcto."),
     "1004": "No records found for the specified period.",
