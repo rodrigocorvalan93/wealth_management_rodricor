@@ -43,8 +43,10 @@ DEFAULT_GET_URL = ("https://gdcdyn.interactivebrokers.com/"
 # Source: IBKR Flex Web Service API Reference.
 _IBKR_ERROR_HINTS = {
     "1001": ("IBKR no puede generar el reporte ahora mismo (transitorio). "
-              "Esperá 2-5 minutos y reintentá. Suele pasar después de "
-              "crear/editar una Flex Query o en horario de mantenimiento."),
+              "Pasa típicamente porque acabás de pedir el mismo reporte "
+              "(IBKR tiene un cooldown de ~30s-3min entre generaciones). "
+              "Si descargaste el XML manualmente en el browser hace poco, "
+              "esperá 5-10 min y reintentá desde la app."),
     "1003": ("Statement is not available. Verifica que tu Flex Query "
               "esté guardada y configurada con el período correcto."),
     "1004": "No records found for the specified period.",
@@ -86,8 +88,25 @@ def _parse_ibkr_error(text: str) -> tuple[str | None, str | None]:
     return (code or None, msg or None)
 
 
+# Códigos transitorios de IBKR — la app reintenta automáticamente con backoff.
+# Para cada uno, lista de delays (segundos) entre reintentos. Total time =
+# sum(delays) + tiempo de las requests (~3-5s). Mantenelo bajo el timeout del
+# background job (~3 min) para que no quede colgado.
+_TRANSIENT_BACKOFFS = {
+    "1001": [20, 60, 120],   # cooldown post-generación (≤ 3.4 min total)
+    "1005": [10, 30, 60],    # service unavailable
+    "1006": [30, 60, 90],    # too many requests
+    "1008": [10, 20, 30],    # statement still being processed
+    "1014": [30, 60, 90],    # too many requests in queue
+}
+
+
 def _request_report(token: str, query_id: str, timeout: int = 20) -> str:
     """Inicia el flex report. Devuelve reference_code.
+
+    Para errores transitorios (1001, 1005, 1006, 1008, 1014) reintenta
+    automáticamente con backoff antes de fallar. Otros errores fallan al
+    primer intento.
 
     Lanza RuntimeError con mensaje contextual si falla.
     """
@@ -105,38 +124,61 @@ def _request_report(token: str, query_id: str, timeout: int = 20) -> str:
             f"Queries en tu cuenta IBKR)."
         )
 
-    r = requests.get(
-        SEND_URL,
-        params={"t": token, "q": query_id, "v": "3"},
-        timeout=timeout,
-    )
-    r.raise_for_status()
-    code, msg = _parse_ibkr_error(r.text)
-    # Si llegó el ReferenceCode → OK
-    try:
-        root = ET.fromstring(r.text)
-    except ET.ParseError:
-        raise RuntimeError(
-            f"IBKR devolvió un response no-XML inesperado "
-            f"(primeros 200 chars: {r.text[:200]!r})"
+    last_code: str | None = None
+    last_msg: str | None = None
+    attempt = 0
+    while True:
+        r = requests.get(
+            SEND_URL,
+            params={"t": token, "q": query_id, "v": "3"},
+            timeout=timeout,
         )
-    status = (root.findtext("Status") or "").strip()
-    if status == "Success":
-        ref = root.findtext("ReferenceCode")
-        if ref:
-            return ref
-        raise RuntimeError("IBKR Status=Success pero sin ReferenceCode")
+        r.raise_for_status()
+        try:
+            root = ET.fromstring(r.text)
+        except ET.ParseError:
+            raise RuntimeError(
+                f"IBKR devolvió un response no-XML inesperado "
+                f"(primeros 200 chars: {r.text[:200]!r})"
+            )
+        status = (root.findtext("Status") or "").strip()
+        if status == "Success":
+            ref = root.findtext("ReferenceCode")
+            if ref:
+                return ref
+            raise RuntimeError("IBKR Status=Success pero sin ReferenceCode")
 
-    # Status != Success → mapear el code a un mensaje útil
-    hint = _IBKR_ERROR_HINTS.get(code, "")
-    if not hint and msg:
-        hint = msg
-    detail = f"code={code}" if code else "sin código"
-    if msg:
-        detail += f", msg='{msg}'"
+        last_code = (root.findtext("ErrorCode") or "").strip() or None
+        last_msg = (root.findtext("ErrorMessage") or "").strip() or None
+
+        # Si es transitorio y todavía quedan reintentos → esperar y reintentar
+        backoffs = _TRANSIENT_BACKOFFS.get(last_code or "")
+        if backoffs and attempt < len(backoffs):
+            wait = backoffs[attempt]
+            print(f"[ibkr_flex] code={last_code} transitorio, esperando {wait}s "
+                  f"(retry {attempt+1}/{len(backoffs)})", flush=True)
+            time.sleep(wait)
+            attempt += 1
+            continue
+        break
+
+    # Falló — mapear el code a un mensaje útil
+    hint = _IBKR_ERROR_HINTS.get(last_code or "", "")
+    if not hint and last_msg:
+        hint = last_msg
+    detail = f"code={last_code}" if last_code else "sin código"
+    if last_msg:
+        detail += f", msg='{last_msg}'"
+    retried_note = ""
+    if last_code in _TRANSIENT_BACKOFFS:
+        retried_note = (
+            f"\n\nLa app reintentó {len(_TRANSIENT_BACKOFFS[last_code])} veces "
+            f"con backoff antes de fallar — el error es persistente del lado "
+            f"de IBKR. Esperá 5-10 minutos y volvé a probar.\n"
+        )
     raise RuntimeError(
         f"IBKR Flex SendRequest falló ({detail}).\n\n"
-        f"💡 {hint}\n\n"
+        f"💡 {hint}{retried_note}\n\n"
         f"Setup de IBKR Flex:\n"
         f"  1. Reports → Flex Queries → New (Custom)\n"
         f"  2. Sections: 'Open Positions' (mandatorio) + 'Trades' "

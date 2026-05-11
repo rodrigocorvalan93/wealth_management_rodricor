@@ -230,6 +230,101 @@ def test_ibkr_error_code_1001_has_hint():
     assert "transitorio" in hint.lower() or "reintentá" in hint.lower()
 
 
+def test_ibkr_request_report_retries_on_transient_1001(monkeypatch):
+    """_request_report debe reintentar automáticamente en 1001 (cooldown)
+    y devolver el ReferenceCode cuando IBKR finalmente acepta."""
+    from engine.brokers import ibkr_flex
+
+    # Saltear los sleeps reales para que el test sea rápido
+    monkeypatch.setattr(ibkr_flex.time, "sleep", lambda s: None)
+
+    error_xml = (
+        '<FlexStatementResponse><Status>Fail</Status>'
+        '<ErrorCode>1001</ErrorCode>'
+        '<ErrorMessage>cooldown</ErrorMessage>'
+        '</FlexStatementResponse>'
+    )
+    success_xml = (
+        '<FlexStatementResponse><Status>Success</Status>'
+        '<ReferenceCode>REF123</ReferenceCode>'
+        '<Url>http://example</Url>'
+        '</FlexStatementResponse>'
+    )
+
+    responses = iter([error_xml, error_xml, success_xml])
+
+    class FakeResp:
+        def __init__(self, text):
+            self.text = text
+        def raise_for_status(self):
+            pass
+
+    def fake_get(url, params=None, timeout=None):
+        return FakeResp(next(responses))
+
+    monkeypatch.setattr("requests.get", fake_get)
+
+    ref = ibkr_flex._request_report("tok", "12345")
+    assert ref == "REF123"
+
+
+def test_ibkr_request_report_gives_up_after_retries(monkeypatch):
+    """Si IBKR sigue dando 1001 después de todos los retries, raisea con un
+    mensaje que indica que ya se reintentó."""
+    from engine.brokers import ibkr_flex
+    monkeypatch.setattr(ibkr_flex.time, "sleep", lambda s: None)
+
+    error_xml = (
+        '<FlexStatementResponse><Status>Fail</Status>'
+        '<ErrorCode>1001</ErrorCode>'
+        '<ErrorMessage>still no</ErrorMessage>'
+        '</FlexStatementResponse>'
+    )
+
+    class FakeResp:
+        def __init__(self, text):
+            self.text = text
+        def raise_for_status(self):
+            pass
+
+    def fake_get(url, params=None, timeout=None):
+        return FakeResp(error_xml)
+
+    monkeypatch.setattr("requests.get", fake_get)
+
+    with pytest.raises(RuntimeError, match="code=1001"):
+        ibkr_flex._request_report("tok", "12345")
+
+
+def test_ibkr_request_report_no_retry_on_non_transient(monkeypatch):
+    """1013 (Invalid query ID) no es transitorio — debe fallar al primer
+    intento, sin retries."""
+    from engine.brokers import ibkr_flex
+
+    call_count = [0]
+
+    class FakeResp:
+        def __init__(self, text):
+            self.text = text
+        def raise_for_status(self):
+            pass
+
+    def fake_get(url, params=None, timeout=None):
+        call_count[0] += 1
+        return FakeResp(
+            '<FlexStatementResponse><Status>Fail</Status>'
+            '<ErrorCode>1013</ErrorCode>'
+            '<ErrorMessage>bad query</ErrorMessage>'
+            '</FlexStatementResponse>'
+        )
+
+    monkeypatch.setattr("requests.get", fake_get)
+
+    with pytest.raises(RuntimeError, match="code=1013"):
+        ibkr_flex._request_report("tok", "12345")
+    assert call_count[0] == 1, "no debió retrytear en error no-transitorio"
+
+
 # =============================================================================
 # Background jobs (api/jobs.py)
 # =============================================================================
