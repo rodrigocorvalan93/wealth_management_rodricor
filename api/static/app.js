@@ -686,6 +686,69 @@
       toast(`Especie ${data.Ticker} agregada ✓`, "success");
       navigate("/especies");
     },
+    // Abre el dialog inline para crear una especie sin abandonar el form
+    // de trade. Reusa el ID #new-especie-dialog que está en la página.
+    openNewEspecieDialog() {
+      const dlg = document.getElementById("new-especie-dialog");
+      if (!dlg) return;
+      dlg.querySelector("form")?.reset();
+      // Pre-popular Ticker si el user tipeó algo en el select del trade
+      // (algunos browsers permiten typing en un <select> simple — si
+      // matchea una opción la selecciona, si no queda como vacío).
+      if (typeof dlg.showModal === "function") dlg.showModal();
+      else dlg.setAttribute("open", "");
+      // Focus al primer input
+      setTimeout(() => dlg.querySelector("input[name=Ticker]")?.focus(), 50);
+    },
+    cancelNewEspecieDialog() {
+      const dlg = document.getElementById("new-especie-dialog");
+      if (!dlg) return;
+      dlg.querySelector("form")?.reset();
+      if (typeof dlg.close === "function") dlg.close();
+      else dlg.removeAttribute("open");
+    },
+    // Submit del dialog: crea la especie, refresca meta, agrega la opción
+    // al <select Ticker> del trade form y la selecciona.
+    async createNewEspecieInline(data, form) {
+      // Trim del ticker para evitar accidentes
+      const ticker = (data.Ticker || "").trim();
+      if (!ticker) {
+        toast("Falta el Ticker", "error");
+        return;
+      }
+      data.Ticker = ticker;
+      await API.createRow("especies", data);
+      invalidateMeta();
+      // Agregar la opción al select del trade form y seleccionarla
+      const tradeForm = document.querySelector(
+        "form[data-action=createTrade], form[data-action=updateTrade]"
+      );
+      const sel = tradeForm?.querySelector("select[name=Ticker]");
+      if (sel) {
+        let opt = Array.from(sel.options).find(o => o.value === ticker);
+        if (!opt) {
+          opt = document.createElement("option");
+          opt.value = ticker;
+          opt.textContent = ticker;
+          // Insertar ordenada alfabéticamente
+          let inserted = false;
+          for (const existing of Array.from(sel.options)) {
+            if (existing.value && existing.value > ticker) {
+              sel.insertBefore(opt, existing);
+              inserted = true;
+              break;
+            }
+          }
+          if (!inserted) sel.appendChild(opt);
+        }
+        sel.value = ticker;
+        sel.dispatchEvent(new Event("change", { bubbles: true }));
+      }
+      toast(`Especie ${ticker} agregada ✓`, "success");
+      form.reset();
+      const dlg = form.closest("dialog");
+      if (dlg && typeof dlg.close === "function") dlg.close();
+    },
     async updateEspecie(data, form) {
       const id = form.dataset.rowId;
       await API.updateRow("especies", id, data);
@@ -1820,6 +1883,7 @@
           <div id="trade-cash-preview" class="card compact" style="margin: 8px 0; font-size: 13px; display: none;"></div>
           <button type="submit" class="btn primary full">Guardar</button>
         </form>
+        ${newEspecieDialogHtml()}
       </main>
     `;
   });
@@ -1841,6 +1905,7 @@
                 data-onclick="deleteTrade" data-arg="${escapeHtml(id)}">
           🗑 Borrar trade
         </button>
+        ${newEspecieDialogHtml()}
       </main>
     `;
   });
@@ -6045,7 +6110,14 @@ python yfinance_loader.py</pre>
         ${selectField("Cuenta", "Cuenta", row.Cuenta, meta.accounts, { required: true })}
         ${selectField("Cuenta Cash", "Cuenta Cash", row["Cuenta Cash"] || row.Cuenta, meta.accounts)}
       </div>
-      ${selectField("Ticker", "Ticker", row.Ticker, meta.tickers, { required: true })}
+      <div style="display: flex; gap: 6px; align-items: flex-end;">
+        <div style="flex: 1; min-width: 0;">
+          ${selectField("Ticker", "Ticker", row.Ticker, meta.tickers, { required: true })}
+        </div>
+        <button type="button" class="btn ghost" data-onclick="openNewEspecieDialog"
+                style="padding: 0 14px; height: 40px; font-size: 20px; line-height: 1; margin-bottom: 12px; flex: 0 0 auto;"
+                title="Crear nueva especie">+</button>
+      </div>
       <div class="field-row">
         ${inputField("Qty", "Qty", row.Qty, "number", { required: true })}
         ${inputField("Precio", "Precio", row.Precio, "number", { required: true })}
@@ -6178,6 +6250,40 @@ python yfinance_loader.py</pre>
   const ACCOUNT_KINDS = ["CASH_BANK", "CASH_BROKER", "CASH_WALLET", "CASH_PHYSICAL",
                           "CARD_CREDIT", "LIABILITY", "EXTERNAL", "OPENING_BALANCE",
                           "INTEREST_EXPENSE", "INTEREST_INCOME"];
+
+  // Dialog inline para crear una nueva especie sin abandonar el form actual.
+  // Usado en trades/new y trades/:id/edit. Después de crear, agrega la
+  // opción al <select name="Ticker"> y la selecciona.
+  function newEspecieDialogHtml() {
+    return `
+      <dialog id="new-especie-dialog" class="dialog">
+        <form data-action="createNewEspecieInline">
+          <h3>+ Nueva especie</h3>
+          <div class="card compact muted" style="font-size: 11px; margin-bottom: 10px; padding: 8px;">
+            • BYMA local: <code>AL30D</code>, <code>GGAL</code>...<br>
+            • CEDEAR: sufijo <code>_AR</code> → <code>AAPL_AR</code><br>
+            • US directo: sufijo <code>_US</code> → <code>AAPL_US</code><br>
+            • FCI: matchea con <code>fcis_cafci.txt</code><br>
+            • Cripto: <code>BTC</code>, <code>ETH</code>, ...
+          </div>
+          ${inputField("Ticker", "Ticker", "", "text",
+            { required: true, placeholder: "ej AL30D" })}
+          ${inputField("Name", "Name", "", "text", { required: true })}
+          ${selectField("Asset Class", "Asset Class", "", ASSET_CLASSES,
+            { required: true })}
+          ${inputField("Currency", "Currency", "", "text",
+            { required: true, placeholder: "USB / USD / ARS / ..." })}
+          <div style="display: flex; gap: 8px; margin-top: 14px;">
+            <button type="button" class="btn ghost"
+                    data-onclick="cancelNewEspecieDialog"
+                    style="flex: 1;">Cancelar</button>
+            <button type="submit" class="btn primary"
+                    style="flex: 1;">Crear y seleccionar</button>
+          </div>
+        </form>
+      </dialog>
+    `;
+  }
 
   function especieFormFields(row, isEdit) {
     return `
