@@ -78,9 +78,9 @@ def import_prices_csv(conn, path):
     valor nominal (VN). Para que mv = qty × price funcione (ej 1500 VN ×
     0.6550 = 982.5 USB), el price tiene que estar en DECIMAL, no en %.
 
-    Si el asset es BOND_AR o BOND_US, dividimos el precio por 100 al
-    importar (convirtiendo de % a decimal). Para equities, ETFs, FCIs,
-    cripto, cash: sin escalado.
+    Si el asset es BOND_AR, BOND_CORP_AR o BOND_US, dividimos el precio
+    por 100 al importar (convirtiendo de % a decimal). Para equities,
+    ETFs, FCIs, cripto, cash: sin escalado.
 
     Devuelve cantidad de filas insertadas/actualizadas.
     """
@@ -96,7 +96,9 @@ def import_prices_csv(conn, path):
     except Exception:
         pass  # tabla assets no existe todavía; sin scaling
 
-    BOND_CLASSES = {"BOND_AR", "BOND_US"}
+    # Todos los bonos que BYMA cotiza en % del par necesitan /100 para
+    # convertir a decimal y que qty (en VN) × price dé valor real en moneda.
+    BOND_CLASSES = {"BOND_AR", "BOND_CORP_AR", "BOND_US"}
     n = 0
     skipped = 0
     scaled = 0
