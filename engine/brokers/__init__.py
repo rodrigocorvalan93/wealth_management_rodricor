@@ -51,9 +51,9 @@ def list_brokers() -> list[dict]:
     """Metadata para que la UI pueda renderizar tiles."""
     return [
         {"id": "cocos",   "name": "Cocos / OMS BYMA",  "icon": "🏦",
-         "needs": ["byma_user", "byma_pass"],
+         "needs": ["byma_user", "byma_pass", "byma_account"],
          "supports": ["positions"],
-         "help": "Usa el OMS configurado en credenciales (Cocos / LatinSecurities). Sin permisos extra — usa las mismas credenciales del loader de precios."},
+         "help": "Usa el OMS configurado en credenciales (Cocos / LatinSecurities). Requiere también el 'byma_account' (nombre/número de cuenta del OMS — el endpoint /getPositions/{account} lo necesita)."},
         {"id": "binance", "name": "Binance",            "icon": "🟡",
          "needs": ["binance_api_key", "binance_api_secret"],
          "supports": ["positions"],
