@@ -116,6 +116,106 @@ def test_cocos_describe_shape():
     assert "data:" in _describe_shape({"data": {"items": []}})
 
 
+def test_cocos_fetch_positions_primary_shape():
+    """Parser debe entender el shape de Primary API:
+    - symbol = "MERV - XMEV - TICKER - CI"
+    - instrument.symbolReference = ticker limpio
+    - buySize / sellSize separados → netear
+    - buyPrice como avg
+    """
+    from engine.brokers import cocos
+
+    fake_session = MagicMock()
+    fake_session.post.return_value.raise_for_status.return_value = None
+    primary_response = MagicMock()
+    primary_response.status_code = 200
+    primary_response.headers = {"content-type": "application/json"}
+    primary_response.json.return_value = {
+        "status": "OK",
+        "positions": [
+            {
+                "instrument": {"symbolReference": "AAPL", "settlType": 0},
+                "symbol": "MERV - XMEV - AAPL - CI",
+                "buySize": 5,
+                "buyPrice": 3092,
+                "sellSize": 0,
+                "sellPrice": 0,
+            },
+            {
+                "instrument": {"symbolReference": "AL30D"},
+                "symbol": "MERV - XMEV - AL30D - 24hs",
+                "buySize": 1500,
+                "buyPrice": 65.5,
+                "sellSize": 0,
+                "sellPrice": 0,
+            },
+        ],
+    }
+    fake_session.get.return_value = primary_response
+
+    with patch("engine.brokers.cocos._login", return_value=fake_session):
+        result = cocos.fetch_positions({
+            "byma_user": "u", "byma_pass": "p", "byma_account": "REM7374",
+        })
+
+    assert result["broker"] == "cocos"
+    tickers = [p["ticker"] for p in result["positions"]]
+    assert "AAPL" in tickers
+    assert "AL30D" in tickers
+    aapl = next(p for p in result["positions"] if p["ticker"] == "AAPL")
+    assert aapl["qty"] == 5
+    assert aapl["avg_price"] == 3092
+    al30 = next(p for p in result["positions"] if p["ticker"] == "AL30D")
+    assert al30["qty"] == 1500
+    assert al30["avg_price"] == 65.5
+    assert al30["asset_class"] == "BOND_AR"
+    # Endpoint used debe tener el account name
+    assert "REM7374" in result["endpoint"]
+
+
+def test_cocos_fetch_positions_no_account_raises():
+    """Sin byma_account, el error debe sugerir cargar el campo."""
+    from engine.brokers import cocos
+    fake_session = MagicMock()
+    fake_session.post.return_value.raise_for_status.return_value = None
+    # Todos los endpoints devuelven {status, message} (Primary error response)
+    err_response = MagicMock()
+    err_response.status_code = 200
+    err_response.headers = {"content-type": "application/json"}
+    err_response.json.return_value = {
+        "status": "ERROR", "message": "Account name required",
+        "description": "...",
+    }
+    fake_session.get.return_value = err_response
+
+    with patch("engine.brokers.cocos._login", return_value=fake_session):
+        with pytest.raises(RuntimeError, match="nombre de cuenta"):
+            cocos.fetch_positions({"byma_user": "u", "byma_pass": "p"})
+
+
+def test_cocos_fetch_positions_with_account_oms_error():
+    """Con byma_account pero OMS devuelve error → mensaje surface los detalles."""
+    from engine.brokers import cocos
+    fake_session = MagicMock()
+    fake_session.post.return_value.raise_for_status.return_value = None
+    err_response = MagicMock()
+    err_response.status_code = 200
+    err_response.headers = {"content-type": "application/json"}
+    err_response.json.return_value = {
+        "status": "ERROR", "message": "Access denied for account",
+    }
+    fake_session.get.return_value = err_response
+
+    with patch("engine.brokers.cocos._login", return_value=fake_session):
+        with pytest.raises(RuntimeError) as exc:
+            cocos.fetch_positions({
+                "byma_user": "u", "byma_pass": "p", "byma_account": "BADACC",
+            })
+    msg = str(exc.value)
+    assert "BADACC" in msg
+    assert "Access denied" in msg
+
+
 # =============================================================================
 # Binance
 # =============================================================================

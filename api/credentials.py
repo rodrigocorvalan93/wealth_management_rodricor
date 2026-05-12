@@ -42,7 +42,7 @@ from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 
 
 CRED_FIELDS = (
-    "byma_user", "byma_pass", "byma_api_url",
+    "byma_user", "byma_pass", "byma_api_url", "byma_account",
     "cafci_token",
     "binance_api_key", "binance_api_secret",
     "ibkr_flex_token", "ibkr_flex_query_id",
@@ -214,6 +214,13 @@ def list_supported_fields(is_superadmin: bool = False) -> list[dict]:
             "type": "text",
             "secret": False,
             "help": "Default: https://api.cocos.xoms.com.ar/. Cambialo si usás otro broker (Latin: https://api.latinsecurities.matrizoms.com.ar/).",
+        },
+        {
+            "key": "byma_account",
+            "label": "BYMA account name (opcional, para auto-import de tenencias)",
+            "type": "text",
+            "secret": False,
+            "help": "Nombre/número de tu cuenta en el OMS (ej: 'REM7374' o el número que ves en Cocos Capital). Sin esto el auto-import de positions falla porque los endpoints lo requieren en el path /getPositions/{account}.",
         },
         {
             "key": "cafci_token",
