@@ -529,6 +529,66 @@ def test_12_blotter_without_fx_skips():
         conn.close()
 
 
+def test_13_bond_prices_scaled_by_100():
+    """Bonos BYMA: el feed los devuelve en % del par (ej 65.50). El motor
+    los divide por 100 al importar para que mv = qty × price quede en
+    moneda real. Esto aplica a las 3 clases de bonos: BOND_AR, BOND_CORP_AR
+    (ONs argentinas) y BOND_US.
+
+    Regression test: BOND_CORP_AR quedaba sin escalar y el user veía valores
+    inflados ~100x.
+    """
+    import csv
+    from engine.prices import import_prices_csv
+    from engine.schema import init_db
+
+    print("\nTest 13 (bond prices: las 3 clases escalan /100):")
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        db = tmp / "test.db"
+        init_db(str(db), drop_existing=True)
+
+        conn = sqlite3.connect(str(db))
+        conn.row_factory = sqlite3.Row
+        # Seed assets con las 3 clases de bonos + 1 equity (no escala)
+        conn.executemany(
+            "INSERT INTO assets (ticker, name, asset_class, currency) VALUES (?,?,?,?)",
+            [
+                ("AL30D", "Bonar 30 USD", "BOND_AR", "USB"),
+                ("YPFCO", "ON YPF Corp", "BOND_CORP_AR", "USB"),
+                ("T2X3", "Bond US", "BOND_US", "USD"),
+                ("GGAL", "Galicia", "EQUITY_AR", "ARS"),
+            ],
+        )
+        conn.commit()
+
+        # CSV con precios en base 100 (BYMA convention)
+        csv_path = tmp / "precios.csv"
+        with open(csv_path, "w", encoding="utf-8", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(["fecha", "ticker", "price", "currency", "source"])
+            w.writerow(["2026-05-08", "AL30D", "65.50", "USB", "BYMA"])
+            w.writerow(["2026-05-08", "YPFCO", "98.20", "USB", "BYMA"])
+            w.writerow(["2026-05-08", "T2X3",  "102.5", "USD", "BYMA"])
+            w.writerow(["2026-05-08", "GGAL",  "2500",  "ARS", "BYMA"])  # NO escala
+
+        import_prices_csv(conn, str(csv_path))
+
+        rows = {r[0]: r[1] for r in
+                conn.execute("SELECT ticker, price FROM prices")}
+        # Los 3 bonos deben quedar en decimal
+        assert abs(rows["AL30D"] - 0.655) < 1e-6, f"AL30D = {rows['AL30D']}"
+        assert abs(rows["YPFCO"] - 0.982) < 1e-6, (
+            f"YPFCO = {rows['YPFCO']} — BOND_CORP_AR debe escalar /100 también"
+        )
+        assert abs(rows["T2X3"] - 1.025) < 1e-6, f"T2X3 = {rows['T2X3']}"
+        # Equity NO escala
+        assert abs(rows["GGAL"] - 2500) < 1e-6, f"GGAL = {rows['GGAL']}"
+        print(f"  ✓ AL30D=0.655, YPFCO=0.982, T2X3=1.025 (los 3 escalados), "
+              f"GGAL=2500 (sin escalar)")
+        conn.close()
+
+
 # =============================================================================
 # Main
 # =============================================================================
@@ -547,6 +607,7 @@ if __name__ == "__main__":
         test_10_fx_module,
         test_11_blotter_with_fx_conversion,
         test_12_blotter_without_fx_skips,
+        test_13_bond_prices_scaled_by_100,
     ]
     for t in tests:
         t()
