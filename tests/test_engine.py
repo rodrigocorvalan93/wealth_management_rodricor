@@ -589,6 +589,109 @@ def test_13_bond_prices_scaled_by_100():
         conn.close()
 
 
+def test_14_fx_fallback_preserves_currency_for_cost_basis():
+    """Regression: comprar USB bond contra ARS sin FX cargado.
+
+    Pasa: importer guarda cost_basis con price_currency=ARS (porque el FX
+    ARS→USB falló al importar).  _calc_position re-intenta el FX y si
+    sigue fallando, deja avg_cost en RAW (1137.50).
+
+    Antes del fix, el caller etiquetaba ese avg_cost como native_ccy=USB
+    para el fallback de market price → mv = qty × 1137.50 USB → patrimonio
+    inflado 1500x.
+
+    Ahora se devuelve avg_cost_currency=ARS para que el caller use la
+    moneda real en cost_basis_fallback. mv termina siendo qty × 1137.50
+    ARS, que convertido a anchor es ≈ el cash que se gastó → net ≈ 0.
+    """
+    from engine.holdings import _calc_position
+    from engine.schema import init_db
+
+    print("\nTest 14 (FX fallback preserva currency real del avg_cost):")
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        db = tmp / "test.db"
+        init_db(str(db), drop_existing=True)
+
+        conn = sqlite3.connect(str(db))
+        conn.row_factory = sqlite3.Row
+
+        # Seed: currencies (FK)
+        conn.executemany(
+            "INSERT INTO currencies (code, name) VALUES (?, ?)",
+            [("ARS", "Pesos"), ("USB", "USD MEP")],
+        )
+        # Seed: asset USB + cuenta
+        conn.execute(
+            "INSERT INTO assets (ticker, name, asset_class, currency) "
+            "VALUES (?, ?, ?, ?)",
+            ("AE38D", "Bonar 38 USD", "BOND_AR", "USB"),
+        )
+        conn.execute(
+            "INSERT INTO accounts (code, name, kind, currency, investible) "
+            "VALUES (?, ?, ?, ?, ?)",
+            ("cocos", "Cocos", "CASH_BROKER", "ARS", 1),
+        )
+        # Insert un event TRADE + movement con unit_price en ARS
+        # (simula FX-falló al importar — el price_currency quedó en ARS,
+        # no en USB).
+        cur = conn.execute(
+            "INSERT INTO events (event_type, event_date, description) "
+            "VALUES (?, ?, ?)",
+            ("TRADE", "2026-05-05", "BUY AE38D contra ARS"),
+        )
+        event_id = cur.lastrowid
+        conn.execute(
+            "INSERT INTO movements (event_id, account, asset, qty, "
+            "unit_price, price_currency, cost_basis) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (event_id, "cocos", "AE38D", 3700, 1137.50, "ARS", 3700 * 1137.50),
+        )
+        conn.commit()
+
+        # NO seedeamos fx_rates ARS→USB → el FX falla en _calc_position
+        pos = _calc_position(conn, "cocos", "AE38D", "2026-05-12",
+                              native_ccy="USB")
+        assert pos is not None, "Debería haber una posición"
+        assert pos["qty"] == 3700
+        # Sin FX, avg_cost queda en valor RAW (1137.50)
+        assert abs(pos["avg_cost"] - 1137.50) < 1e-6, (
+            f"avg_cost = {pos['avg_cost']}"
+        )
+        # KEY: avg_cost_currency debe ser ARS (la del trade), NO USB
+        # (la nativa) — sino el caller meta el cost basis como USB y
+        # mv = 3700 × 1137.50 ≈ 4.2M USB ≈ 6 billones ARS.
+        assert pos["avg_cost_currency"] == "ARS", (
+            f"avg_cost_currency = {pos['avg_cost_currency']!r} — "
+            f"esperaba 'ARS' porque el FX no resolvió"
+        )
+        assert pos["has_fx_fallback"] is True, (
+            "has_fx_fallback debería ser True"
+        )
+        print(f"  ✓ avg_cost={pos['avg_cost']} avg_cost_currency=ARS "
+              f"has_fx_fallback=True")
+
+        # Ahora con FX cargado: la conversión debe funcionar
+        conn.execute(
+            "INSERT INTO fx_rates (fecha, moneda, base, rate, source) "
+            "VALUES (?, ?, ?, ?, ?)",
+            ("2026-05-05", "ARS", "USB", 0.000615, "test"),
+        )
+        conn.commit()
+        pos2 = _calc_position(conn, "cocos", "AE38D", "2026-05-12",
+                                native_ccy="USB")
+        # Con FX, avg_cost convertido: 1137.50 × 0.000615 ≈ 0.699
+        assert abs(pos2["avg_cost"] - 0.6995625) < 1e-4, (
+            f"avg_cost con FX = {pos2['avg_cost']}"
+        )
+        assert pos2["avg_cost_currency"] == "USB", (
+            f"avg_cost_currency con FX = {pos2['avg_cost_currency']!r}"
+        )
+        assert pos2["has_fx_fallback"] is False
+        print(f"  ✓ con FX cargado: avg_cost={pos2['avg_cost']:.4f} "
+              f"avg_cost_currency=USB has_fx_fallback=False")
+        conn.close()
+
+
 # =============================================================================
 # Main
 # =============================================================================
@@ -608,6 +711,7 @@ if __name__ == "__main__":
         test_11_blotter_with_fx_conversion,
         test_12_blotter_without_fx_skips,
         test_13_bond_prices_scaled_by_100,
+        test_14_fx_fallback_preserves_currency_for_cost_basis,
     ]
     for t in tests:
         t()
