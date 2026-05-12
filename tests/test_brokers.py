@@ -89,6 +89,33 @@ def test_cocos_missing_creds():
         cocos.fetch_positions({})
 
 
+def test_cocos_extract_list_handles_shapes():
+    """_extract_list debe poder sacar listas de: raíz, dict[key], dict[k1][k2]."""
+    from engine.brokers.cocos import _extract_list
+    keys = ("positions", "data", "items")
+
+    # Lista directa
+    assert _extract_list([{"a": 1}], keys) == [{"a": 1}]
+    # dict con key conocida
+    assert _extract_list({"positions": [1, 2, 3]}, keys) == [1, 2, 3]
+    # dict anidado
+    assert _extract_list({"data": {"items": [{"x": 1}]}}, keys) == [{"x": 1}]
+    # dict sin lista → []
+    assert _extract_list({"total": 5}, keys) == []
+    # None / otros tipos → []
+    assert _extract_list(None, keys) == []
+    assert _extract_list("string", keys) == []
+
+
+def test_cocos_describe_shape():
+    """_describe_shape debe dar un resumen corto y útil para warnings."""
+    from engine.brokers.cocos import _describe_shape
+    assert _describe_shape([]) == "[]"
+    assert "5 x" in _describe_shape([1, 2, 3, 4, 5])
+    assert "positions: list[3]" in _describe_shape({"positions": [1, 2, 3]})
+    assert "data:" in _describe_shape({"data": {"items": []}})
+
+
 # =============================================================================
 # Binance
 # =============================================================================
