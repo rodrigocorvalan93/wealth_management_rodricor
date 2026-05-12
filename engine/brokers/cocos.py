@@ -94,31 +94,49 @@ def fetch_positions(creds: dict) -> dict:
     base = _base_url(creds)
     session = _login(creds)
 
-    # El endpoint exacto varía según versión del OMS. Intentamos varios.
+    # El endpoint exacto varía según versión del OMS Matriz (Primary/Cocos/
+    # Latin/IEB/etc). Probamos varios. Si todos fallan, levantamos un error
+    # que incluye el detalle de cada response para diagnosticar.
     candidates = [
-        "rest/risk/position",
-        "rest/order/getPositions",
-        "rest/risk/accountReport",
+        "rest/risk/detailedPosition",     # Primary: positions detalladas
+        "rest/risk/position",             # Cocos/Latin clásico
+        "rest/risk/accountReport",        # algunos OMS lo usan así
+        "rest/order/getPositions",        # legacy
+        "rest/risk/positionByCustomer",   # alternativa
     ]
     raw = None
     used_endpoint = None
-    last_err = None
+    diagnostics = []   # lista de (endpoint, status, content_type, body_snippet)
     for ep in candidates:
         try:
             r = session.get(f"{base}{ep}", timeout=15)
-            if r.status_code == 200:
-                ct = r.headers.get("content-type", "")
-                if "json" in ct:
-                    raw = r.json()
+            ct = r.headers.get("content-type", "")
+            snippet = (r.text or "")[:200].replace("\n", " ")
+            diagnostics.append((ep, r.status_code, ct, snippet))
+            if r.status_code == 200 and "json" in ct:
+                payload = r.json()
+                # Si devolvió lista vacía o dict vacío, probamos el próximo
+                # (puede ser otro endpoint que sí tiene data)
+                if payload or used_endpoint is None:
+                    raw = payload
                     used_endpoint = ep
                     break
         except Exception as e:
-            last_err = e
+            diagnostics.append((ep, None, "", f"EXC: {type(e).__name__}: {e}"))
 
     if raw is None:
+        detail = "\n".join(
+            f"  - {ep}: status={st} ct='{ct}' body='{body}'"
+            for ep, st, ct, body in diagnostics
+        )
         raise RuntimeError(
-            f"No pude leer posiciones del OMS ({base}). "
-            f"Endpoints probados: {candidates}. Último error: {last_err}"
+            f"No pude leer posiciones del OMS ({base}).\n\n"
+            f"Endpoints probados:\n{detail}\n\n"
+            f"💡 Si tu broker usa otra URL (Latin: "
+            f"https://api.latinsecurities.matrizoms.com.ar/, IEB, etc.), "
+            f"cargala en `byma_api_url` desde Settings → Credenciales. "
+            f"Si todos los endpoints dan 401 o redirect, el login no funcionó "
+            f"con tu user/pass."
         )
 
     # Estructura típica: lista de dicts o {"data": [...]} o
