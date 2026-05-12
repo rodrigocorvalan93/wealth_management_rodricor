@@ -87,6 +87,58 @@ def _classify(ticker: str, currency: Optional[str] = None) -> str:
     return "OTHER"
 
 
+def _extract_list(raw: Any, list_keys: tuple) -> list:
+    """Extrae una lista de positions de un response JSON que puede tener
+    distintas shapes. Prueba:
+      1. raw es directamente una lista
+      2. raw[key] es una lista para alguna key en list_keys
+      3. raw[key1][key2] es una lista (1 nivel de nesting)
+    Devuelve [] si no encuentra ninguna.
+    """
+    if isinstance(raw, list):
+        return raw
+    if not isinstance(raw, dict):
+        return []
+    # Búsqueda en el primer nivel
+    for k in list_keys:
+        v = raw.get(k)
+        if isinstance(v, list):
+            return v
+    # Búsqueda en el segundo nivel (raw[k1][k2])
+    for k1, v1 in raw.items():
+        if isinstance(v1, dict):
+            for k2 in list_keys:
+                v2 = v1.get(k2)
+                if isinstance(v2, list):
+                    return v2
+    return []
+
+
+def _describe_shape(raw: Any, max_depth: int = 2) -> str:
+    """Devuelve string corto describiendo la shape de raw — útil para warnings.
+    Ej: '{positions: list[5], total: int}' o '[5 dicts]' o '{data: {...}}'.
+    """
+    if isinstance(raw, list):
+        if not raw:
+            return "[]"
+        first_type = type(raw[0]).__name__
+        return f"[{len(raw)} x {first_type}]"
+    if isinstance(raw, dict):
+        if max_depth <= 0:
+            return "{...}"
+        parts = []
+        for k, v in list(raw.items())[:8]:  # primeros 8 keys
+            if isinstance(v, list):
+                parts.append(f"{k}: list[{len(v)}]")
+            elif isinstance(v, dict):
+                parts.append(f"{k}: {_describe_shape(v, max_depth-1)}")
+            else:
+                parts.append(f"{k}: {type(v).__name__}")
+        suffix = ", ..." if len(raw) > 8 else ""
+        return "{" + ", ".join(parts) + suffix + "}"
+    return type(raw).__name__
+
+
 def fetch_positions(creds: dict) -> dict:
     """Trae posiciones del OMS y las devuelve normalizadas."""
     if not creds.get("byma_user") or not creds.get("byma_pass"):
@@ -94,46 +146,69 @@ def fetch_positions(creds: dict) -> dict:
     base = _base_url(creds)
     session = _login(creds)
 
-    # El endpoint exacto varía según versión del OMS. Intentamos varios.
+    # El endpoint exacto varía según versión del OMS Matriz (Primary/Cocos/
+    # Latin/IEB/etc). Probamos varios. Si todos fallan, levantamos un error
+    # que incluye el detalle de cada response para diagnosticar.
     candidates = [
-        "rest/risk/position",
-        "rest/order/getPositions",
-        "rest/risk/accountReport",
+        "rest/risk/detailedPosition",     # Primary: positions detalladas
+        "rest/risk/position",             # Cocos/Latin clásico
+        "rest/risk/accountReport",        # algunos OMS lo usan así
+        "rest/order/getPositions",        # legacy
+        "rest/risk/positionByCustomer",   # alternativa
     ]
     raw = None
     used_endpoint = None
-    last_err = None
+    diagnostics = []   # lista de (endpoint, status, content_type, body_snippet)
     for ep in candidates:
         try:
             r = session.get(f"{base}{ep}", timeout=15)
-            if r.status_code == 200:
-                ct = r.headers.get("content-type", "")
-                if "json" in ct:
-                    raw = r.json()
+            ct = r.headers.get("content-type", "")
+            snippet = (r.text or "")[:200].replace("\n", " ")
+            diagnostics.append((ep, r.status_code, ct, snippet))
+            if r.status_code == 200 and "json" in ct:
+                payload = r.json()
+                # Si devolvió lista vacía o dict vacío, probamos el próximo
+                # (puede ser otro endpoint que sí tiene data)
+                if payload or used_endpoint is None:
+                    raw = payload
                     used_endpoint = ep
                     break
         except Exception as e:
-            last_err = e
+            diagnostics.append((ep, None, "", f"EXC: {type(e).__name__}: {e}"))
 
     if raw is None:
+        detail = "\n".join(
+            f"  - {ep}: status={st} ct='{ct}' body='{body}'"
+            for ep, st, ct, body in diagnostics
+        )
         raise RuntimeError(
-            f"No pude leer posiciones del OMS ({base}). "
-            f"Endpoints probados: {candidates}. Último error: {last_err}"
+            f"No pude leer posiciones del OMS ({base}).\n\n"
+            f"Endpoints probados:\n{detail}\n\n"
+            f"💡 Si tu broker usa otra URL (Latin: "
+            f"https://api.latinsecurities.matrizoms.com.ar/, IEB, etc.), "
+            f"cargala en `byma_api_url` desde Settings → Credenciales. "
+            f"Si todos los endpoints dan 401 o redirect, el login no funcionó "
+            f"con tu user/pass."
         )
 
-    # Estructura típica: lista de dicts o {"data": [...]} o
-    # {"positions": [...]} — normalizamos.
-    items = raw
-    if isinstance(raw, dict):
-        for key in ("positions", "data", "items", "rows", "result"):
-            if isinstance(raw.get(key), list):
-                items = raw[key]
-                break
-    if not isinstance(items, list):
-        items = []
+    # Estructura típica: lista de dicts o {"<key>": [...]} — normalizamos.
+    # Probamos múltiples keys posibles (incluso anidados 1 nivel) porque
+    # cada versión del OMS Matriz usa nombres distintos.
+    LIST_KEYS = ("positions", "data", "items", "rows", "result",
+                  "content", "records", "results")
+    items = _extract_list(raw, LIST_KEYS)
 
     positions = []
     warnings = []
+    # Si extrajimos 0 items pero el endpoint devolvió algo, agregamos warning
+    # con el shape del response para que el user/dev pueda diagnosticar.
+    if not items and raw:
+        shape = _describe_shape(raw)
+        warnings.append(
+            f"Endpoint '{used_endpoint}' respondió con shape {shape} — "
+            f"no encontré ninguna lista con keys {LIST_KEYS}. "
+            f"Si tu OMS usa otro nombre, pasame el shape para agregarlo."
+        )
     today = date.today().isoformat()
     for it in items:
         if not isinstance(it, dict):
