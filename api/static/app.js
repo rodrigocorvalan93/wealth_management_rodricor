@@ -1457,11 +1457,10 @@
     const pn = view === "investible" ? s.patrimonio_invertible : s.patrimonio_total;
     const totalNet = pn;
 
-    // Top cuentas (filtradas: solo activos)
+    // Cuentas con saldo positivo, ordenadas desc (todas, clickeables para drilldown)
     const acc = Object.entries(s.by_account)
       .filter(([_, v]) => v > 0)
-      .sort((a, b) => b[1] - a[1])
-      .slice(0, 5);
+      .sort((a, b) => b[1] - a[1]);
     const totalAcc = acc.reduce((a, [_, v]) => a + Math.abs(v), 0) || 1;
 
     // Por asset class
@@ -1622,18 +1621,19 @@
         </section>
 
         <section>
-          <h2>Top cuentas</h2>
-          <div class="card">
-            ${acc.length === 0 ? '<div class="muted">Sin cuentas</div>' :
+          <h2>Cuentas</h2>
+          <div class="card" style="padding: 0;">
+            ${acc.length === 0 ? '<div class="muted" style="padding: 12px;">Sin cuentas</div>' :
               acc.map(([k, v]) => {
                 const pct = (Math.abs(v) / totalAcc) * 100;
                 const ar = meta?.accountsRich?.[k];
                 const ccy = ar?.currency || "";
-                return `<div style="display:flex; justify-content:space-between; align-items: center; padding: 8px 0; border-bottom: 1px solid var(--border); gap: 8px;">
+                return `<a href="#/account/${encodeURIComponent(k)}" style="display:flex; justify-content:space-between; align-items: center; padding: 10px 12px; border-bottom: 1px solid var(--border); gap: 8px; text-decoration: none; color: inherit;">
                   <div style="flex: 1; min-width: 0;">${accountLabel(k, meta?.accountsRich)}</div>
                   ${ccy ? `<span class="tag" style="font-size:10px;">${escapeHtml(ccy)}</span>` : ""}
                   <span class="tabular ${v < 0 ? 'negative' : ''}" style="white-space: nowrap;">${fmt.money(v)} <span class="muted" style="font-size: 11px;">${pct.toFixed(1)}%</span></span>
-                </div>`;
+                  <span class="muted" style="font-size:14px;">›</span>
+                </a>`;
               }).join("")
             }
           </div>
@@ -1649,11 +1649,11 @@
                   <span class="muted" style="font-size: 12px; font-weight: normal;">(toca para ver cuentas)</span>
                 </h2>
               </summary>
-              <div class="card" style="margin-top: 8px;">
+              <div class="card" style="margin-top: 8px; padding: 0;">
                 ${(() => {
                   const items = (cashData.items || []).slice().sort((a,b) => (b.mv_anchor||0) - (a.mv_anchor||0));
                   return items.map(c => `
-                    <div style="display:flex; justify-content:space-between; align-items: center; padding: 8px 0; border-bottom: 1px solid var(--border); gap: 8px;">
+                    <a href="#/account/${encodeURIComponent(c.account)}" style="display:flex; justify-content:space-between; align-items: center; padding: 10px 12px; border-bottom: 1px solid var(--border); gap: 8px; text-decoration: none; color: inherit;">
                       <div style="flex: 1; min-width: 0;">${accountLabel(c.account, meta?.accountsRich)}</div>
                       ${c.account_kind ? `<span class="tag" style="font-size: 10px;">${escapeHtml(c.account_kind.toLowerCase())}</span>` : ""}
                       <span class="tag" style="font-size: 10px;">${escapeHtml(c.currency)}</span>
@@ -1661,10 +1661,11 @@
                         <div class="tabular" style="font-weight: 500;">${fmt.money(c.qty)}</div>
                         <div class="muted" style="font-size: 11px;">${fmt.money(c.mv_anchor || 0, 2)} ${escapeHtml(API.anchor())}</div>
                       </div>
-                    </div>
+                      <span class="muted" style="font-size:14px;">›</span>
+                    </a>
                   `).join("");
                 })()}
-                <a href="#/cash" class="btn ghost full" style="margin-top: 8px;">Ver detalle completo →</a>
+                <a href="#/cash" class="btn ghost full" style="margin: 8px 12px;">Ver detalle completo →</a>
               </div>
             </details>
           </section>
@@ -3035,6 +3036,188 @@
           Posiciones con <b>px*</b> tienen precio fallback (sin cotización
           fresca). Subí precios con <code>python sync.py --skip-loaders</code>.
         </div>
+      </main>
+      ${bottomNav("/")}
+    `;
+  });
+
+  // /account/:code — drilldown de una cuenta: cash + holdings de esa cuenta
+  route("/account/:code", async ({ code }) => {
+    const anchor = API.anchor();
+    let holdingsData, cashData, meta;
+    try {
+      [holdingsData, cashData, meta] = await Promise.all([
+        API.holdings(anchor),
+        API.cash().catch(() => ({ items: [] })),
+        loadMeta().catch(() => ({ accountsRich: {} })),
+      ]);
+    } catch (e) {
+      return `${headerWithBack("🏦 Cuenta", "/")}
+        <main><div class="card danger">${escapeHtml(e.message)}</div></main>`;
+    }
+
+    const ar = meta?.accountsRich?.[code] || {};
+    const all = holdingsData.items || [];
+    const accountAll = all.filter(h => h.account === code);
+    const cashItems = (cashData.items || []).filter(c => c.account === code);
+    const assetItems = accountAll.filter(h => !h.is_cash && !h.is_liability);
+    const liabItems = accountAll.filter(h => h.is_liability);
+
+    const totalMv = accountAll.reduce(
+      (acc, h) => acc + (h.mv_anchor || 0), 0
+    );
+    const totalAssets = assetItems.reduce(
+      (acc, h) => acc + (h.mv_anchor || 0), 0
+    );
+    const totalCash = cashItems.reduce(
+      (acc, c) => acc + (c.mv_anchor || 0), 0
+    );
+    const totalLiab = liabItems.reduce(
+      (acc, h) => acc + (h.mv_anchor || 0), 0
+    );
+
+    // Asset class breakdown solo para los assets de esta cuenta
+    const byClass = {};
+    for (const h of assetItems) {
+      const k = h.asset_class || "?";
+      byClass[k] = (byClass[k] || 0) + (h.mv_anchor || 0);
+    }
+    const classRows = Object.entries(byClass).sort((a, b) => b[1] - a[1]);
+
+    const accName = ar.name || code;
+    const accKind = ar.kind || "";
+    const accCcy = ar.currency || "";
+    const accInst = ar.institution || "";
+
+    return `
+      ${headerWithBack("🏦 " + escapeHtml(accName), "/")}
+      <main>
+        <section>
+          <div class="card">
+            <div style="display: flex; justify-content: space-between; align-items: flex-start; gap: 8px; margin-bottom: 12px;">
+              <div style="min-width: 0;">
+                <div style="font-weight: 700; font-size: 18px;">${escapeHtml(accName)}</div>
+                <div class="muted" style="font-size: 12px; margin-top: 2px;">
+                  ${escapeHtml(code)}${accKind ? " · " + escapeHtml(accKind.toLowerCase()) : ""}${accInst ? " · " + escapeHtml(accInst) : ""}
+                </div>
+              </div>
+              ${accCcy ? `<span class="tag">${escapeHtml(accCcy)}</span>` : ""}
+            </div>
+            <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 12px;">
+              <div>
+                <div class="muted" style="font-size: 11px;">Total ${escapeHtml(anchor)}</div>
+                <div class="tabular ${totalMv < 0 ? 'negative' : ''}" style="font-size: 20px; font-weight: 700;">${fmt.money(totalMv)}</div>
+              </div>
+              <div>
+                <div class="muted" style="font-size: 11px;">${assetItems.length} ${assetItems.length === 1 ? "activo" : "activos"} · ${cashItems.length} cash</div>
+                ${totalLiab !== 0 ? `<div class="muted" style="font-size: 11px;">+ ${liabItems.length} pasivo${liabItems.length === 1 ? "" : "s"} (${fmt.money(totalLiab)})</div>` : ""}
+              </div>
+            </div>
+          </div>
+        </section>
+
+        ${classRows.length > 0 ? `
+        <section>
+          <h2>Por asset class</h2>
+          <div class="card">
+            ${classRows.map(([k, v]) => {
+              const pct = totalAssets ? (Math.abs(v) / Math.abs(totalAssets)) * 100 : 0;
+              return `<div style="display:flex; justify-content:space-between; padding: 6px 0; border-bottom: 1px solid var(--border);">
+                <span>${escapeHtml(assetClassLabel(k))}</span>
+                <span class="tabular ${v < 0 ? 'negative' : ''}">${fmt.money(v)} <span class="muted" style="font-size: 11px;">${pct.toFixed(1)}%</span></span>
+              </div>`;
+            }).join("")}
+          </div>
+        </section>
+        ` : ""}
+
+        ${cashItems.length > 0 ? `
+        <section>
+          <h2>💵 Cash</h2>
+          <div class="list">
+            ${cashItems.sort((a, b) => (b.mv_anchor||0) - (a.mv_anchor||0)).map(c => `
+              <div class="list-item" style="align-items: center;">
+                <div class="meta">
+                  <div class="meta-line1">${escapeHtml(c.currency)}</div>
+                </div>
+                <div class="right" style="white-space: nowrap;">
+                  <div class="amount tabular">${fmt.money(c.qty)}</div>
+                  <div class="sub muted">${fmt.money(c.mv_anchor || 0, 2)} ${escapeHtml(anchor)}</div>
+                </div>
+              </div>
+            `).join("")}
+            <div style="display: flex; justify-content: space-between; padding: 10px 12px; font-weight: 600; border-top: 2px solid var(--border); background: var(--bg-soft);">
+              <span class="muted">Total cash</span>
+              <span class="tabular">${fmt.money(totalCash)} ${escapeHtml(anchor)}</span>
+            </div>
+          </div>
+        </section>
+        ` : ""}
+
+        ${assetItems.length > 0 ? `
+        <section>
+          <h2>📈 Activos</h2>
+          <div class="list">
+            ${assetItems.sort((a, b) => Math.abs(b.mv_anchor||0) - Math.abs(a.mv_anchor||0)).map(h => {
+              const unr = h.unrealized_pnl_native;
+              const unrPct = h.unrealized_pct;
+              const cls = (unr || 0) > 0 ? 'positive' : (unr || 0) < 0 ? 'negative' : '';
+              return `<a class="list-item" href="#/asset/${encodeURIComponent(h.asset)}?account=${encodeURIComponent(code)}" style="align-items: flex-start; text-decoration: none; color: inherit;">
+                <div class="meta">
+                  <div class="meta-line1">
+                    ${tickerHtml(h.asset, h.asset_class, h.name)}
+                    ${h.price_fallback ? '<span class="tag warn">px*</span>' : ""}
+                    <span class="muted" style="font-size:11px;">›</span>
+                  </div>
+                  <div class="meta-line2 muted">${escapeHtml(assetClassLabel(h.asset_class))}${(h.asset_class !== "FCI" && h.name && h.name !== h.asset) ? ' · ' + escapeHtml(h.name) : ""}</div>
+                  <div class="meta-line2 tabular" style="margin-top: 4px;">
+                    ${fmt.money(h.qty, 4)} ${escapeHtml(h.native_currency)} @ ${fmt.money(h.market_price, 4)}
+                  </div>
+                </div>
+                <div class="right">
+                  <div class="amount tabular">${fmt.money(h.mv_anchor)}</div>
+                  <div class="sub muted">${escapeHtml(anchor)}</div>
+                  ${unr != null ? `
+                    <div class="sub tabular ${cls}" style="margin-top: 2px;">
+                      ${unr > 0 ? '+' : ''}${fmt.money(unr, 0)} ${escapeHtml(h.native_currency)}${unrPct != null ? ` (${(unrPct * 100).toFixed(1)}%)` : ""}
+                    </div>
+                  ` : ""}
+                </div>
+              </a>`;
+            }).join("")}
+            <div style="display: flex; justify-content: space-between; padding: 10px 12px; font-weight: 600; border-top: 2px solid var(--border); background: var(--bg-soft);">
+              <span class="muted">Total activos</span>
+              <span class="tabular">${fmt.money(totalAssets)} ${escapeHtml(anchor)}</span>
+            </div>
+          </div>
+        </section>
+        ` : ""}
+
+        ${liabItems.length > 0 ? `
+        <section>
+          <h2>📉 Pasivos</h2>
+          <div class="list">
+            ${liabItems.sort((a, b) => Math.abs(b.mv_anchor||0) - Math.abs(a.mv_anchor||0)).map(h => `
+              <div class="list-item">
+                <div class="meta">
+                  <div class="meta-line1">${escapeHtml(h.asset)}</div>
+                  <div class="meta-line2 muted">${escapeHtml(assetClassLabel(h.asset_class))}</div>
+                </div>
+                <div class="right">
+                  <div class="amount tabular negative">${fmt.money(h.mv_anchor)}</div>
+                  <div class="sub muted">${escapeHtml(anchor)}</div>
+                </div>
+              </div>
+            `).join("")}
+          </div>
+        </section>
+        ` : ""}
+
+        ${accountAll.length === 0 && cashItems.length === 0 ? `
+          <div class="card muted" style="text-align: center; padding: 20px;">
+            Esta cuenta no tiene tenencias actualmente.
+          </div>
+        ` : ""}
       </main>
       ${bottomNav("/")}
     `;
