@@ -173,8 +173,8 @@ def _get_active_target(conn, account, asset, _cache=None):
 def _calc_position(conn, account, asset, fecha_iso, native_ccy=None):
     """Calcula posición agregada para (account, asset) hasta fecha_iso.
 
-    Devuelve dict {qty, cost_basis_total, avg_cost, has_fx_fallback}
-    o None si saldo cero.
+    Devuelve dict {qty, cost_basis_total, avg_cost, avg_cost_currency,
+    has_fx_fallback} o None si saldo cero.
 
     Para avg_cost usa weighted average de COMPRAS (no FIFO estricto;
     para FIFO realizado/no-realizado se usa engine/pnl.py).
@@ -182,8 +182,10 @@ def _calc_position(conn, account, asset, fecha_iso, native_ccy=None):
     Si `native_ccy` se pasa y un movement tiene `price_currency` distinto
     (típicamente porque el FX falló al importar), intenta reconvertir el
     unit_price a la moneda nativa del activo en la fecha del trade. Si la
-    reconversión también falla, usa el valor crudo y marca
-    `has_fx_fallback=True`.
+    reconversión también falla, mantiene el unit_price en la moneda del
+    trade y marca `has_fx_fallback=True` con `avg_cost_currency` igual a
+    la moneda del trade — así el caller puede convertir mv correctamente
+    en lugar de tratar 1137.50 ARS como si fuera 1137.50 USB.
     """
     cur = conn.execute(
         """
@@ -203,6 +205,7 @@ def _calc_position(conn, account, asset, fecha_iso, native_ccy=None):
     cost_total_acum = 0.0  # suma de qty_compra * unit_price (en native_ccy)
     qty_compra_acum = 0.0  # qty positiva acumulada (para WAC)
     has_fx_fallback = False
+    fallback_currency = None  # si fallback, qué moneda quedó realmente usada
 
     for r in rows:
         qty = r["qty"]
@@ -222,7 +225,9 @@ def _calc_position(conn, account, asset, fecha_iso, native_ccy=None):
                     )
                 except FxError:
                     has_fx_fallback = True
-                    # up = unit_price (sin conversión, cost_basis aproximado)
+                    if fallback_currency is None:
+                        fallback_currency = price_ccy
+                    # up = unit_price (sin conversión, en price_ccy)
             cost_total_acum += qty * up
             qty_compra_acum += qty
 
@@ -231,10 +236,16 @@ def _calc_position(conn, account, asset, fecha_iso, native_ccy=None):
 
     avg_cost = (cost_total_acum / qty_compra_acum) if qty_compra_acum > 0 else None
     cost_basis_total = (qty_neto * avg_cost) if avg_cost is not None else None
+    # Si TODOS los buys hicieron fallback, avg_cost está en fallback_currency.
+    # Si ALGUNOS hicieron fallback pero otros no, avg_cost es un mix y no
+    # podemos confiar en ninguna moneda — usamos fallback_currency también
+    # (mejor el aviso que tratar el mix como native_ccy y meter ruido x1500).
+    avg_cost_currency = fallback_currency if has_fx_fallback else native_ccy
 
     return {
         "qty": qty_neto,
         "avg_cost": avg_cost,
+        "avg_cost_currency": avg_cost_currency,
         "cost_basis_total": cost_basis_total,
         "has_fx_fallback": has_fx_fallback,
     }
@@ -375,12 +386,16 @@ def calculate_holdings(conn, fecha=None, anchor_currency="USD"):
             asset_class = asset_info["asset_class"]
             name = asset_info["name"]
 
-            # Precio de mercado (con fallback a cost basis)
+            # Precio de mercado (con fallback a cost basis).
+            # Importante: usamos avg_cost_currency (no native_ccy) porque si el
+            # FX falló al importar/recalcular, avg_cost quedó en la moneda del
+            # trade — etiquetarlo como native_ccy haría que mv = qty × avg_cost
+            # se trate como si fuera USB cuando en realidad está en ARS.
             cost_fallback = None
             if pos["avg_cost"] is not None:
                 cost_fallback = {
                     "price": pos["avg_cost"],
-                    "currency": native_ccy,
+                    "currency": pos.get("avg_cost_currency") or native_ccy,
                 }
 
             mp = _resolve_market_price(conn, asset, fecha_iso, fallback_to_cost=cost_fallback)
@@ -416,12 +431,21 @@ def calculate_holdings(conn, fecha=None, anchor_currency="USD"):
             mv_native = pos["qty"] * market_price
             avg_cost = pos["avg_cost"] if pos["avg_cost"] else market_price
             cost_basis_total = pos["cost_basis_total"] if pos["cost_basis_total"] else mv_native
-            unrealized_pnl_native = (market_price - avg_cost) * pos["qty"]
-            unrealized_pct = (
-                (unrealized_pnl_native / cost_basis_total)
-                if cost_basis_total and cost_basis_total != 0
-                else 0.0
-            )
+            # Si avg_cost quedó en otra moneda (FX fallback no resuelto),
+            # comparar precios entre monedas distintas produce números sin
+            # sentido. Dejamos unrealized_pnl en None para que la UI muestre
+            # "?" en lugar de un valor engañoso.
+            avg_cost_ccy = pos.get("avg_cost_currency") or native_ccy
+            if avg_cost_ccy != native_ccy:
+                unrealized_pnl_native = None
+                unrealized_pct = None
+            else:
+                unrealized_pnl_native = (market_price - avg_cost) * pos["qty"]
+                unrealized_pct = (
+                    (unrealized_pnl_native / cost_basis_total)
+                    if cost_basis_total and cost_basis_total != 0
+                    else 0.0
+                )
 
         # Convertir MV a moneda ancla. Si la conversión price→native falló
         # arriba, mv_native_currency != native_ccy y acá usamos la moneda
