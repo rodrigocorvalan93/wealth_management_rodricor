@@ -1,0 +1,104 @@
+name: Deploy to Oracle
+
+# Auto-deploy a Oracle Cloud en cada merge a `main`. También se puede
+# disparar manualmente desde la pestaña Actions → "Deploy to Oracle" →
+# "Run workflow".
+#
+# SETUP (una sola vez):
+#
+# 1. Generar SSH key dedicada (en tu PC):
+#      ssh-keygen -t ed25519 -f wm_deploy_key -N ""
+#    Te genera wm_deploy_key (privada) y wm_deploy_key.pub (pública).
+#
+# 2. Autorizar la key en el server Oracle:
+#      ssh ubuntu@<TU_IP>
+#      mkdir -p ~/.ssh && chmod 700 ~/.ssh
+#      echo "<contenido_pegado_de_wm_deploy_key.pub>" >> ~/.ssh/authorized_keys
+#      chmod 600 ~/.ssh/authorized_keys
+#
+# 3. Cargar 3 secrets en GitHub:
+#      Repo → Settings → Secrets and variables → Actions → New repository secret
+#      - ORACLE_HOST     : la IP pública de tu Oracle
+#      - ORACLE_USER     : ubuntu
+#      - ORACLE_SSH_KEY  : pegá el CONTENIDO ENTERO de wm_deploy_key
+#                          (privada, incluyendo ----BEGIN/END OPENSSH...)
+#
+# 4. Mergear este workflow a main. Próximos merges van a triggerear deploy.
+#
+# Para deshabilitarlo temporalmente: comentá la sección `on:` o renombrá
+# el archivo a `.disabled.yml`.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:    # disparar manual desde la UI
+
+# Un deploy a la vez. Si entran 2 merges seguidos, el 2do espera al 1ro
+# (no lo cancela mid-flight).
+concurrency:
+  group: deploy-oracle
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Verify secrets
+        env:
+          ORACLE_HOST: ${{ secrets.ORACLE_HOST }}
+          ORACLE_USER: ${{ secrets.ORACLE_USER }}
+          ORACLE_SSH_KEY: ${{ secrets.ORACLE_SSH_KEY }}
+        run: |
+          if [ -z "$ORACLE_HOST" ] || [ -z "$ORACLE_USER" ] || [ -z "$ORACLE_SSH_KEY" ]; then
+            echo "::error::Faltan secrets ORACLE_HOST / ORACLE_USER / ORACLE_SSH_KEY."
+            echo "Configuralos en Settings → Secrets and variables → Actions."
+            exit 1
+          fi
+
+      - name: Set up SSH key
+        env:
+          ORACLE_SSH_KEY: ${{ secrets.ORACLE_SSH_KEY }}
+        run: |
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          printf '%s\n' "$ORACLE_SSH_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+
+      - name: Deploy via SSH
+        env:
+          ORACLE_HOST: ${{ secrets.ORACLE_HOST }}
+          ORACLE_USER: ${{ secrets.ORACLE_USER }}
+        run: |
+          # accept-new: confía en la host key la primera vez y la pinea para
+          # esta sesión del runner. Cada job arranca con known_hosts vacío.
+          ssh -i ~/.ssh/deploy_key \
+              -o StrictHostKeyChecking=accept-new \
+              -o ConnectTimeout=20 \
+              -o ServerAliveInterval=15 \
+              "$ORACLE_USER@$ORACLE_HOST" 'bash -s' <<'REMOTE_SCRIPT'
+          set -euo pipefail
+          cd /opt/wm
+
+          echo "==> git pull"
+          git pull --ff-only
+
+          echo "==> docker compose up -d --build"
+          docker compose -f docker-compose.prod.yml up -d --build
+
+          echo "==> sleep 5s para que arranque"
+          sleep 5
+
+          echo "==> ps"
+          docker compose -f docker-compose.prod.yml ps
+
+          echo "==> git head"
+          git log -1 --oneline
+
+          echo "==> deploy OK $(date -u +%FT%TZ)"
+          REMOTE_SCRIPT
+
+      - name: Cleanup
+        if: always()
+        run: rm -f ~/.ssh/deploy_key
