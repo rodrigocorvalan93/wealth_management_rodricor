@@ -945,6 +945,7 @@ def build_master(output_path: Path):
     hoja_funding(wb)
     hoja_ingresos(wb)
     hoja_gastos(wb)
+    hoja_resumen_tarjeta(wb)
     hoja_pasivos(wb)
     hoja_pagos_pasivos(wb)
     hoja_recurrentes(wb)
