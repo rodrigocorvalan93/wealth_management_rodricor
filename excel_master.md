@@ -38,6 +38,7 @@ python add_carga_inicial_sheet.py inputs/wealth_management.xlsx
 | 9 | `funding` | Cauciones, pases, préstamos cortos |
 | 10 | `ingresos` | Sueldos, dividendos, cupones (no recurrentes) |
 | 11 | `gastos` | Gastos cash o tarjeta (con cuotas) |
+| 11b | `resumen_tarjeta` | Carga CONSOLIDADA de tarjeta: un monto total por tarjeta+período (lo que te llega a pagar), sin cargar compra por compra |
 | 12 | `pasivos` | Préstamos personales, hipoteca |
 | 13 | `pagos_pasivos` | Pagos de cuotas y cancelación de tarjetas |
 | 14 | `recurrentes` | Sueldo/alquiler/servicios — auto-repetición |
@@ -69,6 +70,16 @@ python add_carga_inicial_sheet.py inputs/wealth_management.xlsx
 - **Transferencias entre tus cuentas**: `transferencias_cash` o `transferencias_activos`
 - **Sueldos/dividendos/cupones**: `ingresos` (si NO es recurrente, sino ya está en `recurrentes`)
 - **Gastos**: `gastos` — indicá si es FIJO/VARIABLE, cantidad de cuotas
+- **Gastos de tarjeta sin registrar uno por uno**: si te da fiaca cargar cada
+  compra, usá `resumen_tarjeta` y cargá el **total del resumen** por tarjeta y
+  período (`Periodo` = YYYY-MM). El motor lo registra como un único cargo y el
+  reporte de Flujo de Caja lo toma en la vista "devengado". Regla: usá resumen
+  **o** cargas sueltas para un mismo período, no ambos (el sistema avisa si los
+  mezclás para evitar doble conteo).
+- **Invertible / no invertible**: el reporte de Flujo de Caja separa lo
+  invertible (en blanco) de lo no invertible (efectivo/no declarado) según el
+  flag `investible` de cada **cuenta** (hoja `cuentas`). Marcá tus cuentas de
+  efectivo no declarado con `investible=0`.
 - **Pagos de tarjeta o cuotas de préstamo**: `pagos_pasivos`
 
 ### Recurrentes (1 vez por concepto)

@@ -711,6 +711,45 @@ def hoja_gastos(wb):
     return ws
 
 
+def hoja_resumen_tarjeta(wb):
+    """Carga CONSOLIDADA de gastos de tarjeta.
+
+    En vez de registrar cada compra, cargás UN monto total por tarjeta y
+    período (lo que te llega a pagar). El motor lo registra como un único
+    CARD_CHARGE y el reporte de Flujo de Caja lo toma en la vista devengado.
+    Regla: usá resumen O cargas sueltas para un mismo período, no ambos.
+    """
+    ws = wb.create_sheet("resumen_tarjeta")
+    style_banner(
+        ws, "RESUMEN TARJETA",
+        ("Carga consolidada: un monto total por tarjeta y período (YYYY-MM), "
+         "sin cargar compra por compra. Usá resumen O cargas sueltas, no ambos."),
+        7,
+    )
+
+    headers = ["Fecha", "Tarjeta", "Periodo", "Monto", "Moneda",
+               "Categoría", "Notes"]
+    style_headers(ws, headers, header_row=4)
+    set_widths(ws, [12, 20, 12, 14, 8, 18, 28])
+
+    examples = [
+        (date(2026, 4, 28), "galicia_visa_ars", "2026-04", 320000, "ARS",
+         "Resumen tarjeta", "Total del resumen de abril"),
+    ]
+    for i, row in enumerate(examples, start=5):
+        for j, val in enumerate(row, start=1):
+            cell = ws.cell(row=i, column=j, value=val)
+            style_input_cell(cell)
+            if j == 1:
+                cell.number_format = "yyyy-mm-dd"
+            elif j == 4:
+                cell.number_format = '#,##0.00;[Red](#,##0.00)'
+
+    add_freeze(ws, 4)
+    add_filter(ws, 4, len(headers), last_row=2000)
+    return ws
+
+
 def hoja_pasivos(wb):
     """Pasivos (préstamos personales, hipoteca)."""
     ws = wb.create_sheet("pasivos")
@@ -945,6 +984,7 @@ def build_master(output_path: Path):
     hoja_funding(wb)
     hoja_ingresos(wb)
     hoja_gastos(wb)
+    hoja_resumen_tarjeta(wb)
     hoja_pasivos(wb)
     hoja_pagos_pasivos(wb)
     hoja_recurrentes(wb)

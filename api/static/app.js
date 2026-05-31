@@ -133,6 +133,18 @@
     refresh: () => API.req("/api/refresh", { method: "POST" }),
     backups: () => API.req("/api/backups"),
 
+    cashflowReport: (opts = {}) => {
+      const p = new URLSearchParams();
+      if (opts.desde) p.set("desde", opts.desde);
+      if (opts.hasta) p.set("hasta", opts.hasta);
+      if (opts.basis) p.set("basis", opts.basis);
+      if (opts.investible !== undefined && opts.investible !== "")
+        p.set("investible", opts.investible);
+      if (opts.moneda) p.set("moneda", opts.moneda);
+      return API.req(`/api/cashflow-report?${p.toString()}`, { noCache: true });
+    },
+    tarjetas: () => API.req("/api/tarjetas", { noCache: true }),
+
     listSheet: (sheet) => API.req(`/api/sheets/${sheet}`),
     getSheetRow: (sheet, id) => API.req(`/api/sheets/${sheet}/${encodeURIComponent(id)}`),
     createRow: (sheet, data) => API.req(`/api/sheets/${sheet}`, { method: "POST", json: data }),
@@ -649,6 +661,13 @@
       invalidateMeta();
       toast("Ingreso agregado ✓", "success");
       navigate("/ingresos");
+    },
+    async createResumenTarjeta(data) {
+      if (data.Monto !== null) data.Monto = parseFloat(data.Monto);
+      await API.createRow("resumen_tarjeta", data);
+      invalidateMeta();
+      toast("Resumen de tarjeta cargado ✓", "success");
+      navigate("/cashflow");
     },
     async updateIngreso(data, form) {
       if (data.Monto !== null && data.Monto !== undefined) data.Monto = parseFloat(data.Monto);
@@ -2025,6 +2044,10 @@
           </button>
         </div>
 
+        <a href="#/cashflow" class="btn ghost full" style="margin-bottom: 14px;">
+          📊 Ver Flujo de Caja (reporte mensual)
+        </a>
+
         <div class="kpi-grid">
           <div class="kpi">
             <div class="kpi-label">${tab === 'ingresos' ? 'Total ingresos' : 'Total gastos'}</div>
@@ -2175,6 +2198,166 @@
         </form>
         <button class="btn danger full" style="margin-top:12px"
                 data-onclick="deleteIngreso" data-arg="${escapeHtml(id)}">🗑 Borrar</button>
+      </main>
+    `;
+  });
+
+  // /cashflow — Flujo de Caja del hogar (estado de resultados mensual)
+  let _cfBasis = "cash";      // 'cash' | 'accrual'
+  let _cfInvest = "";         // '' | '1' | '0'
+  window._setCfBasis = (b) => { _cfBasis = b; render(); };
+  window._setCfInvest = (v) => { _cfInvest = v; render(); };
+
+  route("/cashflow", async () => {
+    const data = await API.cashflowReport({ basis: _cfBasis, investible: _cfInvest });
+    const months = data.months || [];
+    const fmtm = (v) => (v ? fmt.money(v) : "—");
+
+    // Filas de una sección (con grupos + categorías)
+    function sectionRows(section) {
+      return (section || []).map(g => {
+        const grp = `<tr class="cf-group">
+          <td>${escapeHtml(g.grupo)}</td>
+          ${months.map(m => `<td class="tabular">${fmtm(g.total[m])}</td>`).join("")}
+          <td class="tabular">${fmtm(g.total_periodo)}</td>
+        </tr>`;
+        const cats = (g.categorias || []).map(c => `<tr class="cf-cat">
+          <td style="padding-left:18px;">${escapeHtml(c.categoria)}</td>
+          ${months.map(m => `<td class="tabular muted">${fmtm(c.values[m])}</td>`).join("")}
+          <td class="tabular muted">${fmtm(c.total)}</td>
+        </tr>`).join("");
+        return grp + cats;
+      }).join("");
+    }
+
+    const t = data.totales || {};
+    const totalRow = (label, obj, periodo, cls) => `<tr class="${cls}">
+      <td><b>${escapeHtml(label)}</b></td>
+      ${months.map(m => `<td class="tabular"><b>${fmtm(obj[m])}</b></td>`).join("")}
+      <td class="tabular"><b>${fmtm(periodo)}</b></td>
+    </tr>`;
+
+    // Gráfico de evolución: ingresos vs egresos (líneas SVG simples)
+    function evoChart() {
+      if (months.length < 2) return "";
+      const ing = months.map(m => t.ingresos?.[m] || 0);
+      const egr = months.map(m => t.egresos?.[m] || 0);
+      const w = 320, h = 110, pad = 6;
+      const max = Math.max(1, ...ing, ...egr);
+      const stepX = (w - pad * 2) / (months.length - 1);
+      const toPts = (arr) => arr.map((v, i) => {
+        const x = pad + i * stepX;
+        const y = h - pad - (v / max) * (h - pad * 2);
+        return `${x.toFixed(1)},${y.toFixed(1)}`;
+      }).join(" ");
+      return `
+        <div class="card" style="margin-bottom:12px;">
+          <div style="font-size:12px; margin-bottom:6px;">
+            <span style="color:#10A66B;">● Ingresos</span> &nbsp;
+            <span style="color:#DC2626;">● Egresos</span>
+          </div>
+          <svg viewBox="0 0 ${w} ${h}" preserveAspectRatio="none" style="width:100%; height:110px; display:block;">
+            <polyline points="${toPts(ing)}" fill="none" stroke="#10A66B" stroke-width="2"/>
+            <polyline points="${toPts(egr)}" fill="none" stroke="#DC2626" stroke-width="2"/>
+          </svg>
+          <div style="display:flex; justify-content:space-between; font-size:11px; color:var(--muted); margin-top:4px;">
+            <span>${escapeHtml(months[0])}</span><span>${escapeHtml(months[months.length - 1])}</span>
+          </div>
+        </div>`;
+    }
+
+    const warnings = data.card_warnings || [];
+    const warnBanner = warnings.length === 0 ? "" : `
+      <div class="card" style="border-left:4px solid var(--yellow); margin-bottom:12px; font-size:13px;">
+        ⚠ <b>Posible doble conteo en tarjetas</b>
+        ${warnings.map(w => `<div class="muted" style="margin-top:4px;">${escapeHtml(w.mensaje)}</div>`).join("")}
+      </div>`;
+
+    const pill = (cur, opts, fn) => `<div class="toggle-pill">${
+      opts.map(([val, lbl]) => `<button data-onclick="${fn}" data-arg="${val}" class="${cur === val ? "active" : ""}">${lbl}</button>`).join("")
+    }</div>`;
+
+    const hasData = months.length > 0;
+
+    return `
+      ${headerWithBack("📊 Flujo de Caja", "/")}
+      <main>
+        <div class="toggle-bar" style="display:flex; gap:8px; flex-wrap:wrap; margin-bottom:12px;">
+          ${pill(_cfBasis, [["cash", "Caja real"], ["accrual", "Devengado"]], "_setCfBasis")}
+          ${pill(_cfInvest, [["", "Total"], ["1", "💎 Invertible"], ["0", "No invert."]], "_setCfInvest")}
+        </div>
+        <div class="muted" style="font-size:12px; margin-bottom:12px;">
+          ${_cfBasis === "cash"
+            ? "Caja real: el gasto cuenta cuando pagás (incluye pago de tarjeta, no los consumos a crédito)."
+            : "Devengado: el gasto cuenta en el mes de la compra (incluye consumos de tarjeta)."}
+          Montos en ${escapeHtml(data.moneda || "ARS")}.
+        </div>
+        ${warnBanner}
+        ${hasData ? evoChart() : ""}
+        ${!hasData ? emptyState("Sin movimientos", "Cargá ingresos y gastos para ver el reporte") : `
+          <div class="card" style="overflow-x:auto; padding:0;">
+            <table class="cf-table" style="width:100%; border-collapse:collapse; font-size:13px;">
+              <thead>
+                <tr>
+                  <th style="text-align:left; padding:8px;">Concepto</th>
+                  ${months.map(m => `<th style="text-align:right; padding:8px;">${escapeHtml(m)}</th>`).join("")}
+                  <th style="text-align:right; padding:8px;">Total</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr class="cf-section"><td colspan="${months.length + 2}"><b>INGRESOS</b></td></tr>
+                ${sectionRows(data.secciones?.ingresos)}
+                ${totalRow("Total Ingresos", t.ingresos || {}, t.ingresos_periodo, "cf-total positive")}
+                <tr class="cf-section"><td colspan="${months.length + 2}"><b>EGRESOS</b></td></tr>
+                ${sectionRows(data.secciones?.egresos)}
+                ${totalRow("Total Egresos", t.egresos || {}, t.egresos_periodo, "cf-total negative")}
+                ${totalRow("NETO", t.neto || {}, t.neto_periodo, "cf-neto")}
+              </tbody>
+            </table>
+          </div>
+        `}
+        <a href="#/resumen-tarjeta/new" class="btn primary full" style="margin-top:16px;">
+          + Cargar resumen de tarjeta
+        </a>
+      </main>
+    `;
+  });
+
+  function resumenTarjetaFormFields(row, meta) {
+    const cards = (meta.accounts || []).filter(
+      c => (meta.accountsRich?.[c]?.kind || "") === "CARD_CREDIT"
+    );
+    const now = new Date();
+    const periodo = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}`;
+    return `
+      ${inputField("Fecha", "Fecha", fmt.date(row.Fecha) || fmt.today(), "date", { required: true })}
+      ${selectField("Tarjeta", "Tarjeta", row.Tarjeta, cards, { required: true })}
+      ${inputField("Periodo (YYYY-MM)", "Periodo", row.Periodo || periodo, "text",
+                   { required: true, placeholder: "2026-01" })}
+      <div class="field-row">
+        ${inputField("Monto total", "Monto", row.Monto, "number", { required: true })}
+        ${selectField("Moneda", "Moneda", row.Moneda, meta.currencies, { required: true })}
+      </div>
+      ${inputField("Categoría", "Categoría", row.Categoría || row.Categoria, "text",
+                   { placeholder: "Resumen tarjeta, Varios, ...", list: "cat-list" })}
+      ${inputField("Notes", "Notes", row.Notes)}
+      ${catDatalist()}
+    `;
+  }
+
+  route("/resumen-tarjeta/new", async () => {
+    const meta = await loadMeta();
+    return `
+      ${headerWithBack("Resumen de tarjeta", "/cashflow")}
+      <main>
+        <div class="muted" style="font-size:12px; margin-bottom:12px;">
+          Cargá el <b>total del resumen</b> de la tarjeta para un período en vez de
+          cada compra. Usá resumen <b>o</b> cargas sueltas para el mismo mes, no ambos.
+        </div>
+        <form data-action="createResumenTarjeta">
+          ${resumenTarjetaFormFields({}, meta)}
+          <button type="submit" class="btn primary full">Guardar</button>
+        </form>
       </main>
     `;
   });
@@ -6070,6 +6253,28 @@ python yfinance_loader.py</pre>
     }
   };
 
+  // -------- Categorías canónicas (P&L hogareño) --------
+  // Mantenidas en sync con engine/categories.py (lista representativa para
+  // autocompletar; el backend acepta texto libre igual).
+  const CASHFLOW_CATEGORIES = [
+    "Alquiler", "Expensas", "Hipoteca",
+    "Luz", "Gas", "Agua", "Internet", "Telefonia", "Cable/Streaming",
+    "Supermercado", "Restaurantes",
+    "Combustible", "Transporte publico", "Taxi/App", "Auto",
+    "Obra social/Prepaga", "Farmacia", "Medico",
+    "Colegio/Universidad", "Utiles",
+    "Entretenimiento", "Viajes", "Gimnasio/Deporte",
+    "Indumentaria", "Cuidado personal", "Hogar/Compras",
+    "Impuestos", "Comisiones bancarias", "Seguros",
+    "Sueldo", "Honorarios", "Dividendos", "Cupon/Renta", "Aguinaldo",
+    "Bono/Premio", "Alquiler cobrado",
+  ];
+  function catDatalist() {
+    return `<datalist id="cat-list">${
+      CASHFLOW_CATEGORIES.map(c => `<option value="${escapeHtml(c)}"></option>`).join("")
+    }</datalist>`;
+  }
+
   // -------- Field templates --------
   function selectField(label, name, value, options, opts = {}) {
     const required = opts.required ? "required" : "";
@@ -6088,12 +6293,13 @@ python yfinance_loader.py</pre>
     const required = opts.required ? "required" : "";
     const step = type === "number" ? `step="any"` : "";
     const readonly = opts.readonly ? "readonly style='background:#F0F0F0;'" : "";
+    const list = opts.list ? `list="${escapeHtml(opts.list)}"` : "";
     return `
       <div class="field">
         <label>${escapeHtml(label)}${opts.required ? " *" : ""}${opts.readonly ? " (no editable)" : ""}</label>
         <input type="${type}" name="${escapeHtml(name)}"
                value="${value !== null && value !== undefined ? escapeHtml(value) : ""}"
-               ${step} ${required} ${readonly}
+               ${step} ${required} ${readonly} ${list}
                placeholder="${escapeHtml(opts.placeholder || "")}">
       </div>
     `;
@@ -6157,11 +6363,12 @@ python yfinance_loader.py</pre>
       ${selectField("Cuenta Destino", "Cuenta Destino", row["Cuenta Destino"], meta.accounts, { required: true })}
       <div class="field-row">
         ${inputField("Categoría", "Categoría", row.Categoría || row.Categoria, "text",
-                     { placeholder: "Vivienda, Comida, ..." })}
+                     { placeholder: "Vivienda, Comida, ...", list: "cat-list" })}
         ${selectField("Tipo", "Tipo", row.Tipo, ["FIJO", "VARIABLE"], { allowEmpty: true })}
       </div>
       ${inputField("Cuotas", "Cuotas", row.Cuotas || 1, "number")}
       ${inputField("Notes", "Notes", row.Notes)}
+      ${catDatalist()}
     `;
   }
   function ingresoFormFields(row, meta) {
@@ -6169,7 +6376,8 @@ python yfinance_loader.py</pre>
       ${inputField("Fecha", "Fecha", fmt.date(row.Fecha) || fmt.today(), "date", { required: true })}
       ${inputField("Concepto", "Concepto", row.Concepto, "text", { required: true })}
       ${inputField("Categoría", "Categoría", row.Categoría || row.Categoria, "text",
-                   { placeholder: "Sueldo, Cupón, Dividendo, ..." })}
+                   { placeholder: "Sueldo, Cupón, Dividendo, ...", list: "cat-list" })}
+      ${catDatalist()}
       <div class="field-row">
         ${inputField("Monto", "Monto", row.Monto, "number", { required: true })}
         ${selectField("Moneda", "Moneda", row.Moneda, meta.currencies, { required: true })}

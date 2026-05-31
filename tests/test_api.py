@@ -429,3 +429,36 @@ if __name__ == "__main__":
     else:
         print(f"✓ Todos los {len(tests)} tests pasaron")
     print("=" * 70)
+
+
+def test_cashflow_report_requires_auth(client):
+    r = client.get("/api/cashflow-report")
+    assert r.status_code == 401
+
+
+def test_cashflow_report_shape(client):
+    r = client.get("/api/cashflow-report", headers=_auth())
+    assert r.status_code == 200
+    data = r.get_json()
+    for key in ("months", "moneda", "basis", "secciones", "totales", "card_warnings"):
+        assert key in data, f"falta {key}"
+    assert data["basis"] == "cash"
+    assert "ingresos" in data["secciones"] and "egresos" in data["secciones"]
+    assert "neto" in data["totales"]
+    assert isinstance(data["card_warnings"], list)
+
+
+def test_cashflow_report_basis_and_investible(client):
+    r = client.get("/api/cashflow-report?basis=accrual&investible=1", headers=_auth())
+    assert r.status_code == 200
+    data = r.get_json()
+    assert data["basis"] == "accrual"
+    assert data["investible"] == 1
+
+
+def test_tarjetas_endpoint(client):
+    r = client.get("/api/tarjetas", headers=_auth())
+    assert r.status_code == 200
+    data = r.get_json()
+    assert "tarjetas" in data and isinstance(data["tarjetas"], list)
+    assert "warnings" in data and isinstance(data["warnings"], list)

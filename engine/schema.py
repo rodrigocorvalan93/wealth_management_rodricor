@@ -219,6 +219,9 @@ CREATE TABLE IF NOT EXISTS events (
     external_id  TEXT,                        -- ID externo (ej Trade ID del broker)
     parent_event_id INTEGER,                  -- para cuotas: vincula al evento padre
     notes        TEXT,
+    -- Categoría del flujo (ingresos/gastos): texto libre normalizado en reportes
+    -- vía engine/categories.py. Ej: 'Alquiler', 'Luz', 'Supermercado', 'Sueldo'.
+    category     TEXT,
     -- Trade thesis (solo TRADE events): take-profit y stop-loss en moneda nativa
     target_price    REAL,                     -- precio target (TP) opcional
     stop_loss_price REAL,                     -- precio stop-loss opcional
@@ -511,22 +514,25 @@ def insert_event(conn, event_type, event_date, settle_date=None,
                  description=None, source_row=None, source_sheet=None,
                  external_id=None, parent_event_id=None, notes=None,
                  target_price=None, stop_loss_price=None,
-                 target_currency=None) -> int:
+                 target_currency=None, category=None) -> int:
     """Inserta un evento. Devuelve el event_id generado.
 
     target_price / stop_loss_price / target_currency son opcionales y
     típicamente solo se llenan en TRADE events de tipo BUY (la "tesis"
     inicial del trade).
+
+    category es opcional y se usa en INCOME/EXPENSE/CARD_CHARGE para el
+    reporte de flujo de caja (engine/cashflow.py).
     """
     cur = conn.execute(
         """INSERT INTO events
            (event_type, event_date, settle_date, description,
             source_row, source_sheet, external_id, parent_event_id, notes,
-            target_price, stop_loss_price, target_currency)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+            target_price, stop_loss_price, target_currency, category)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         (event_type, event_date, settle_date, description,
          source_row, source_sheet, external_id, parent_event_id, notes,
-         target_price, stop_loss_price, target_currency),
+         target_price, stop_loss_price, target_currency, category),
     )
     return cur.lastrowid
 

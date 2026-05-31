@@ -60,6 +60,7 @@ SHEET_PREFIX = {
     "asientos_contables": "AS",
     "recurrentes": "RC",
     "pagos_pasivos": "PP",
+    "resumen_tarjeta": "RT",
 }
 
 # Hojas maestras: usan natural key (no auto-genera Row ID).

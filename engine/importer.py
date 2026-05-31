@@ -711,6 +711,7 @@ def import_ingresos(conn, ws):
             description=_to_str(row.get("Concepto")) or "Ingreso",
             source_row=r, source_sheet="ingresos",
             notes=_to_str(row.get("Notes")),
+            category=_to_str(row.get("Categoría")),
         )
         insert_movement(conn, eid, account=cuenta_dest,    asset=moneda, qty=monto,
                         notes=_to_str(row.get("Categoría")))
@@ -762,6 +763,7 @@ def import_gastos(conn, ws):
                 description=concepto,
                 source_row=r, source_sheet="gastos",
                 notes=f"{categoria} | {tipo}{' | ' + notes if notes else ''}",
+                category=categoria or None,
             )
             if is_card:
                 # CARD_CHARGE: incrementa pasivo de tarjeta (qty positiva en tarjeta)
@@ -797,6 +799,7 @@ def import_gastos(conn, ws):
                 description=f"{concepto} ({cuotas} cuotas)",
                 source_row=r, source_sheet="gastos",
                 notes=f"{categoria} | {tipo} | Cuotas={cuotas}",
+                category=categoria or None,
             )
             # Generar N CARD_INSTALLMENT mensuales
             f0 = date.fromisoformat(fecha)
@@ -819,6 +822,7 @@ def import_gastos(conn, ws):
                     source_row=r, source_sheet="gastos",
                     parent_event_id=parent_eid,
                     notes=f"{categoria} | {tipo}",
+                    category=categoria or None,
                 )
                 insert_movement(
                     conn, eid, account=cuenta_dest, asset=moneda,
@@ -882,6 +886,7 @@ def import_recurrentes(conn, ws, fecha_corte: date):
                         description=description,
                         source_row=r, source_sheet="recurrentes",
                         notes=f"Auto: {rule_name}",
+                        category=categoria or None,
                     )
                     insert_movement(conn, eid, account=cuenta, asset=asset, qty=amount,
                                     notes=categoria)
@@ -893,6 +898,7 @@ def import_recurrentes(conn, ws, fecha_corte: date):
                         description=description,
                         source_row=r, source_sheet="recurrentes",
                         notes=f"Auto: {rule_name} | {categoria} | {tipo}",
+                        category=categoria or None,
                     )
                     insert_movement(conn, eid, account=cuenta, asset=asset, qty=-amount,
                                     notes=f"{categoria} | {tipo}")
@@ -904,6 +910,7 @@ def import_recurrentes(conn, ws, fecha_corte: date):
                         description=description,
                         source_row=r, source_sheet="recurrentes",
                         notes=f"Auto: {rule_name} | {categoria} | {tipo}",
+                        category=categoria or None,
                     )
                     insert_movement(conn, eid, account=cuenta, asset=asset, qty=amount)
                     insert_movement(conn, eid, account="external_expense", asset=asset, qty=-amount)
@@ -912,6 +919,64 @@ def import_recurrentes(conn, ws, fecha_corte: date):
             if m > 12:
                 m = 1; y += 1
 
+    return n
+
+
+def import_resumen_tarjeta(conn, ws):
+    """Hoja 'resumen_tarjeta': carga CONSOLIDADA de gastos de tarjeta.
+
+    En lugar de registrar cada compra, el usuario carga UN monto total por
+    tarjeta y período (lo que le llega a pagar). Genera UN CARD_CHARGE por fila
+    con las mismas patas que un gasto de tarjeta normal (qty + en la tarjeta,
+    qty - en external_expense), así que el saldo de la tarjeta
+    (engine/liabilities.py) lo toma automáticamente.
+
+    Se marca con external_id="CARDSUM:<tarjeta>:<periodo>" y notes con sufijo
+    " | RESUMEN" para distinguirlo de las cargas granulares y avisar de doble
+    conteo (ver engine/liabilities.py::detect_double_count).
+
+    Columnas esperadas: Fecha, Tarjeta, Periodo (YYYY-MM), Monto, Moneda,
+    Categoría, Notes.
+    """
+    # Lookup de cuentas para validar que sea tarjeta
+    accounts_kind = {}
+    for a in conn.execute("SELECT code, kind FROM accounts").fetchall():
+        accounts_kind[a["code"]] = a["kind"]
+
+    n = 0
+    for r, row in _read_rows(ws):
+        fecha = _to_date_str(row.get("Fecha"))
+        tarjeta = _to_str(row.get("Tarjeta"))
+        periodo = _to_str(row.get("Periodo"))
+        monto = _to_float(row.get("Monto"))
+        moneda = _to_str(row.get("Moneda"))
+        if not all([fecha, tarjeta, monto, moneda]):
+            continue
+        if accounts_kind.get(tarjeta) != AccountKind.CARD_CREDIT:
+            print(f"[importer] WARN resumen_tarjeta row {r}: '{tarjeta}' no es "
+                  f"una tarjeta (CARD_CREDIT), se omite")
+            continue
+
+        categoria = _to_str(row.get("Categoría")) or "Resumen tarjeta"
+        notes = _to_str(row.get("Notes"))
+        # Si no viene período, derivarlo de la fecha (YYYY-MM)
+        periodo = periodo or fecha[:7]
+
+        eid = insert_event(
+            conn, EventType.CARD_CHARGE,
+            event_date=fecha,
+            description=f"RESUMEN {tarjeta} {periodo}",
+            source_row=r, source_sheet="resumen_tarjeta",
+            external_id=f"CARDSUM:{tarjeta}:{periodo}",
+            notes=f"{categoria}{' | ' + notes if notes else ''} | RESUMEN",
+            category=categoria,
+        )
+        # Mismas patas que un CARD_CHARGE normal
+        insert_movement(conn, eid, account=tarjeta, asset=moneda, qty=monto,
+                        notes=f"{categoria} | RESUMEN {periodo}")
+        insert_movement(conn, eid, account="external_expense", asset=moneda,
+                        qty=-monto)
+        n += 1
     return n
 
 
@@ -1126,6 +1191,8 @@ def import_all(db_path: str | Path, xlsx_path: str | Path,
         stats["ingresos"] = import_ingresos(conn, wb["ingresos"])
     if "gastos" in wb.sheetnames:
         stats["gastos"] = import_gastos(conn, wb["gastos"])
+    if "resumen_tarjeta" in wb.sheetnames:
+        stats["resumen_tarjeta"] = import_resumen_tarjeta(conn, wb["resumen_tarjeta"])
     if "recurrentes" in wb.sheetnames:
         stats["recurrentes"] = import_recurrentes(conn, wb["recurrentes"], fecha_corte)
     if "pagos_pasivos" in wb.sheetnames:
