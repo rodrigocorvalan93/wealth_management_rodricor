@@ -351,6 +351,21 @@ def create_app() -> Flask:
     # PUBLIC
     # =========================================================================
 
+    def _app_build() -> str:
+        """Build del frontend = el VERSION del service worker desplegado.
+        Es la fuente de verdad de 'qué versión de la app está sirviendo el
+        server'. El cliente lo compara contra su propio SW cacheado para saber
+        si está en la última versión."""
+        try:
+            sw = (Path(app.static_folder) / "sw.js").read_text(encoding="utf-8")
+            import re as _re
+            m = _re.search(r'VERSION\s*=\s*["\']([^"\']+)["\']', sw)
+            if m:
+                return m.group(1)
+        except Exception:
+            pass
+        return "unknown"
+
     @app.get("/api/health")
     def health():
         import os as _os
@@ -361,6 +376,7 @@ def create_app() -> Flask:
         body = {
             "status": "ok",
             "version": "2.0",
+            "app_build": _app_build(),
             "auth_configured": len(users) > 0,
             "n_users": len(users),
             "multi_tenant": is_multi,
