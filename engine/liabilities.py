@@ -197,3 +197,56 @@ def all_card_snapshots(conn, ref_date: Optional[date] = None) -> List[CardSnapsh
         if snap is not None:
             out.append(snap)
     return out
+
+
+def detect_double_count(conn) -> List[dict]:
+    """Detecta posible doble conteo en tarjetas: cuando para una misma
+    (tarjeta, período YYYY-MM) coexiste un cargo CONSOLIDADO (resumen, marcado
+    con external_id 'CARDSUM:...') y además cargos GRANULARES (CARD_CHARGE /
+    CARD_INSTALLMENT normales) en ese mismo mes.
+
+    Devuelve avisos [{tarjeta, periodo, n_granulares, monto_resumen,
+    monto_granular, mensaje}]. NO modifica nada: solo avisa (la regla es usar
+    resumen O granular, no ambos).
+    """
+    resumenes = conn.execute(
+        """SELECT m.account AS tarjeta,
+                  substr(e.event_date,1,7) AS periodo,
+                  SUM(m.qty) AS monto
+           FROM events e
+           JOIN movements m ON m.event_id = e.event_id
+           JOIN accounts a ON a.code = m.account
+           WHERE a.kind = 'CARD_CREDIT'
+             AND e.event_type = 'CARD_CHARGE'
+             AND e.external_id LIKE 'CARDSUM:%'
+             AND m.qty > 0
+           GROUP BY m.account, periodo""",
+    ).fetchall()
+
+    warnings = []
+    for rsum in resumenes:
+        tarjeta = rsum["tarjeta"]
+        periodo = rsum["periodo"]
+        gran = conn.execute(
+            """SELECT COUNT(*) AS n, COALESCE(SUM(m.qty),0) AS monto
+               FROM events e
+               JOIN movements m ON m.event_id = e.event_id
+               WHERE m.account = ?
+                 AND substr(e.event_date,1,7) = ?
+                 AND e.event_type IN ('CARD_CHARGE','CARD_INSTALLMENT')
+                 AND (e.external_id IS NULL OR e.external_id NOT LIKE 'CARDSUM:%')
+                 AND m.qty > 0""",
+            (tarjeta, periodo),
+        ).fetchone()
+        if gran["n"] > 0:
+            warnings.append({
+                "tarjeta": tarjeta,
+                "periodo": periodo,
+                "n_granulares": int(gran["n"]),
+                "monto_resumen": round(float(rsum["monto"]), 2),
+                "monto_granular": round(float(gran["monto"]), 2),
+                "mensaje": (f"La tarjeta '{tarjeta}' tiene un resumen consolidado "
+                            f"y {int(gran['n'])} cargo(s) individual(es) en {periodo}. "
+                            f"Posible doble conteo: usá resumen O cargas sueltas, no ambos."),
+            })
+    return warnings
