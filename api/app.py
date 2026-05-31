@@ -477,6 +477,58 @@ def create_app() -> Flask:
         finally:
             conn.close()
 
+    # ---------------------------------------------------------------
+    # Flujo de caja del hogar (estado de resultados mensual)
+    # ---------------------------------------------------------------
+    @app.get("/api/cashflow-report")
+    def cashflow_report():
+        """Reporte de flujo de caja mensual estilo P&L.
+
+        Query params:
+          desde, hasta  — ISO YYYY-MM-DD (opcionales)
+          basis         — 'cash' (caja real) | 'accrual' (devengado)
+          investible    — '', '1' (solo invertible) | '0' (solo no invertible)
+          moneda        — moneda destino (default ARS)
+        """
+        _require_auth(); _block_if_switched_mutation()
+        from engine.cashflow import monthly_cashflow
+        from engine.liabilities import detect_double_count
+        desde = request.args.get("desde") or None
+        hasta = request.args.get("hasta") or None
+        basis = request.args.get("basis", "cash")
+        moneda = request.args.get("moneda") or "ARS"
+        inv_raw = request.args.get("investible", "")
+        investible = int(inv_raw) if inv_raw in ("0", "1") else None
+        conn = db_conn()
+        try:
+            report = monthly_cashflow(
+                conn, desde=desde, hasta=hasta, basis=basis,
+                investible=investible, moneda=moneda,
+            )
+            report["card_warnings"] = detect_double_count(conn)
+            return jsonify(report)
+        finally:
+            conn.close()
+
+    # ---------------------------------------------------------------
+    # Tarjetas (saldos: actual / último resumen / próximo vto)
+    # ---------------------------------------------------------------
+    @app.get("/api/tarjetas")
+    def tarjetas():
+        """Snapshots de todas las tarjetas + avisos de doble conteo."""
+        _require_auth(); _block_if_switched_mutation()
+        from dataclasses import asdict
+        from engine.liabilities import all_card_snapshots, detect_double_count
+        conn = db_conn()
+        try:
+            snaps = [asdict(s) for s in all_card_snapshots(conn)]
+            return jsonify({
+                "tarjetas": snaps,
+                "warnings": detect_double_count(conn),
+            })
+        finally:
+            conn.close()
+
     @app.get("/api/asset/<path:ticker>/history")
     def asset_history_endpoint(ticker):
         """Detalle histórico de un activo: primera compra, todas las
