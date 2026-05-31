@@ -547,6 +547,41 @@
         if (window._actions[fn]) window._actions[fn](arg, b);
       });
     });
+    // Chequeo de versión (Settings → Versión)
+    const verEl = root.querySelector("#ver-status");
+    if (verEl) checkAppVersion(verEl, verEl.dataset.serverBuild || null);
+  }
+
+  // Compara el build del server (VERSION del sw.js desplegado) contra el SW
+  // efectivamente activo en este navegador (las caches que tiene abiertas).
+  // Si difieren, el cliente tiene una versión vieja cacheada.
+  async function checkAppVersion(el, serverBuild) {
+    if (!serverBuild) { el.textContent = "No pude leer la versión del servidor."; return; }
+    let clientBuild = null;
+    try {
+      // El SW abre una cache con nombre == VERSION (ej "wm-v19").
+      const keys = await caches.keys();
+      const wm = keys.filter(k => /^wm-v\d+$/.test(k))
+                     .sort((a, b) => parseInt(b.slice(4)) - parseInt(a.slice(4)));
+      clientBuild = wm[0] || null;
+    } catch (_) {}
+    if (!clientBuild) {
+      el.innerHTML = `✓ Estás en la última versión (<b>${escapeHtml(serverBuild)}</b>).`;
+      el.className = "positive";
+      return;
+    }
+    if (clientBuild === serverBuild) {
+      el.innerHTML = `✓ Estás en la última versión (<b>${escapeHtml(serverBuild)}</b>).`;
+      el.className = "positive";
+    } else {
+      el.innerHTML = `⚠ Tenés una versión vieja cacheada (<b>${escapeHtml(clientBuild)}</b>). ` +
+        `Disponible: <b>${escapeHtml(serverBuild)}</b>. ` +
+        `<button class="btn ghost" style="margin-top:6px;" data-onclick="forceUpdate">Actualizar ahora</button>`;
+      el.className = "negative";
+      // re-attach del botón recién insertado
+      const btn = el.querySelector("[data-onclick]");
+      if (btn) btn.addEventListener("click", () => window._actions.forceUpdate());
+    }
   }
 
   // -------- Theme (dark / light) --------
@@ -589,6 +624,21 @@
       applyTheme(next);
       // Re-render para refrescar el ícono del toggle
       try { render(); } catch (_) {}
+    },
+    async forceUpdate() {
+      // Borra caches del SW, desregistra los SW y recarga para bajar lo último.
+      toast("Actualizando…", "info");
+      try {
+        if ("caches" in window) {
+          const keys = await caches.keys();
+          await Promise.all(keys.map(k => caches.delete(k)));
+        }
+        if ("serviceWorker" in navigator) {
+          const regs = await navigator.serviceWorker.getRegistrations();
+          await Promise.all(regs.map(r => r.unregister()));
+        }
+      } catch (_) {}
+      window.location.reload(true);
     },
     async createTrade(data) {
       // Convertir tipos numéricos
@@ -5200,11 +5250,15 @@ python yfinance_loader.py</pre>
         </section>
 
         <section>
-          <h2>Sobre</h2>
-          <div class="card compact muted" style="font-size:13px;">
-            wm_engine v${escapeHtml(health?.version || "1.0")} · personal use only<br/>
-            <a href="https://github.com/rodrigocorvalan93/wealth_management_rodricor"
-               target="_blank">repo en GitHub</a>
+          <h2>Versión</h2>
+          <div class="card compact" style="font-size:13px;">
+            <div id="ver-status" class="muted" data-server-build="${escapeHtml(health?.app_build || "")}">Verificando versión…</div>
+            <div class="muted" style="margin-top:6px;">
+              wm_engine v${escapeHtml(health?.version || "1.0")} ·
+              build server <b>${escapeHtml(health?.app_build || "?")}</b><br/>
+              <a href="https://github.com/rodrigocorvalan93/wealth_management_rodricor"
+                 target="_blank">repo en GitHub</a>
+            </div>
           </div>
         </section>
       </main>
