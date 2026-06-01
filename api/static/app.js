@@ -6908,8 +6908,8 @@ python yfinance_loader.py</pre>
       <nav class="bottom-nav">
         <a href="#/"><span class="icon">📊</span><span>Home</span></a>
         <a href="#/trades"><span class="icon">📈</span><span>Trades</span></a>
-        <a href="#/gastos"><span class="icon">💸</span><span>Gastos</span></a>
-        <a href="#/ingresos"><span class="icon">💰</span><span>Ingresos</span></a>
+        <a href="#/flows"><span class="icon">💸</span><span>Flujos</span></a>
+        <a href="#/cashflow"><span class="icon">📊</span><span>Caja</span></a>
         <a href="#/performance"><span class="icon">🎯</span><span>Stats</span></a>
         <a href="#/settings"><span class="icon">⚙️</span><span>Más</span></a>
       </nav>
